@@ -230,6 +230,12 @@ def test_health_monitor_disabled_provider_skipping():
     finally:
         os.environ.pop("DISABLED_PROVIDERS", None)
 
+    # 验证动态解禁后状态自愈恢复（消除状态粘滞）
+    all_st_after = monitor.get_all_statuses()
+    assert all_st_after["deepseek"]["status"] == "healthy"
+    assert all_st_after["kimi"]["status"] == "healthy"
+    assert monitor.get_status("deepseek")["status"] == "healthy"
+
 
 if __name__ == "__main__":
     test_agent_finder_and_version()

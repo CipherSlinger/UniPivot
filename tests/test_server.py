@@ -1395,11 +1395,14 @@ def test_diagnostics_endpoint():
 
 
 def test_diagnostics_with_disabled_provider():
-    """验证当环境变量设置 DISABLED_PROVIDERS 时，/v1/diagnostics 暴露被禁用节点列表及对应节点状态。"""
+    """验证当环境变量设置 DISABLED_PROVIDERS 时，/v1/diagnostics 暴露被禁用节点列表及对应节点状态；
+    并在动态解禁后，状态自愈恢复，不发生状态粘滞。
+    """
     os.environ["DISABLED_PROVIDERS"] = "deepseek"
     srv.failover_router.cooldown_tracker.reset()
+    client = TestClient(srv.app)
     try:
-        client = TestClient(srv.app)
+        # 1. 禁用状态校验
         r = client.get("/v1/diagnostics")
         assert r.status_code == 200
         data = r.json()
@@ -1408,6 +1411,15 @@ def test_diagnostics_with_disabled_provider():
     finally:
         os.environ.pop("DISABLED_PROVIDERS", None)
         srv.failover_router.cooldown_tracker.reset()
+
+    # 2. 动态解禁后校验（验证状态粘滞消除，健康状态恢复）
+    r_after = client.get("/v1/diagnostics")
+    assert r_after.status_code == 200
+    data_after = r_after.json()
+    assert "deepseek" not in data_after["disabled_providers"]
+    assert data_after["providers"]["deepseek"]["health_status"] != "disabled"
+    assert data_after["providers"]["deepseek"]["health_status"] in ("healthy", "degraded", "failing", "unhealthy")
+    print("[PASS] server: /v1/diagnostics 节点禁用与动态解禁自愈恢复校验通过")
 
 
 def test_reports_latest_endpoint():
@@ -1632,8 +1644,8 @@ if __name__ == "__main__":
     test_anthropic_thinking_state_machine_streaming_and_non_streaming()
     test_kimi_and_glm_model_routing()
     test_peer_to_peer_mutual_failover()
-    test_diagnostics_endpoint()
     test_diagnostics_with_disabled_provider()
+    test_diagnostics_endpoint()
     test_reports_latest_endpoint()
     test_disabled_provider_zero_latency_switch()
     test_adaptive_load_balancer_metrics_and_degradation()

@@ -635,7 +635,7 @@ async def health():
         p_info["risk_level"] = meta.risk_level.value if meta else "medium"
         in_cd = failover_router.cooldown_tracker.is_in_cooldown(p_name)
         rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(p_name)
-        is_dis = p_name in disabled_set or p_info.get("status") == "disabled"
+        is_dis = p_name in disabled_set
         if is_dis:
             p_info["status"] = "disabled"
         p_info["is_disabled"] = is_dis
@@ -739,10 +739,10 @@ async def get_diagnostics():
         consec_fails = p_state.get("consecutive_failures", 0)
         configured = p_state.get("configured", False)
         raw_status = p_state.get("status", "offline")
-        is_disabled = p_name in disabled_set or raw_status == "disabled"
+        is_disabled = p_name in disabled_set
 
         # 映射规范化健康状态: healthy / degraded / failing / unhealthy / disabled
-        if is_disabled or raw_status == "disabled":
+        if is_disabled:
             h_status = "disabled"
             raw_status = "disabled"
         elif not configured or raw_status == "offline":

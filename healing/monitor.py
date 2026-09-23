@@ -109,15 +109,24 @@ class HealthMonitor:
                 self._states[name] = ProviderHealth()
             self._states[name].status = "disabled"
             self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
+        elif name in self._states and self._states[name].status == "disabled":
+            # 动态解禁恢复
+            self._states[name].status = "healthy"
+            if self._states[name].last_error == "节点已被禁用 (DISABLED_PROVIDERS)":
+                self._states[name].last_error = None
         h = self._states.get(name)
         return h.to_dict() if h else None
 
     def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
-        # 刷新 disabled 状态
+        # 刷新 disabled 状态与动态解禁
         for name in list(self._states.keys()):
             if self.is_disabled(name):
                 self._states[name].status = "disabled"
                 self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
+            elif self._states[name].status == "disabled":
+                self._states[name].status = "healthy"
+                if self._states[name].last_error == "节点已被禁用 (DISABLED_PROVIDERS)":
+                    self._states[name].last_error = None
 
         # 刷新 configured 标志
         for name, resolver in self._provider_resolvers.items():
@@ -211,6 +220,11 @@ class HealthMonitor:
                 self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
                 self._states[name].last_check = time.time()
                 return False, "节点已被禁用 (DISABLED_PROVIDERS)"
+
+            if name in self._states and self._states[name].status == "disabled":
+                self._states[name].status = "healthy"
+                if self._states[name].last_error == "节点已被禁用 (DISABLED_PROVIDERS)":
+                    self._states[name].last_error = None
 
             # 如果正在处于自愈中，不强行覆盖为 degraded/offline
             current_state = self._states.get(name)
