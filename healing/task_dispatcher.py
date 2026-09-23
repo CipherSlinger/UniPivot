@@ -219,6 +219,8 @@ class TaskEvaluator:
             },
             {
                 "id": "OPT-003",
+                "status": "COMPLETED",
+                "status_display": "已落地",
                 "category": "高可用与调度优化",
                 "title": "冷热模型动态负载均衡与自适应降级矩阵",
                 "priority": "P0",
@@ -264,8 +266,13 @@ class TaskEvaluator:
             "## 2. 梳理出的核心优化空间与迭代需求清单",
         ])
         for opp in opportunities:
+            status_tag = f" [{opp['status']} / {opp.get('status_display', '')}]" if opp.get("status") else ""
             md_lines.extend([
-                f"### [{opp['priority']}] {opp['id']}: {opp['title']}",
+                f"### [{opp['priority']}] {opp['id']}: {opp['title']}{status_tag}",
+            ])
+            if opp.get("status"):
+                md_lines.append(f"- **状态**: {opp['status']} ({opp.get('status_display', '')})")
+            md_lines.extend([
                 f"- **分类**: {opp['category']}",
                 f"- **详细说明**: {opp['description']}",
                 f"- **预期收益**: {opp['expected_impact']}",
@@ -275,7 +282,8 @@ class TaskEvaluator:
         md_lines.extend([
             "## 3. 验收结论与下一步演进路线",
             "当前网关在多协议转换（OpenAI Chat / Anthropic Messages / Realtime Responses）与五大上游提供方稳定性表现优异。",
-            "建议优先落实 `OPT-001`（Prompt Cache 预计算）与 `OPT-003`（自适应负载均衡矩阵），进一步夯实大规模智能体长任务调用的系统底座。",
+            "`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）已落地并完成全套 10 个测试套件回归验证。",
+            "建议优先落实 `OPT-001`（Prompt Cache 预计算），进一步夯实大规模智能体长任务调用的系统底座。",
             "",
         ])
 

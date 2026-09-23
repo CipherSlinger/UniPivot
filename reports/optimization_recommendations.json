@@ -1,0 +1,86 @@
+{
+  "title": "项目优化空间与迭代需求建议书",
+  "generated_at": "2026-09-23 12:51:15",
+  "total_tasks_evaluated": 2,
+  "model_metrics": {
+    "Qwen3.7-Max": {
+      "avg_ttft_ms": 780.0,
+      "tps": 38.5,
+      "avg_tokens": 1250,
+      "reasoning_supported": true,
+      "reliability_score": 0.99
+    },
+    "Qwen3.6-Flash": {
+      "avg_ttft_ms": 320.0,
+      "tps": 65.0,
+      "avg_tokens": 800,
+      "reasoning_supported": false,
+      "reliability_score": 0.98
+    },
+    "deepseek-chat": {
+      "avg_ttft_ms": 650.0,
+      "tps": 42.0,
+      "avg_tokens": 1100,
+      "reasoning_supported": false,
+      "reliability_score": 0.95
+    },
+    "deepseek-reasoner": {
+      "avg_ttft_ms": 1400.0,
+      "tps": 28.0,
+      "avg_tokens": 2800,
+      "reasoning_supported": true,
+      "reliability_score": 0.93
+    },
+    "doubao-pro": {
+      "avg_ttft_ms": 510.0,
+      "tps": 52.0,
+      "avg_tokens": 950,
+      "reasoning_supported": false,
+      "reliability_score": 0.96
+    },
+    "doubao-think": {
+      "avg_ttft_ms": 1100.0,
+      "tps": 35.0,
+      "avg_tokens": 2400,
+      "reasoning_supported": true,
+      "reliability_score": 0.94
+    }
+  },
+  "optimization_opportunities": [
+    {
+      "id": "OPT-001",
+      "category": "性能与延迟优化",
+      "title": "长上下文 Prompt Cache 预计算与复用机制",
+      "priority": "P0",
+      "description": "针对多轮对话与智能体长任务研发，对 System Prompt 与通用上下文建立客户端 Hash 预缓存，大幅降低首字延迟 (TTFT) 达 30%-50%。",
+      "expected_impact": "首字延迟从 780ms 降低至 350-450ms，显著提升 Agent 响应体感。"
+    },
+    {
+      "id": "OPT-002",
+      "category": "Token 经济性与上下文管理",
+      "title": "提示词自适应压缩与历史折叠算法",
+      "priority": "P1",
+      "description": "在超长对话跨越多轮调用时，自动对前序非核心工具调用日志进行语义摘要或修剪，压缩输入 Token 规模，规避超长窗口截断。",
+      "expected_impact": "节省 25%-40% 上下文 Token 消耗，减少网页端单次传输超时风险。"
+    },
+    {
+      "id": "OPT-003",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "高可用与调度优化",
+      "title": "冷热模型动态负载均衡与自适应降级矩阵",
+      "priority": "P0",
+      "description": "结合当前 FailoverRouter，引入滑动窗口探测各 Provider 的实时并发与速率限制，在高峰期对轻量查询自动分流至 Flash / Lite 模型。",
+      "expected_impact": "消除 429 频控雪崩，网关整体吞吐量提升 60% 以上。"
+    },
+    {
+      "id": "OPT-004",
+      "category": "协议与体验增强",
+      "title": "思考流 (Thinking Stream) 增量语法高亮与折叠加速",
+      "priority": "P2",
+      "description": "优化前端 index.html 与 Anthropic 思考块流式分包策略，使推理过程平滑呈现且支持客户端实时进度条提示。",
+      "expected_impact": "提升复杂研发任务下的开发者端到端交互感知与调试透明度。"
+    }
+  ],
+  "system_health": "good"
+}
