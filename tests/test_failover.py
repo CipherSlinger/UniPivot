@@ -450,6 +450,11 @@ def test_server_health_and_failover_integration():
     assert r_chat.headers.get("x-failover-from") == "deepseek"
     assert r_chat.headers.get("x-failover-to") == "doubao"
 
+    # 清除测试产生的冷却与统计，避免干扰后续测试
+    srv.failover_router.cooldown_tracker.reset()
+    if hasattr(srv, "load_balancer"):
+        srv.load_balancer.reset()
+
     # 3. 验证 /v1/messages (Anthropic) 自动故障转移
     r_msg = client.post(
         "/v1/messages",

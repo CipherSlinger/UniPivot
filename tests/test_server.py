@@ -1216,6 +1216,9 @@ def test_peer_to_peer_mutual_failover():
     client = TestClient(srv.app)
 
     # 1. OpenAI 接口容灾测试（指定 kimi 为第一顺位）
+    srv.failover_router.cooldown_tracker.reset()
+    if hasattr(srv, "load_balancer"):
+        srv.load_balancer.reset()
     r_openai = client.post(
         "/v1/chat/completions",
         json={"model": "kimi", "messages": [{"role": "user", "content": "你好"}]},
@@ -1229,6 +1232,9 @@ def test_peer_to_peer_mutual_failover():
     print(f"[PASS] 对等互备 (OpenAI 协议): {data_oa['failover']['from_provider']} -> {data_oa['failover']['to_provider']}")
 
     # 2. Anthropic 接口容灾测试（指定 kimi 为第一顺位）
+    srv.failover_router.cooldown_tracker.reset()
+    if hasattr(srv, "load_balancer"):
+        srv.load_balancer.reset()
     r_ant = client.post(
         "/v1/messages",
         headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
@@ -1243,6 +1249,9 @@ def test_peer_to_peer_mutual_failover():
     print(f"[PASS] 对等互备 (Anthropic 协议): {data_ant['failover']['from_provider']} -> {data_ant['failover']['to_provider']}")
 
     # 3. Responses (Codex CLI) 接口容灾测试
+    srv.failover_router.cooldown_tracker.reset()
+    if hasattr(srv, "load_balancer"):
+        srv.load_balancer.reset()
     r_resp = client.post(
         "/v1/responses",
         json={"model": "kimi", "input": "生成代码"},
@@ -1387,6 +1396,171 @@ def test_reports_latest_endpoint():
     print("[PASS] server: GET /v1/reports/latest 与 /reports/latest 优化报告接口验证通过")
 
 
+def test_disabled_provider_zero_latency_switch():
+    """测试当某个提供方被禁用 (DISABLED_PROVIDERS) 时：
+    1. 首选被禁节点在主入口被 0ms 内部瞬时重定向至同能力环健康备用节点（如 deepseek -> qwen/doubao）；
+    2. 被禁节点不产生任何实际调用，杜绝 401/429 无效网络惩罚；
+    3. 响应头透传调度决策：
+       - x-load-balancing-action (shedded)
+       - x-load-balancing-reason
+       - x-dispatched-provider
+       - x-dispatched-model
+    4. 覆盖 OpenAI (/v1/chat/completions)、Anthropic (/v1/messages) 与 Responses (/v1/responses) 协议，
+       以及流式和非流式两种模式。
+    """
+    os.environ["DISABLED_PROVIDERS"] = "deepseek"
+    srv.failover_router.cooldown_tracker.reset()
+    if hasattr(srv, "load_balancer"):
+        srv.load_balancer.cooldown_tracker.reset()
+        srv.load_balancer.reset()
+
+    called_providers: list[str] = []
+
+    def mock_factory(key: str):
+        called_providers.append(key)
+        if key == "deepseek":
+            raise RuntimeError("Fatal: DeepSeek should NOT be called when disabled!")
+        return EchoProvider()
+
+    orig_factory = srv._make_provider
+    srv._make_provider = mock_factory
+
+    try:
+        client = TestClient(srv.app)
+
+        # 1. OpenAI 协议非流式
+        r_chat = client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "你好"}]},
+        )
+        assert r_chat.status_code == 200, r_chat.text
+        assert r_chat.headers.get("x-load-balancing-action") == "shedded"
+        dispatched_chat = r_chat.headers.get("x-dispatched-provider")
+        assert dispatched_chat in ("qwen", "doubao", "glm", "kimi")
+        assert dispatched_chat != "deepseek"
+        assert r_chat.headers.get("x-dispatched-model") is not None
+        assert r_chat.headers.get("x-load-balancing-reason") is not None
+        assert "deepseek" not in called_providers
+
+        # 2. OpenAI 协议流式
+        with client.stream(
+            "POST",
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "你好"}], "stream": True},
+        ) as r_stream:
+            assert r_stream.status_code == 200
+            assert r_stream.headers.get("x-load-balancing-action") == "shedded"
+            assert r_stream.headers.get("x-dispatched-provider") in ("qwen", "doubao", "glm", "kimi")
+            assert r_stream.headers.get("x-dispatched-provider") != "deepseek"
+            text = "".join(r_stream.iter_text())
+            assert "你好" in text
+            assert "deepseek" not in called_providers
+
+        # 3. Anthropic 协议非流式
+        r_ant = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "你好"}]},
+        )
+        assert r_ant.status_code == 200, r_ant.text
+        assert r_ant.headers.get("x-load-balancing-action") == "shedded"
+        assert r_ant.headers.get("x-dispatched-provider") != "deepseek"
+        assert "deepseek" not in called_providers
+
+        # 4. Anthropic 协议流式
+        with client.stream(
+            "POST",
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "你好"}], "stream": True},
+        ) as r_ant_stream:
+            assert r_ant_stream.status_code == 200
+            assert r_ant_stream.headers.get("x-load-balancing-action") == "shedded"
+            assert r_ant_stream.headers.get("x-dispatched-provider") != "deepseek"
+            text_ant = "".join(r_ant_stream.iter_text())
+            assert "你好" in text_ant
+            assert "deepseek" not in called_providers
+
+        # 5. Responses (Codex CLI) 协议非流式
+        r_resp = client.post(
+            "/v1/responses",
+            json={"model": "deepseek-chat", "input": "生成一段测试代码"},
+        )
+        assert r_resp.status_code == 200, r_resp.text
+        assert r_resp.headers.get("x-load-balancing-action") == "shedded"
+        assert r_resp.headers.get("x-dispatched-provider") != "deepseek"
+        assert "deepseek" not in called_providers
+
+        # 6. Responses (Codex CLI) 协议流式
+        with client.stream(
+            "POST",
+            "/v1/responses",
+            json={"model": "deepseek-chat", "input": "生成一段测试代码", "stream": True},
+        ) as r_resp_stream:
+            assert r_resp_stream.status_code == 200
+            assert r_resp_stream.headers.get("x-load-balancing-action") == "shedded"
+            assert r_resp_stream.headers.get("x-dispatched-provider") != "deepseek"
+            text_resp = "".join(r_resp_stream.iter_text())
+            assert "你好" in text_resp
+            assert "deepseek" not in called_providers
+
+        print("[PASS] test_disabled_provider_zero_latency_switch: 节点禁用瞬时转移与响应头透传验证通过")
+    finally:
+        os.environ.pop("DISABLED_PROVIDERS", None)
+        srv.failover_router.cooldown_tracker.reset()
+        srv._make_provider = orig_factory
+
+
+def test_adaptive_load_balancer_metrics_and_degradation():
+    """测试自适应负载均衡调度：
+    1. 高水位与轻量降级 (degraded)：旗舰模型轻量 Prompt 遇到高负载时自适应降级至 SPEED 环；
+    2. 生命周期追踪：acquire / release 并发计数平衡（调用后保底归零）；
+    3. TTFT 首包耗时成功记录入滑动窗口统计器。
+    """
+    srv._make_provider = lambda key: EchoProvider()
+    client = TestClient(srv.app)
+
+    # 1. 正常路由 (normal)
+    r_norm = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "你好"}]},
+    )
+    assert r_norm.status_code == 200
+    assert r_norm.headers.get("x-load-balancing-action") == "normal"
+    assert r_norm.headers.get("x-dispatched-provider") == "qwen"
+
+    # 2. 模拟高负载触发轻量降级 (degraded)
+    # 将 qwen 并发拉高超过 high_watermark
+    qwen_metrics = srv.load_balancer.get_metrics("qwen")
+    for _ in range(8):
+        qwen_metrics.acquire()
+
+    try:
+        # 短 Prompt (<300 tokens) 且无 thinking，请求旗舰模型 qwen-max
+        r_deg = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen-max", "messages": [{"role": "user", "content": "1+1=?"}]},
+        )
+        assert r_deg.status_code == 200
+        assert r_deg.headers.get("x-load-balancing-action") == "degraded"
+        # 降级至 SPEED 环模型
+        dispatched_model = r_deg.headers.get("x-dispatched-model")
+        assert dispatched_model in ("Qwen3.6-Flash", "doubao-lite", "glm-4-flash")
+    finally:
+        for _ in range(8):
+            qwen_metrics.release()
+
+    # 3. 验证并发计数归零
+    for pk in ("qwen", "doubao", "kimi", "glm", "deepseek"):
+        assert srv.load_balancer.get_metrics(pk).active_concurrency == 0
+
+    # 4. 验证 TTFT 耗时记录入快照
+    snap = qwen_metrics.get_snapshot()
+    assert snap.avg_ttft_ms >= 0.0
+
+    print("[PASS] test_adaptive_load_balancer_metrics_and_degradation: 自适应降级与生命周期度量验证通过")
+
+
 if __name__ == "__main__":
     test_unknown_model_404()
     test_empty_messages_400()
@@ -1423,4 +1597,6 @@ if __name__ == "__main__":
     test_peer_to_peer_mutual_failover()
     test_diagnostics_endpoint()
     test_reports_latest_endpoint()
+    test_disabled_provider_zero_latency_switch()
+    test_adaptive_load_balancer_metrics_and_degradation()
     print("服务端集成测试全部通过")

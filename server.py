@@ -25,6 +25,7 @@ import json
 import os
 import threading
 import time
+import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -52,6 +53,8 @@ from providers import (
     CapabilityRing,
     RING_DEFINITIONS,
     FailoverRouter,
+    AdaptiveLoadBalancer,
+    BalancingDecision,
     PROVIDER_RISK_SPECS,
     anthropic_error_response,
     anthropic_message_response,
@@ -120,6 +123,23 @@ task_dispatcher = TaskDispatcher(port=PORT)
 
 # 全局五大模型对等互备路由调度器
 failover_router = FailoverRouter()
+
+# 全局冷热动态负载均衡与自适应降级调度引擎
+load_balancer = AdaptiveLoadBalancer(cooldown_tracker=failover_router.cooldown_tracker)
+
+
+def _make_lb_headers(decision: BalancingDecision) -> dict[str, str]:
+    """构造负载均衡与降级分流决策响应头"""
+    headers = {
+        "x-load-balancing-action": decision.action,
+        "x-dispatched-provider": decision.provider_key,
+        "x-dispatched-model": decision.wire_model,
+    }
+    if decision.reason:
+        headers["x-load-balancing-reason"] = urllib.parse.quote(
+            decision.reason, safe=" /:;=@[](){}<>_-,."
+        )
+    return headers
 
 # ---------------------------------------------------------------- 模型表
 
@@ -1070,6 +1090,22 @@ async def chat_completions(req: ChatCompletionRequest):
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_tokens if req.max_tokens is not None else 2048
 
+    # 1. 估算 prompt tokens 与思考意图
+    prompt_text = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
+    prompt_tokens = _est_tokens(prompt_text)
+    is_thinking = bool(req.thinking)
+
+    # 2. 自适应负载均衡与被禁节点即刻转移路由决策
+    decision = load_balancer.select_route(
+        primary_provider=provider_key,
+        primary_model=wire_model,
+        prompt_tokens=prompt_tokens,
+        is_thinking=is_thinking,
+    )
+    lb_headers = _make_lb_headers(decision)
+    dispatched_provider = decision.provider_key
+    dispatched_model = decision.wire_model
+
     chat_args = {
         "messages": messages,
         "conversation_id": req.conversation_id,
@@ -1081,6 +1117,12 @@ async def chat_completions(req: ChatCompletionRequest):
     }
 
     if req.stream:
+        stream_headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        stream_headers.update(lb_headers)
+
         async def gen():
             cid = _id("chatcmpl")
             created = int(time.time())
@@ -1088,12 +1130,19 @@ async def chat_completions(req: ChatCompletionRequest):
             accumulated_chunks: list[str] = []
             accumulated_reasoning: list[str] = []
 
+            start_time = time.time()
+            load_balancer.acquire(dispatched_provider)
+            ttft_recorded = False
+            success = False
+            is_rate_limit = False
+            error_msg = ""
+
             # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
             if not req.tools:
                 try:
                     stream, failover_event, active_provider = await failover_router.execute_chat(
-                        primary_provider_key=provider_key,
-                        primary_wire_model=wire_model,
+                        primary_provider_key=dispatched_provider,
+                        primary_wire_model=dispatched_model,
                         provider_factory=lambda pkey: _make_provider(pkey),
                         chat_args=chat_args,
                     )
@@ -1111,6 +1160,12 @@ async def chat_completions(req: ChatCompletionRequest):
                     yield sse_frame(first_chunk)
 
                     async for delta, meta in stream:
+                        if not ttft_recorded and delta:
+                            load_balancer.record_ttft(
+                                dispatched_provider, (time.time() - start_time) * 1000.0
+                            )
+                            ttft_recorded = True
+
                         if not delta:
                             if meta and meta.get("conversation_id"):
                                 conversation_id = meta["conversation_id"]
@@ -1161,7 +1216,6 @@ async def chat_completions(req: ChatCompletionRequest):
                     yield sse_frame(final)
 
                     if req.stream_options and req.stream_options.get("include_usage"):
-                        prompt_text = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
                         pt = _est_tokens(prompt_text)
                         ct = max(1, _est_tokens("".join(accumulated_chunks) + "".join(accumulated_reasoning)))
                         yield sse_frame({
@@ -1181,21 +1235,38 @@ async def chat_completions(req: ChatCompletionRequest):
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conversation_id))
+                    success = True
                 except ProviderError as e:
+                    is_rate_limit = (e.status == 429)
+                    error_msg = e.message
                     yield sse_frame(error_response(e.message, e.status, e.err_type))
                 except Exception as e:
+                    error_msg = str(e)
                     yield sse_frame(error_response(f"上游服务异常: {e}", 502, "upstream_error"))
+                finally:
+                    load_balancer.release(
+                        dispatched_provider,
+                        success=success,
+                        is_rate_limit=is_rate_limit,
+                        error_msg=error_msg,
+                    )
                 return
 
             # 2. Tools 模式：聚合后解析 tool_call
             try:
                 stream, failover_event, active_provider = await failover_router.execute_chat(
-                    primary_provider_key=provider_key,
-                    primary_wire_model=wire_model,
+                    primary_provider_key=dispatched_provider,
+                    primary_wire_model=dispatched_model,
                     provider_factory=lambda pkey: _make_provider(pkey),
                     chat_args=chat_args,
                 )
                 async for delta, meta in stream:
+                    if not ttft_recorded and delta:
+                        load_balancer.record_ttft(
+                            dispatched_provider, (time.time() - start_time) * 1000.0
+                        )
+                        ttft_recorded = True
+
                     if not delta:
                         if meta and meta.get("conversation_id"):
                             conversation_id = meta["conversation_id"]
@@ -1291,7 +1362,6 @@ async def chat_completions(req: ChatCompletionRequest):
                     })
 
                 if req.stream_options and req.stream_options.get("include_usage"):
-                    prompt_text = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
                     pt = _est_tokens(prompt_text)
                     ct = max(1, _est_tokens(full_text + full_reasoning))
                     yield sse_frame({
@@ -1311,29 +1381,51 @@ async def chat_completions(req: ChatCompletionRequest):
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conversation_id))
+                success = True
             except ProviderError as e:
+                is_rate_limit = (e.status == 429)
+                error_msg = e.message
                 yield sse_frame(error_response(e.message, e.status, e.err_type))
             except Exception as e:
+                error_msg = str(e)
                 yield sse_frame(error_response(f"上游服务异常: {e}", 502, "upstream_error"))
+            finally:
+                load_balancer.release(
+                    dispatched_provider,
+                    success=success,
+                    is_rate_limit=is_rate_limit,
+                    error_msg=error_msg,
+                )
 
         return StreamingResponse(
             gen(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=stream_headers,
         )
 
     # 非流式：聚合上游流
     chunks: list[str] = []
     reasoning_chunks: list[str] = []
     conversation_id = req.conversation_id
+    start_time = time.time()
+    load_balancer.acquire(dispatched_provider)
+    ttft_recorded = False
+    success = False
+    is_rate_limit = False
+    error_msg = ""
     try:
         stream, failover_event, active_provider = await failover_router.execute_chat(
-            primary_provider_key=provider_key,
-            primary_wire_model=wire_model,
+            primary_provider_key=dispatched_provider,
+            primary_wire_model=dispatched_model,
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
         async for delta, meta in stream:
+            if not ttft_recorded and delta:
+                load_balancer.record_ttft(
+                    dispatched_provider, (time.time() - start_time) * 1000.0
+                )
+                ttft_recorded = True
             if not delta:
                 if meta and meta.get("conversation_id"):
                     conversation_id = meta["conversation_id"]
@@ -1344,26 +1436,37 @@ async def chat_completions(req: ChatCompletionRequest):
                 chunks.append(delta)
             if meta and meta.get("conversation_id"):
                 conversation_id = meta["conversation_id"]
+        success = True
     except ProviderError as e:
+        is_rate_limit = (e.status == 429)
+        error_msg = e.message
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
+        error_msg = str(e)
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
+    finally:
+        load_balancer.release(
+            dispatched_provider,
+            success=success,
+            is_rate_limit=is_rate_limit,
+            error_msg=error_msg,
+        )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
         asyncio.create_task(active_provider.delete_conversation(conversation_id))
 
-    prompt = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
+    prompt = prompt_text
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
 
-    resp_headers = {}
+    resp_headers = dict(lb_headers)
     if failover_event:
-        resp_headers = {
+        resp_headers.update({
             "x-failover-from": failover_event.from_provider,
             "x-failover-to": failover_event.to_provider,
             "x-failover-model": failover_event.to_model,
             "x-failover-ring": failover_event.ring.value,
-        }
+        })
 
     if req.tools:
         parsed = parse_tool_calls(full_output)
@@ -1437,6 +1540,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         else:
             enable_thinking = bool(req.thinking)
 
+    # 自适应负载均衡与被禁节点即刻转移路由决策
+    decision = load_balancer.select_route(
+        primary_provider=provider_key,
+        primary_model=wire_model,
+        prompt_tokens=input_tokens,
+        is_thinking=enable_thinking,
+    )
+    lb_headers = _make_lb_headers(decision)
+    dispatched_provider = decision.provider_key
+    dispatched_model = decision.wire_model
+
     chat_args = {
         "messages": gateway_messages,
         "conversation_id": req.conversation_id,
@@ -1446,16 +1560,28 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     }
 
     if req.stream:
+        stream_headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        stream_headers.update(lb_headers)
+
         async def gen():
             msg_id = _id("msg", "_")
             conv_id: Optional[str] = None
+            start_time = time.time()
+            load_balancer.acquire(dispatched_provider)
+            ttft_recorded = False
+            success = False
+            is_rate_limit = False
+            error_msg = ""
 
             try:
                 # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
                 if not req.tools:
                     stream, failover_event, active_provider = await failover_router.execute_chat(
-                        primary_provider_key=provider_key,
-                        primary_wire_model=wire_model,
+                        primary_provider_key=dispatched_provider,
+                        primary_wire_model=dispatched_model,
                         provider_factory=lambda pkey: _make_provider(pkey),
                         chat_args=chat_args,
                     )
@@ -1468,6 +1594,12 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     accumulated_thinking: list[str] = []
 
                     async for delta, _meta in stream:
+                        if not ttft_recorded and delta:
+                            load_balancer.record_ttft(
+                                dispatched_provider, (time.time() - start_time) * 1000.0
+                            )
+                            ttft_recorded = True
+
                         if not delta:
                             if _meta and _meta.get("conversation_id"):
                                 conv_id = _meta["conversation_id"]
@@ -1520,19 +1652,26 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conv_id))
+                    success = True
                     return
 
                 # 2. Agent / 工具模式：聚合后解析 tool_call 协议
                 accumulated_chunks: list[str] = []
                 accumulated_thinking: list[str] = []
                 stream, failover_event, active_provider = await failover_router.execute_chat(
-                    primary_provider_key=provider_key,
-                    primary_wire_model=wire_model,
+                    primary_provider_key=dispatched_provider,
+                    primary_wire_model=dispatched_model,
                     provider_factory=lambda pkey: _make_provider(pkey),
                     chat_args=chat_args,
                 )
 
                 async for delta, _meta in stream:
+                    if not ttft_recorded and delta:
+                        load_balancer.record_ttft(
+                            dispatched_provider, (time.time() - start_time) * 1000.0
+                        )
+                        ttft_recorded = True
+
                     if not delta:
                         if _meta and _meta.get("conversation_id"):
                             conv_id = _meta["conversation_id"]
@@ -1605,33 +1744,55 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conv_id))
+                success = True
             except ProviderError as e:
+                is_rate_limit = (e.status == 429)
+                error_msg = e.message
                 yield anthropic_sse_event(
                     "error", anthropic_error_response(e.message, e.status, e.err_type)
                 )
             except Exception as e:
+                error_msg = str(e)
                 yield anthropic_sse_event(
                     "error", anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error")
+                )
+            finally:
+                load_balancer.release(
+                    dispatched_provider,
+                    success=success,
+                    is_rate_limit=is_rate_limit,
+                    error_msg=error_msg,
                 )
 
         return StreamingResponse(
             gen(),
             media_type="text/event-stream",
-            headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+            headers=stream_headers,
         )
 
     # 非流式
     chunks: list[str] = []
     thinking_chunks: list[str] = []
     conv_id: Optional[str] = None
+    start_time = time.time()
+    load_balancer.acquire(dispatched_provider)
+    ttft_recorded = False
+    success = False
+    is_rate_limit = False
+    error_msg = ""
     try:
         stream, failover_event, active_provider = await failover_router.execute_chat(
-            primary_provider_key=provider_key,
-            primary_wire_model=wire_model,
+            primary_provider_key=dispatched_provider,
+            primary_wire_model=dispatched_model,
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
         async for delta, _meta in stream:
+            if not ttft_recorded and delta:
+                load_balancer.record_ttft(
+                    dispatched_provider, (time.time() - start_time) * 1000.0
+                )
+                ttft_recorded = True
             if not delta:
                 if _meta and _meta.get("conversation_id"):
                     conv_id = _meta["conversation_id"]
@@ -1642,15 +1803,26 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 chunks.append(delta)
             if _meta and _meta.get("conversation_id"):
                 conv_id = _meta["conversation_id"]
+        success = True
     except ProviderError as e:
+        is_rate_limit = (e.status == 429)
+        error_msg = e.message
         return JSONResponse(
             anthropic_error_response(e.message, e.status, e.err_type),
             status_code=e.status,
         )
     except Exception as e:
+        error_msg = str(e)
         return JSONResponse(
             anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error"),
             status_code=502,
+        )
+    finally:
+        load_balancer.release(
+            dispatched_provider,
+            success=success,
+            is_rate_limit=is_rate_limit,
+            error_msg=error_msg,
         )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -1661,14 +1833,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     output_tokens = max(1, _est_tokens(full_output + full_thinking))
     msg_id = _id("msg", "_")
 
-    resp_headers = {}
+    resp_headers = dict(lb_headers)
     if failover_event:
-        resp_headers = {
+        resp_headers.update({
             "x-failover-from": failover_event.from_provider,
             "x-failover-to": failover_event.to_provider,
             "x-failover-model": failover_event.to_model,
             "x-failover-ring": failover_event.ring.value,
-        }
+        })
 
     blocks: list[dict] = []
     if full_thinking:
@@ -1761,6 +1933,17 @@ async def responses_endpoint(req: ResponsesRequest):
     elif req.reasoning_effort and req.reasoning_effort.lower() in ("high", "medium", "low"):
         enable_thinking = True
 
+    # 自适应负载均衡与被禁节点即刻转移路由决策
+    decision = load_balancer.select_route(
+        primary_provider=provider_key,
+        primary_model=wire_model,
+        prompt_tokens=input_tokens,
+        is_thinking=enable_thinking,
+    )
+    lb_headers = _make_lb_headers(decision)
+    dispatched_provider = decision.provider_key
+    dispatched_model = decision.wire_model
+
     chat_args = {
         "messages": gateway_messages,
         "conversation_id": req.conversation_id,
@@ -1771,27 +1954,45 @@ async def responses_endpoint(req: ResponsesRequest):
 
     resp_id = _id("resp", "_")
     msg_id = _id("msg", "_")
+    start_time = time.time()
+    load_balancer.acquire(dispatched_provider)
+    ttft_recorded = False
+    success = False
+    is_rate_limit = False
+    error_msg = ""
 
     try:
         stream, failover_event, active_provider = await failover_router.execute_chat(
-            primary_provider_key=provider_key,
-            primary_wire_model=wire_model,
+            primary_provider_key=dispatched_provider,
+            primary_wire_model=dispatched_model,
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
     except ProviderError as e:
+        load_balancer.release(
+            dispatched_provider,
+            success=False,
+            is_rate_limit=(e.status == 429),
+            error_msg=e.message,
+        )
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
+        load_balancer.release(
+            dispatched_provider,
+            success=False,
+            is_rate_limit=False,
+            error_msg=str(e),
+        )
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
 
-    resp_headers = {}
+    resp_headers = dict(lb_headers)
     if failover_event:
-        resp_headers = {
+        resp_headers.update({
             "x-failover-from": failover_event.from_provider,
             "x-failover-to": failover_event.to_provider,
             "x-failover-model": failover_event.to_model,
             "x-failover-ring": failover_event.ring.value,
-        }
+        })
 
     if req.stream:
         stream_headers = {
@@ -1801,6 +2002,7 @@ async def responses_endpoint(req: ResponsesRequest):
         stream_headers.update(resp_headers)
 
         async def gen():
+            nonlocal ttft_recorded, success, is_rate_limit, error_msg
             conv_id: Optional[str] = None
             try:
                 # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
@@ -1823,6 +2025,12 @@ async def responses_endpoint(req: ResponsesRequest):
                     accumulated_reasoning: list[str] = []
 
                     async for delta, _meta in stream:
+                        if not ttft_recorded and delta:
+                            load_balancer.record_ttft(
+                                dispatched_provider, (time.time() - start_time) * 1000.0
+                            )
+                            ttft_recorded = True
+
                         if not delta:
                             if _meta and _meta.get("conversation_id"):
                                 conv_id = _meta["conversation_id"]
@@ -1868,12 +2076,19 @@ async def responses_endpoint(req: ResponsesRequest):
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conv_id))
+                    success = True
                     return
 
                 # 2. Tools 模式：聚合后解析 tool_call 协议
                 accumulated_chunks: list[str] = []
                 accumulated_reasoning: list[str] = []
                 async for delta, _meta in stream:
+                    if not ttft_recorded and delta:
+                        load_balancer.record_ttft(
+                            dispatched_provider, (time.time() - start_time) * 1000.0
+                        )
+                        ttft_recorded = True
+
                     if not delta:
                         if _meta and _meta.get("conversation_id"):
                             conv_id = _meta["conversation_id"]
@@ -1988,10 +2203,21 @@ async def responses_endpoint(req: ResponsesRequest):
 
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conv_id))
+                success = True
             except ProviderError as e:
+                is_rate_limit = (e.status == 429)
+                error_msg = e.message
                 yield sse_response_error(e.message, e.status, e.err_type)
             except Exception as e:
+                error_msg = str(e)
                 yield sse_response_error(f"上游服务异常: {e}", 502, "upstream_error")
+            finally:
+                load_balancer.release(
+                    dispatched_provider,
+                    success=success,
+                    is_rate_limit=is_rate_limit,
+                    error_msg=error_msg,
+                )
 
         return StreamingResponse(
             gen(),
@@ -2005,6 +2231,11 @@ async def responses_endpoint(req: ResponsesRequest):
     conv_id: Optional[str] = None
     try:
         async for delta, meta in stream:
+            if not ttft_recorded and delta:
+                load_balancer.record_ttft(
+                    dispatched_provider, (time.time() - start_time) * 1000.0
+                )
+                ttft_recorded = True
             if not delta:
                 if meta and meta.get("conversation_id"):
                     conv_id = meta["conversation_id"]
@@ -2015,10 +2246,21 @@ async def responses_endpoint(req: ResponsesRequest):
                 chunks.append(delta)
             if meta and meta.get("conversation_id"):
                 conv_id = meta["conversation_id"]
+        success = True
     except ProviderError as e:
+        is_rate_limit = (e.status == 429)
+        error_msg = e.message
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
+        error_msg = str(e)
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
+    finally:
+        load_balancer.release(
+            dispatched_provider,
+            success=success,
+            is_rate_limit=is_rate_limit,
+            error_msg=error_msg,
+        )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
         asyncio.create_task(active_provider.delete_conversation(conv_id))
