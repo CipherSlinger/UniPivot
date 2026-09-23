@@ -20,14 +20,122 @@ from providers.prompt_optimizer import (
     DEFAULT_MAX_TOKENS,
     FOLDED_TOOL_RESULT_TEMPLATE,
     SUMMARY_MARKER,
+    PromptOptimizer,
     compute_prompt_hash,
     estimate_history_tokens,
     fold_history,
     fold_single_message,
+    make_prompt_folding_headers,
+    prompt_optimizer,
 )
 
 
 class TestPromptOptimizer(unittest.TestCase):
+    def test_prompt_optimizer_class_and_headers(self):
+        opt = PromptOptimizer(max_tokens=1000, preserve_recent_turns=2)
+        messages = [
+            {"role": "system", "content": "You are a test assistant."},
+            {"role": "user", "content": "Hello!"},
+            {"role": "assistant", "content": "Hi there!"},
+            {"role": "user", "content": "What is 1+1?"},
+        ]
+        optimized, meta = opt.optimize_chat_messages(messages)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(meta["saved_tokens"], 0)
+        self.assertEqual(meta["phase"], 0)
+        self.assertEqual(optimized, messages)
+
+        headers = make_prompt_folding_headers(meta)
+        self.assertEqual(headers["x-prompt-folding-applied"], "false")
+        self.assertEqual(headers["x-prompt-folding-saved-tokens"], "0")
+        self.assertIn("x-prompt-folding-original-tokens", headers)
+        self.assertIn("x-prompt-folding-final-tokens", headers)
+
+        stats = opt.get_stats()
+        self.assertIn("total_inspections", stats)
+        self.assertEqual(stats["total_inspections"], 1)
+        self.assertEqual(stats["total_folded_requests"], 0)
+        self.assertEqual(stats["total_saved_tokens"], 0)
+        self.assertTrue(stats["folding_enabled"])
+
+    def test_prompt_optimizer_phase_one_folding_and_stats(self):
+        opt = PromptOptimizer(max_tokens=1500, preserve_recent_turns=3)
+        huge_tool_output = "Line " * 1500  # ~7500 chars
+
+        messages = [
+            {"role": "system", "content": "You are a CLI agent."},
+            {"role": "user", "content": "Initial prompt: please inspect the logs."},
+            {
+                "role": "assistant",
+                "content": "Running command...",
+                "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Bash"}}],
+            },
+            {"role": "tool", "tool_call_id": "call_1", "content": huge_tool_output},
+            {"role": "assistant", "content": "I see the logs."},
+            {"role": "user", "content": "Recent question 1"},
+            {"role": "assistant", "content": "Recent answer 1"},
+            {"role": "user", "content": "Latest query: what is the conclusion?"},
+        ]
+
+        optimized, meta = opt.optimize_chat_messages(messages)
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["phase"], 1)
+        self.assertGreater(meta["saved_tokens"], 0)
+        self.assertGreater(meta["original_tokens"], meta["final_tokens"])
+
+        headers = make_prompt_folding_headers(meta)
+        self.assertEqual(headers["x-prompt-folding-applied"], "true")
+        self.assertEqual(headers["x-prompt-folding-saved-tokens"], str(meta["saved_tokens"]))
+        self.assertEqual(headers["x-prompt-folding-original-tokens"], str(meta["original_tokens"]))
+        self.assertEqual(headers["x-prompt-folding-final-tokens"], str(meta["final_tokens"]))
+
+        stats = opt.get_stats()
+        self.assertEqual(stats["total_inspections"], 1)
+        self.assertEqual(stats["total_folded_requests"], 1)
+        self.assertEqual(stats["total_saved_tokens"], meta["saved_tokens"])
+
+    def test_prompt_optimizer_singleton_and_reset(self):
+        inst1 = PromptOptimizer.get_instance()
+        inst2 = PromptOptimizer.get_instance()
+        self.assertIs(inst1, inst2)
+        self.assertIs(inst1, prompt_optimizer)
+
+        inst1.reset_stats()
+        stats = inst1.get_stats()
+        self.assertEqual(stats["total_inspections"], 0)
+        self.assertEqual(stats["total_folded_requests"], 0)
+        self.assertEqual(stats["total_saved_tokens"], 0)
+
+    def test_prompt_optimizer_phase_two_summary(self):
+        opt = PromptOptimizer(max_tokens=800, preserve_recent_turns=2)
+        messages = [{"role": "system", "content": "Agent System Prompt"}]
+        messages.append({"role": "user", "content": "First instruction from user"})
+
+        for i in range(25):
+            messages.append({"role": "assistant", "content": f"Answer turn {i}: " + "detailed explanation " * 40})
+            messages.append({"role": "user", "content": f"User follow-up {i}: " + "more requirements " * 30})
+
+        messages.append({"role": "assistant", "content": "Final assistant response"})
+        messages.append({"role": "user", "content": "Final user instruction"})
+
+        optimized, meta = opt.optimize_chat_messages(messages)
+        self.assertTrue(meta["applied"])
+        self.assertEqual(meta["phase"], 2)
+        self.assertGreater(meta["saved_tokens"], 0)
+        has_summary = any(SUMMARY_MARKER in str(m.get("content")) for m in optimized)
+        self.assertTrue(has_summary)
+
+    def test_prompt_optimizer_empty_and_disabled(self):
+        opt_disabled = PromptOptimizer(disabled=True)
+        messages = [{"role": "user", "content": "Line " * 500}]
+        optimized, meta = opt_disabled.optimize_chat_messages(messages, max_tokens=10)
+        self.assertFalse(meta["applied"])
+        self.assertEqual(optimized, messages)
+
+        opt = PromptOptimizer()
+        optimized_empty, meta_empty = opt.optimize_chat_messages([])
+        self.assertFalse(meta_empty["applied"])
+        self.assertEqual(optimized_empty, [])
     def test_compute_prompt_hash(self):
         sys_prompt = "You are a helpful programming assistant."
         messages = [

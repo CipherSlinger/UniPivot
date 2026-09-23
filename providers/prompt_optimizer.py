@@ -1,6 +1,8 @@
 """上下文长度管理与历史消息自适应折叠优化器 (prompt_optimizer.py)。
 
 提供:
+- PromptOptimizer: 线程安全的提示词自适应压缩与历史折叠全局管理器，支持度量统计、分级折叠与单例管理。
+- make_prompt_folding_headers: 生成符合 RFC 规范的折叠审计响应头。
 - fold_history: 估算对话上下文 Token 数，超出限制时自适应折叠中间轮次中的超长工具执行输出与代码块，
   并在极端情况下将老旧历史轮次压缩为紧凑摘要提示，同时严格保护系统提示词 (index 0)、初始任务指令与最近 N 轮对话，
   并确保工具调用状态机 (tool calling) 与角色平衡。
@@ -13,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import threading
 from typing import Any, Dict, List, Optional, Tuple
 
 from .base import _est_tokens, text_of
@@ -195,96 +198,268 @@ def fold_single_message(msg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     return msg, False
 
 
+def make_prompt_folding_headers(meta: Dict[str, Any]) -> Dict[str, str]:
+    """生成符合 RFC 规范的折叠审计响应头。"""
+    applied = bool(meta.get("applied", False))
+    return {
+        "x-prompt-folding-applied": "true" if applied else "false",
+        "x-prompt-folding-saved-tokens": str(meta.get("saved_tokens", 0)),
+        "x-prompt-folding-original-tokens": str(meta.get("original_tokens", 0)),
+        "x-prompt-folding-final-tokens": str(meta.get("final_tokens", 0)),
+    }
+
+
+class PromptOptimizer:
+    """线程安全的提示词自适应压缩与历史折叠全局管理器。"""
+
+    _instance: Optional[PromptOptimizer] = None
+    _instance_lock = threading.Lock()
+
+    def __init__(
+        self,
+        max_tokens: Optional[int] = None,
+        preserve_recent_turns: Optional[int] = None,
+        disabled: Optional[bool] = None,
+    ):
+        if max_tokens is not None:
+            self.max_tokens = max_tokens
+        else:
+            try:
+                self.max_tokens = int(os.environ.get("GATEWAY_MAX_CONTEXT_TOKENS", str(DEFAULT_MAX_TOKENS)))
+            except (ValueError, TypeError):
+                self.max_tokens = DEFAULT_MAX_TOKENS
+
+        if preserve_recent_turns is not None:
+            self.preserve_recent_turns = preserve_recent_turns
+        else:
+            try:
+                self.preserve_recent_turns = int(os.environ.get("GATEWAY_PRESERVE_RECENT_TURNS", str(DEFAULT_PRESERVE_RECENT_TURNS)))
+            except (ValueError, TypeError):
+                self.preserve_recent_turns = DEFAULT_PRESERVE_RECENT_TURNS
+
+        self._disabled = disabled
+        self._lock = threading.Lock()
+        self._total_inspections: int = 0
+        self._total_folded_requests: int = 0
+        self._total_saved_tokens: int = 0
+        self._total_original_tokens: int = 0
+        self._total_final_tokens: int = 0
+
+    @classmethod
+    def get_instance(cls) -> PromptOptimizer:
+        """获取或创建全局默认单例。"""
+        if cls._instance is None:
+            with cls._instance_lock:
+                if cls._instance is None:
+                    cls._instance = cls()
+        return cls._instance
+
+    def is_disabled(self) -> bool:
+        """检查当前折叠优化是否被禁用。"""
+        if self._disabled is not None:
+            if self._disabled:
+                return True
+        return os.environ.get("GATEWAY_DISABLE_PROMPT_FOLDING", "").strip().lower() in ("1", "true", "yes")
+
+    def optimize_chat_messages(
+        self,
+        messages: List[Dict[str, Any]],
+        max_tokens: Optional[int] = None,
+    ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+        """执行消息列表自适应折叠优化。
+
+        返回: (optimized_messages, meta)
+        meta 包含:
+          - applied: bool
+          - original_tokens: int
+          - final_tokens: int
+          - saved_tokens: int
+          - phase: int (0: none, 1: tool/code fold, 2: summary convergence)
+        """
+        effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
+
+        if not messages:
+            with self._lock:
+                self._total_inspections += 1
+            return messages, {
+                "applied": False,
+                "original_tokens": 0,
+                "final_tokens": 0,
+                "saved_tokens": 0,
+                "phase": 0,
+            }
+
+        original_tokens = estimate_history_tokens(messages)
+
+        if len(messages) <= 1 or self.is_disabled() or original_tokens <= effective_max_tokens:
+            with self._lock:
+                self._total_inspections += 1
+                self._total_original_tokens += original_tokens
+                self._total_final_tokens += original_tokens
+            return messages, {
+                "applied": False,
+                "original_tokens": original_tokens,
+                "final_tokens": original_tokens,
+                "saved_tokens": 0,
+                "phase": 0,
+            }
+
+        # 1. 提取头部系统提示词 (index 0 及开头连续的 system 消息)
+        head_indices: List[int] = []
+        for i, m in enumerate(messages):
+            if m.get("role") == "system":
+                head_indices.append(i)
+            else:
+                break
+
+        # 2. 提取第一条用户消息 (初始任务指令)
+        first_user_idx: Optional[int] = None
+        for i in range(len(head_indices), len(messages)):
+            if messages[i].get("role") == "user":
+                first_user_idx = i
+                break
+
+        if first_user_idx is not None:
+            head_indices.append(first_user_idx)
+
+        head_end = (max(head_indices) + 1) if head_indices else 0
+
+        # 3. 确定保留的尾部最近轮次 (preserve_recent_turns)
+        tail_start = max(head_end, len(messages) - max(1, self.preserve_recent_turns))
+
+        # 维护工具调用配对平衡 (tool calling balance):
+        while tail_start > head_end:
+            curr_msg = messages[tail_start]
+            prev_msg = messages[tail_start - 1]
+            if _is_tool_result_message(curr_msg):
+                tail_start -= 1
+                continue
+            if _has_tool_call(prev_msg):
+                tail_start -= 1
+                continue
+            break
+
+        # 如果中间轮次为空，说明所有消息均属于 Head 或 Tail
+        if head_end >= tail_start:
+            with self._lock:
+                self._total_inspections += 1
+                self._total_original_tokens += original_tokens
+                self._total_final_tokens += original_tokens
+            return messages, {
+                "applied": False,
+                "original_tokens": original_tokens,
+                "final_tokens": original_tokens,
+                "saved_tokens": 0,
+                "phase": 0,
+            }
+
+        intermediate_msgs = messages[head_end:tail_start]
+
+        # 阶段一: 折叠中间轮次中的超长工具执行输出与长代码块
+        folded_intermediate: List[Dict[str, Any]] = []
+        any_folded = False
+        for m in intermediate_msgs:
+            folded_m, was_folded = fold_single_message(m)
+            folded_intermediate.append(folded_m)
+            if was_folded:
+                any_folded = True
+
+        candidate_messages = messages[:head_end] + folded_intermediate + messages[tail_start:]
+        cand_tokens = estimate_history_tokens(candidate_messages)
+
+        if cand_tokens <= effective_max_tokens:
+            if any_folded and cand_tokens < original_tokens:
+                saved_tokens = original_tokens - cand_tokens
+                with self._lock:
+                    self._total_inspections += 1
+                    self._total_folded_requests += 1
+                    self._total_saved_tokens += saved_tokens
+                    self._total_original_tokens += original_tokens
+                    self._total_final_tokens += cand_tokens
+                return candidate_messages, {
+                    "applied": True,
+                    "original_tokens": original_tokens,
+                    "final_tokens": cand_tokens,
+                    "saved_tokens": saved_tokens,
+                    "phase": 1,
+                }
+            else:
+                with self._lock:
+                    self._total_inspections += 1
+                    self._total_original_tokens += original_tokens
+                    self._total_final_tokens += original_tokens
+                return messages, {
+                    "applied": False,
+                    "original_tokens": original_tokens,
+                    "final_tokens": original_tokens,
+                    "saved_tokens": 0,
+                    "phase": 0,
+                }
+
+        # 阶段二: 若折叠超长工具输出后依然超载，收敛压缩中间老旧对话为紧凑摘要提示
+        summary_msg: Dict[str, Any] = {
+            "role": "user",
+            "content": SUMMARY_MARKER,
+        }
+
+        phase2_messages = messages[:head_end] + [summary_msg] + messages[tail_start:]
+        final_tokens = estimate_history_tokens(phase2_messages)
+        saved_tokens = max(0, original_tokens - final_tokens)
+        applied = saved_tokens > 0
+
+        with self._lock:
+            self._total_inspections += 1
+            if applied:
+                self._total_folded_requests += 1
+                self._total_saved_tokens += saved_tokens
+            self._total_original_tokens += original_tokens
+            self._total_final_tokens += final_tokens
+
+        return phase2_messages, {
+            "applied": applied,
+            "original_tokens": original_tokens,
+            "final_tokens": final_tokens,
+            "saved_tokens": saved_tokens,
+            "phase": 2 if applied else 0,
+        }
+
+    def get_stats(self) -> Dict[str, Any]:
+        """返回当前优化器的累计遥测与度量指标字典。"""
+        with self._lock:
+            return {
+                "total_inspections": self._total_inspections,
+                "total_folded_requests": self._total_folded_requests,
+                "total_saved_tokens": self._total_saved_tokens,
+                "total_original_tokens": self._total_original_tokens,
+                "total_final_tokens": self._total_final_tokens,
+                "max_tokens": self.max_tokens,
+                "preserve_recent_turns": self.preserve_recent_turns,
+                "folding_enabled": not self.is_disabled(),
+            }
+
+    def reset_stats(self) -> None:
+        """重置所有累计统计数据。"""
+        with self._lock:
+            self._total_inspections = 0
+            self._total_folded_requests = 0
+            self._total_saved_tokens = 0
+            self._total_original_tokens = 0
+            self._total_final_tokens = 0
+
+
+# 全局默认单例
+prompt_optimizer = PromptOptimizer.get_instance()
+
+
 def fold_history(
     messages: List[Dict[str, Any]],
     max_tokens: int = DEFAULT_MAX_TOKENS,
     preserve_recent_turns: int = DEFAULT_PRESERVE_RECENT_TURNS,
 ) -> List[Dict[str, Any]]:
-    """自适应折叠对话历史，避免超长工具执行与多轮会话导致上游 Web 模型超时或 400 载荷超限。
-
-    策略:
-    1. 若未启用优化（GATEWAY_DISABLE_PROMPT_FOLDING=1）或总 Token 数未超过 max_tokens，原样返回。
-    2. 若超出限制:
-       - 始终保留 index 0 处的系统提示词 (以及开头连续的所有 system 消息)。
-       - 始终保留首条用户消息 (初始任务需求与指令)。
-       - 始终保留最近 preserve_recent_turns 轮对话，并维护 tool_call 与 tool_result 配对平衡。
-       - 对中间轮次进行阶段一折叠: 截断超长工具执行结果与长代码块，替换为 concise marker:
-         `[已折叠历史执行结果: 原 {orig_len} 字符, 状态正常]`。
-       - 若折叠后依然超过 max_tokens，执行阶段二折叠: 将老旧中间对话轮次收敛压缩为统一摘要轮次:
-         `{"role": "user", "content": "[前序对话历史已由网关自适应折叠，保留核心结论与上下文]"}`。
-    """
-    if os.environ.get("GATEWAY_DISABLE_PROMPT_FOLDING", "").strip().lower() in ("1", "true", "yes"):
-        return messages
-
-    if not messages or len(messages) <= 1:
-        return messages
-
-    total_tokens = estimate_history_tokens(messages)
-    if total_tokens <= max_tokens:
-        return messages
-
-    # 1. 提取头部系统提示词 (index 0 及开头连续的 system 消息)
-    head_indices: List[int] = []
-    for i, m in enumerate(messages):
-        if m.get("role") == "system":
-            head_indices.append(i)
-        else:
-            break
-
-    # 2. 提取第一条用户消息 (初始任务指令)
-    first_user_idx: Optional[int] = None
-    for i in range(len(head_indices), len(messages)):
-        if messages[i].get("role") == "user":
-            first_user_idx = i
-            break
-
-    if first_user_idx is not None:
-        head_indices.append(first_user_idx)
-
-    head_end = (max(head_indices) + 1) if head_indices else 0
-
-    # 3. 确定保留的尾部最近轮次 (preserve_recent_turns)
-    tail_start = max(head_end, len(messages) - max(1, preserve_recent_turns))
-
-    # 维护工具调用配对平衡 (tool calling balance):
-    # 若 tail_start 恰好切割在 tool_result 处，或者前一条是发起了 tool_calls 的 assistant 消息，
-    # 向前推移 tail_start 确保 tool_use 与 tool_result 作为一个完整事务被同时保留在 tail 中。
-    while tail_start > head_end:
-        curr_msg = messages[tail_start]
-        prev_msg = messages[tail_start - 1]
-        if _is_tool_result_message(curr_msg):
-            tail_start -= 1
-            continue
-        if _has_tool_call(prev_msg):
-            tail_start -= 1
-            continue
-        break
-
-    # 如果中间轮次为空，说明所有消息均属于 Head 或 Tail
-    if head_end >= tail_start:
-        return messages
-
-    intermediate_msgs = messages[head_end:tail_start]
-
-    # 阶段一: 折叠中间轮次中的超长工具执行输出与长代码块
-    folded_intermediate: List[Dict[str, Any]] = []
-    for m in intermediate_msgs:
-        folded_m, _ = fold_single_message(m)
-        folded_intermediate.append(folded_m)
-
-    candidate_messages = messages[:head_end] + folded_intermediate + messages[tail_start:]
-    cand_tokens = estimate_history_tokens(candidate_messages)
-
-    if cand_tokens <= max_tokens:
-        return candidate_messages
-
-    # 阶段二: 若折叠超长工具输出后依然超载，收敛压缩中间老旧对话为紧凑摘要提示
-    summary_msg: Dict[str, Any] = {
-        "role": "user",
-        "content": SUMMARY_MARKER,
-    }
-
-    return messages[:head_end] + [summary_msg] + messages[tail_start:]
+    """自适应折叠对话历史（兼容旧函数接口）。"""
+    opt = PromptOptimizer(max_tokens=max_tokens, preserve_recent_turns=preserve_recent_turns)
+    folded, _ = opt.optimize_chat_messages(messages, max_tokens=max_tokens)
+    return folded
 
 
 def compute_prompt_hash(system_prompt: str, messages: List[Dict[str, Any]]) -> str:
