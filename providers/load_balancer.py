@@ -619,9 +619,11 @@ class AdaptiveLoadBalancer:
             "prompt_complexity_threshold": self.prompt_complexity_threshold,
             "total_active_concurrency": total_active,
             "total_qps": total_qps,
+            "total_requests": total_requests,
             "total_shed_count": total_shed,
             "total_degraded_count": total_degraded,
             "nodes": nodes_stat,
+            "providers": nodes_stat,
         }
 
     def reset(self) -> None:

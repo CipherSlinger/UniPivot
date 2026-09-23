@@ -78,6 +78,14 @@ class HealthMonitor:
             name: asyncio.Lock() for name in self._states
         }
 
+    def is_disabled(self, name: str) -> bool:
+        """检查提供方是否被环境变量 DISABLED_PROVIDERS 禁用。"""
+        disabled_str = os.getenv("DISABLED_PROVIDERS", "")
+        if not disabled_str:
+            return False
+        disabled_set = {p.strip().lower() for p in disabled_str.split(",") if p.strip()}
+        return (name or "").lower() in disabled_set
+
     def register_provider(
         self,
         name: str,
@@ -96,12 +104,25 @@ class HealthMonitor:
         self._healer_trigger = trigger
 
     def get_status(self, name: str) -> Optional[Dict[str, Any]]:
+        if self.is_disabled(name):
+            if name not in self._states:
+                self._states[name] = ProviderHealth()
+            self._states[name].status = "disabled"
+            self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
         h = self._states.get(name)
         return h.to_dict() if h else None
 
     def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
+        # 刷新 disabled 状态
+        for name in list(self._states.keys()):
+            if self.is_disabled(name):
+                self._states[name].status = "disabled"
+                self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
+
         # 刷新 configured 标志
         for name, resolver in self._provider_resolvers.items():
+            if self.is_disabled(name):
+                continue
             s = resolver()
             configured = bool(s and s.token)
             self._states[name].configured = configured
@@ -182,6 +203,15 @@ class HealthMonitor:
             self._check_locks[name] = asyncio.Lock()
 
         async with self._check_locks[name]:
+            if self.is_disabled(name):
+                logger.info("Provider %s 已被禁用 (DISABLED_PROVIDERS)，跳过健康探测", name)
+                if name not in self._states:
+                    self._states[name] = ProviderHealth()
+                self._states[name].status = "disabled"
+                self._states[name].last_error = "节点已被禁用 (DISABLED_PROVIDERS)"
+                self._states[name].last_check = time.time()
+                return False, "节点已被禁用 (DISABLED_PROVIDERS)"
+
             # 如果正在处于自愈中，不强行覆盖为 degraded/offline
             current_state = self._states.get(name)
             if current_state and current_state.status == "recovering":

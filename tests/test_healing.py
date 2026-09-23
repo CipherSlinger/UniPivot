@@ -204,11 +204,40 @@ def test_server_health_and_heal_endpoints():
     assert r_bad.status_code == 404
 
 
+def test_health_monitor_disabled_provider_skipping():
+    """测试 HealthMonitor 识别 DISABLED_PROVIDERS 并跳过网络探针与自愈。"""
+    os.environ["DISABLED_PROVIDERS"] = "deepseek,kimi"
+    try:
+        monitor = HealthMonitor()
+        mock_probe = AsyncMock(return_value=(False, "不应该被调用"))
+        monitor.probe_provider = mock_probe
+
+        # deepseek 被禁用，探测应直接返回且不调用底层网络探针
+        is_healthy, err = asyncio.run(monitor.check_provider("deepseek"))
+        assert mock_probe.call_count == 0
+        st = monitor.get_status("deepseek")
+        assert st["status"] == "disabled"
+        assert st["consecutive_failures"] == 0
+
+        # get_all_statuses 中 deepseek 与 kimi 状态为 disabled
+        all_st = monitor.get_all_statuses()
+        assert all_st["deepseek"]["status"] == "disabled"
+        assert all_st["kimi"]["status"] == "disabled"
+
+        # 未被禁用的 qwen 正常调用 probe_provider
+        asyncio.run(monitor.check_provider("qwen"))
+        assert mock_probe.call_count == 1
+    finally:
+        os.environ.pop("DISABLED_PROVIDERS", None)
+
+
 if __name__ == "__main__":
     test_agent_finder_and_version()
     print("[PASS] 智能体环境发现器与版本解析")
     test_health_state_machine_and_monitor()
     print("[PASS] 健康探测状态机跃迁与探针审计")
+    test_health_monitor_disabled_provider_skipping()
+    print("[PASS] HealthMonitor 禁用 Provider 跳过探针与标记 disabled")
     test_healer_prompt_and_model_picking()
     print("[PASS] 自愈决策器与 Prompt 提示词工程")
     test_healer_engine_execution()

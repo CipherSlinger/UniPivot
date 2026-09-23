@@ -627,11 +627,19 @@ def _configured(resolver) -> bool:
 @app.get("/health")
 async def health():
     providers_status = health_monitor.get_all_statuses()
+    disabled_set = failover_router.cooldown_tracker.disabled_providers | {
+        p.strip().lower() for p in os.getenv("DISABLED_PROVIDERS", "").split(",") if p.strip()
+    }
     for p_name, p_info in providers_status.items():
         meta = PROVIDER_RISK_SPECS.get(p_name)
         p_info["risk_level"] = meta.risk_level.value if meta else "medium"
         in_cd = failover_router.cooldown_tracker.is_in_cooldown(p_name)
         rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(p_name)
+        is_dis = p_name in disabled_set or p_info.get("status") == "disabled"
+        if is_dis:
+            p_info["status"] = "disabled"
+        p_info["is_disabled"] = is_dis
+        p_info["disabled"] = is_dis
         p_info["in_cooldown"] = in_cd
         p_info["cooldown_status"] = "in_cooldown" if in_cd else "ready"
         p_info["remaining_cooldown"] = round(rem_cd, 1)
@@ -640,6 +648,7 @@ async def health():
     healing_status = healing_engine.get_healing_status()
     return {
         "status": "ok",
+        "disabled_providers": sorted(list(disabled_set)),
         "qwen_configured": _configured(resolve_qwen),
         "deepseek_configured": _configured(resolve_deepseek),
         "doubao_configured": _configured(resolve_doubao),
@@ -715,8 +724,11 @@ async def get_rd_task(task_id: str):
 @app.get("/v1/diagnostics")
 @app.get("/diagnostics")
 async def get_diagnostics():
-    """实时系统状态、多提供方健康与度量诊断接口。"""
+    """实时���统状态、多提供方健康与度量诊断接口。"""
     all_statuses = health_monitor.get_all_statuses()
+    disabled_set = failover_router.cooldown_tracker.disabled_providers | {
+        p.strip().lower() for p in os.getenv("DISABLED_PROVIDERS", "").split(",") if p.strip()
+    }
     providers_diag = {}
 
     for p_name in ("qwen", "deepseek", "doubao", "kimi", "glm"):
@@ -727,9 +739,13 @@ async def get_diagnostics():
         consec_fails = p_state.get("consecutive_failures", 0)
         configured = p_state.get("configured", False)
         raw_status = p_state.get("status", "offline")
+        is_disabled = p_name in disabled_set or raw_status == "disabled"
 
-        # 映射规范化健康状态: healthy / degraded / failing / unhealthy
-        if not configured or raw_status == "offline":
+        # 映射规范化健康状态: healthy / degraded / failing / unhealthy / disabled
+        if is_disabled or raw_status == "disabled":
+            h_status = "disabled"
+            raw_status = "disabled"
+        elif not configured or raw_status == "offline":
             h_status = "unhealthy"
         elif raw_status == "recovering" or consec_fails >= 2:
             h_status = "failing"
@@ -749,6 +765,8 @@ async def get_diagnostics():
             "status": h_status,
             "health_status": h_status,
             "raw_status": raw_status,
+            "is_disabled": is_disabled,
+            "disabled": is_disabled,
             "risk_level": meta.risk_level.value.upper() if meta else "MEDIUM",
             "in_cooldown": bool(in_cd),
             "remaining_cooldown_s": round(float(rem_cd), 2),
@@ -846,9 +864,20 @@ async def get_diagnostics():
         "ttft_reduction_pct": 45.0 if cache_stats["cache_hits"] > 0 else 0.0,
     }
 
+    # 7. 自适应负载均衡器实时度量与被禁用节点列表
+    lb_stats = load_balancer.get_load_stats()
+    if "providers" not in lb_stats and "nodes" in lb_stats:
+        lb_stats["providers"] = lb_stats["nodes"]
+    if "total_requests" not in lb_stats:
+        lb_stats["total_requests"] = sum(
+            node.get("request_count", 0) for node in lb_stats.get("nodes", {}).values()
+        )
+
     return {
         "status": "ok",
         "timestamp": time.time(),
+        "disabled_providers": sorted(list(disabled_set)),
+        "load_balancer": lb_stats,
         "providers": providers_diag,
         "capability_rings": capability_rings,
         "healing_status": healing_status,

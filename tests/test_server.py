@@ -1370,7 +1370,44 @@ def test_diagnostics_endpoint():
         assert "status" in pool
         assert "active_connections" in pool
 
+        # 6. 验证自适应负载均衡器统计指标 (load_balancer)
+        assert "load_balancer" in data
+        lb = data["load_balancer"]
+        assert "providers" in lb
+        assert "total_requests" in lb
+        assert "high_watermark_ratio" in lb
+        assert "total_active_concurrency" in lb
+        assert "total_qps" in lb
+        for p in ("qwen", "deepseek", "doubao", "kimi", "glm"):
+            assert p in lb["providers"]
+            p_metric = lb["providers"][p]
+            assert "active_concurrency" in p_metric
+            assert "max_concurrency" in p_metric
+            assert "concurrency_ratio" in p_metric
+            assert "avg_ttft_ms" in p_metric
+            assert "error_rate" in p_metric
+
+        # 7. 验证 disabled_providers 列表
+        assert "disabled_providers" in data
+        assert isinstance(data["disabled_providers"], list)
+
     print("[PASS] server: GET /v1/diagnostics 与 /diagnostics 诊断指标接口验证通过")
+
+
+def test_diagnostics_with_disabled_provider():
+    """验证当环境变量设置 DISABLED_PROVIDERS 时，/v1/diagnostics 暴露被禁用节点列表及对应节点状态。"""
+    os.environ["DISABLED_PROVIDERS"] = "deepseek"
+    srv.failover_router.cooldown_tracker.reset()
+    try:
+        client = TestClient(srv.app)
+        r = client.get("/v1/diagnostics")
+        assert r.status_code == 200
+        data = r.json()
+        assert "deepseek" in data["disabled_providers"]
+        assert data["providers"]["deepseek"]["health_status"] == "disabled"
+    finally:
+        os.environ.pop("DISABLED_PROVIDERS", None)
+        srv.failover_router.cooldown_tracker.reset()
 
 
 def test_reports_latest_endpoint():
@@ -1596,6 +1633,7 @@ if __name__ == "__main__":
     test_kimi_and_glm_model_routing()
     test_peer_to_peer_mutual_failover()
     test_diagnostics_endpoint()
+    test_diagnostics_with_disabled_provider()
     test_reports_latest_endpoint()
     test_disabled_provider_zero_latency_switch()
     test_adaptive_load_balancer_metrics_and_degradation()
