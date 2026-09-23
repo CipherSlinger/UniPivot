@@ -37,6 +37,7 @@ import json
 import os
 import sys
 import time
+import unittest
 from pathlib import Path
 from typing import AsyncIterator, Optional, Tuple
 
@@ -474,6 +475,39 @@ def test_server_health_and_failover_integration():
     print("[PASS] Test 5: 服务端 GET /health 状态报送与端点透明故障转移透传通过")
 
 
+class TestFailoverGrid(unittest.TestCase):
+    def test_disabled_providers_exclusion(self):
+        os.environ["DISABLED_PROVIDERS"] = "deepseek,glm"
+        try:
+            tracker = CooldownTracker()
+            self.assertTrue(tracker.is_disabled("deepseek"))
+            self.assertTrue(tracker.is_disabled("glm"))
+            self.assertFalse(tracker.is_disabled("qwen"))
+
+            router = FailoverRouter()
+            candidates = router.get_fallback_candidates("qwen", "Qwen3.7-Max")
+            keys = [c.provider_key for c in candidates]
+            self.assertNotIn("deepseek", keys)
+            self.assertNotIn("glm", keys)
+        finally:
+            os.environ.pop("DISABLED_PROVIDERS", None)
+
+    def test_classify_capability_ring(self):
+        test_classify_capability_ring()
+
+    def test_provider_risk_meta_and_cooldown_tracker(self):
+        test_provider_risk_meta_and_cooldown_tracker()
+
+    def test_fallback_candidates(self):
+        test_fallback_candidates()
+
+    def test_execute_chat_scenarios(self):
+        test_execute_chat_scenarios()
+
+    def test_server_health_and_failover_integration(self):
+        test_server_health_and_failover_integration()
+
+
 def main():
     print("=" * 60)
     print("开始运行对等互备网格与风险频控步调系统单测...")
@@ -491,4 +525,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()

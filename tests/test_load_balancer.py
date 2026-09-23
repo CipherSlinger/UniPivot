@@ -195,6 +195,37 @@ class TestLoadBalancer(unittest.TestCase):
         self.assertIn("doubao", stats["nodes"])
         self.assertIn("glm", stats["nodes"])
 
+    def test_disabled_provider_routing(self):
+        import os
+        old_val = os.environ.get("DISABLED_PROVIDERS")
+        try:
+            os.environ["DISABLED_PROVIDERS"] = "deepseek,glm"
+            tracker = CooldownTracker()
+            lb = AdaptiveLoadBalancer(cooldown_tracker=tracker)
+
+            # is_high_load should identify disabled provider
+            is_busy, reason = lb.is_high_load("deepseek")
+            self.assertTrue(is_busy)
+            self.assertIn("禁用", reason)
+
+            # select_route with primary_provider="deepseek" (REASONING ring)
+            # REASONING ring: deepseek, kimi, qwen, doubao, glm
+            # deepseek and glm are disabled -> should select kimi, qwen, or doubao
+            decision = lb.select_route(
+                primary_provider="deepseek",
+                primary_model="deepseek-reasoner",
+                prompt_tokens=500,
+            )
+            self.assertNotEqual(decision.provider_key, "deepseek")
+            self.assertNotEqual(decision.provider_key, "glm")
+            self.assertIn(decision.provider_key, ["qwen", "kimi", "doubao"])
+            self.assertEqual(decision.ring, CapabilityRing.REASONING)
+        finally:
+            if old_val is not None:
+                os.environ["DISABLED_PROVIDERS"] = old_val
+            else:
+                os.environ.pop("DISABLED_PROVIDERS", None)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -316,6 +316,10 @@ class AdaptiveLoadBalancer:
         """判定指定提供方是否处于高风控水位或高负载状态。
         返回 (is_high_load, reason)
         """
+        # 0. 禁用检查
+        if self.cooldown_tracker.is_disabled(provider_key):
+            return True, "节点已被禁用 (DISABLED_PROVIDERS)"
+
         # 1. 冷却期检查
         if self.cooldown_tracker.is_in_cooldown(provider_key):
             rem = self.cooldown_tracker.get_remaining_cooldown(provider_key)
@@ -362,6 +366,73 @@ class AdaptiveLoadBalancer:
            若主节点健康且负载在安全水位，走原始模型路由。
         """
         ring = classify_capability_ring(primary_provider, primary_model)
+
+        # ------------------------------------------------ 0. 初选提供方主动禁用拦截 (Disabled Provider Redirection)
+        if self.cooldown_tracker.is_disabled(primary_provider):
+            same_ring_candidates = [
+                (pk, wm)
+                for pk, wm in self.ring_definitions.get(ring, [])
+                if pk != primary_provider
+            ]
+            best_alt = self._pick_best_candidate(
+                candidates=same_ring_candidates,
+                preferred_provider=None,
+                now=now,
+            )
+            if best_alt:
+                alt_pk, alt_model = best_alt
+                self.get_metrics(primary_provider).record_shed(as_source=True)
+                self.get_metrics(alt_pk).record_shed(as_source=False)
+                reason = (
+                    f"主节点 [{primary_provider}] 已被禁用 (DISABLED_PROVIDERS)，"
+                    f"同环打散分流至健康备用节点 [{alt_pk}:{alt_model}]"
+                )
+                logger.info(f"[负载均衡] 被禁同环分流: {primary_provider}:{primary_model} -> {alt_pk}:{alt_model}")
+                return BalancingDecision(
+                    provider_key=alt_pk,
+                    wire_model=alt_model,
+                    action="shedded",
+                    original_provider=primary_provider,
+                    original_model=primary_model,
+                    ring=ring,
+                    reason=reason,
+                )
+
+            # 若同环暂无可用备选，尝试 SPEED 环备选
+            speed_candidates = self.ring_definitions.get(CapabilityRing.SPEED, [])
+            best_speed = self._pick_best_candidate(
+                candidates=speed_candidates,
+                preferred_provider=None,
+                now=now,
+            )
+            if best_speed:
+                speed_pk, speed_model = best_speed
+                self.get_metrics(primary_provider).record_degraded(as_source=True)
+                self.get_metrics(speed_pk).record_degraded(as_source=False)
+                reason = (
+                    f"主节点 [{primary_provider}] 已被禁用且同环无可用节点，"
+                    f"降级至 SPEED 环备选 [{speed_pk}:{speed_model}]"
+                )
+                logger.info(f"[负载均衡] 被禁跨环降级: {primary_provider}:{primary_model} -> {speed_pk}:{speed_model}")
+                return BalancingDecision(
+                    provider_key=speed_pk,
+                    wire_model=speed_model,
+                    action="degraded",
+                    original_provider=primary_provider,
+                    original_model=primary_model,
+                    ring=CapabilityRing.SPEED,
+                    reason=reason,
+                )
+
+            return BalancingDecision(
+                provider_key=primary_provider,
+                wire_model=primary_model,
+                action="normal",
+                original_provider=primary_provider,
+                original_model=primary_model,
+                ring=ring,
+                reason=f"主节点 [{primary_provider}] 已被禁用且无可用备用节点",
+            )
 
         # ------------------------------------------------ 1. 轻量请求自适应降级 (Query Complexity Degradation)
         is_lightweight = (
@@ -449,6 +520,10 @@ class AdaptiveLoadBalancer:
         """从候选列表中挑选健康度最高、并发最低的最优节点"""
         available = []
         for pk, wm in candidates:
+            # 排除处于禁用状态的节点
+            if self.cooldown_tracker.is_disabled(pk):
+                continue
+
             # 排除处于冷却避让期的节点
             if self.cooldown_tracker.is_in_cooldown(pk):
                 continue

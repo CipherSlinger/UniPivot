@@ -175,6 +175,12 @@ class CooldownTracker:
     """动态冷却与避让跟踪器"""
 
     def __init__(self):
+        # 禁用提供方配置 (从环境变量 DISABLED_PROVIDERS 读取，逗号分隔，如 "deepseek,glm")
+        disabled_str = os.getenv("DISABLED_PROVIDERS", "")
+        self.disabled_providers: Set[str] = {
+            p.strip().lower() for p in disabled_str.split(",") if p.strip()
+        }
+
         # provider -> float (冷却结束的时间戳)
         self._cooldowns: Dict[str, float] = {}
         # provider -> 连续失败次数
@@ -188,6 +194,10 @@ class CooldownTracker:
         }
         # 保护锁
         self._lock = asyncio.Lock()
+
+    def is_disabled(self, provider_key: str) -> bool:
+        """检查指定 Provider 是否被配置主动禁用"""
+        return (provider_key or "").lower() in self.disabled_providers
 
     def is_in_cooldown(self, provider_key: str) -> bool:
         """检查指定 Provider 是否处于冷却避让期"""
@@ -287,6 +297,10 @@ class CooldownTracker:
         self._cooldowns.clear()
         self._failure_counts.clear()
         self._last_call_time.clear()
+        disabled_str = os.getenv("DISABLED_PROVIDERS", "")
+        self.disabled_providers = {
+            p.strip().lower() for p in disabled_str.split(",") if p.strip()
+        }
 
 
 @dataclass
@@ -324,11 +338,15 @@ class FailoverEvent:
 class FailoverRouter:
     """五大模型对等互备路由网格调度器"""
 
-    def __init__(self, provider_factory_map: Optional[Dict[str, Callable]] = None):
+    def __init__(
+        self,
+        provider_factory_map: Optional[Dict[str, Callable]] = None,
+        cooldown_tracker: Optional[CooldownTracker] = None,
+    ):
         """
         provider_factory_map: provider_key -> 实例化 provider 的无参或单参 lambda
         """
-        self.cooldown_tracker = CooldownTracker()
+        self.cooldown_tracker = cooldown_tracker or CooldownTracker()
         self._factory_map = provider_factory_map or {}
 
     def set_provider_factory(self, provider_key: str, factory: Callable) -> None:
@@ -343,7 +361,7 @@ class FailoverRouter:
         """根据当前主选节点生成同等能力环内的有序候选节点列表。
 
         排序策略：
-        1. 排除当前排除集（已尝试失败过的 Provider）
+        1. 排除当前排除集（已尝试失败过的 Provider 以及被主动禁用的 Provider）
         2. 健康节点排在冷却避让中节点之前
         3. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
         4. 同等风险下，按历史失败次数升序排列
@@ -356,7 +374,7 @@ class FailoverRouter:
 
         # 遍历环中所有成员
         for p_key, w_model in ring_members:
-            if p_key in excluded:
+            if p_key in excluded or self.cooldown_tracker.is_disabled(p_key):
                 continue
 
             meta = PROVIDER_RISK_SPECS.get(p_key)
