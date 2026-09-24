@@ -97,6 +97,7 @@ from providers import (
 from providers.base import _est_tokens, _id
 from providers import http_client
 from providers.http_client import close_http_client, get_default_limits, get_http_client
+from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
 from session_store import (
     MAX_AGE,
     resolve_deepseek,
@@ -884,6 +885,7 @@ async def get_diagnostics():
         "agent_cli": agent_cli,
         "http_pool": http_pool,
         "prompt_cache": prompt_cache,
+        "prompt_optimizer": prompt_optimizer.get_stats(),
     }
 
 
@@ -1119,6 +1121,10 @@ async def chat_completions(req: ChatCompletionRequest):
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_tokens if req.max_tokens is not None else 2048
 
+    # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
+    messages, fold_meta = prompt_optimizer.optimize_chat_messages(messages)
+    fold_headers = make_prompt_folding_headers(fold_meta)
+
     # 1. 估算 prompt tokens 与思考意图
     prompt_text = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
     prompt_tokens = _est_tokens(prompt_text)
@@ -1151,6 +1157,7 @@ async def chat_completions(req: ChatCompletionRequest):
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(lb_headers)
+        stream_headers.update(fold_headers)
 
         async def gen():
             cid = _id("chatcmpl")
@@ -1489,6 +1496,7 @@ async def chat_completions(req: ChatCompletionRequest):
     full_reasoning = "".join(reasoning_chunks)
 
     resp_headers = dict(lb_headers)
+    resp_headers.update(fold_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1556,6 +1564,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     gateway_messages = convert_anthropic_to_gateway_messages(
         req.messages, system=req.system, tools=req.tools
     )
+    # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
+    gateway_messages, fold_meta = prompt_optimizer.optimize_chat_messages(gateway_messages)
+    fold_headers = make_prompt_folding_headers(fold_meta)
+
     input_text = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(input_text)
     temperature = req.temperature if req.temperature is not None else 0.7
@@ -1594,6 +1606,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(lb_headers)
+        stream_headers.update(fold_headers)
 
         async def gen():
             msg_id = _id("msg", "_")
@@ -1863,6 +1876,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     msg_id = _id("msg", "_")
 
     resp_headers = dict(lb_headers)
+    resp_headers.update(fold_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1935,6 +1949,10 @@ async def responses_endpoint(req: ResponsesRequest):
             error_response("`input` 或 `instructions` 不能为空", 400, "invalid_request_error"),
             status_code=400,
         )
+
+    # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
+    gateway_messages, fold_meta = prompt_optimizer.optimize_chat_messages(gateway_messages)
+    fold_headers = make_prompt_folding_headers(fold_meta)
 
     provider_key, wire_model = resolve_model(req.model)
     if not provider_key:
@@ -2015,6 +2033,7 @@ async def responses_endpoint(req: ResponsesRequest):
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
 
     resp_headers = dict(lb_headers)
+    resp_headers.update(fold_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,

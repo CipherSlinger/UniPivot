@@ -1391,6 +1391,16 @@ def test_diagnostics_endpoint():
         assert "disabled_providers" in data
         assert isinstance(data["disabled_providers"], list)
 
+        # 8. 验证 prompt_optimizer 统计指标
+        assert "prompt_optimizer" in data
+        po = data["prompt_optimizer"]
+        assert "total_inspections" in po
+        assert "total_folded_requests" in po
+        assert "total_saved_tokens" in po
+        assert "max_tokens" in po
+        assert "preserve_recent_turns" in po
+        assert "folding_enabled" in po
+
     print("[PASS] server: GET /v1/diagnostics 与 /diagnostics 诊断指标接口验证通过")
 
 
@@ -1610,6 +1620,131 @@ def test_adaptive_load_balancer_metrics_and_degradation():
     print("[PASS] test_adaptive_load_balancer_metrics_and_degradation: 自适应降级与生命周期度量验证通过")
 
 
+def test_prompt_folding_headers_and_truncation():
+    """测试提示词自适应压缩与历史折叠响应头透传与截断功能：
+    1. 正常短会话：返回 x-prompt-folding-applied: false，saved-tokens: 0；
+    2. 中间包含超长工具调用日志的长会话：触发阶段一截断，返回 x-prompt-folding-applied: true，且 saved-tokens > 0；
+    3. 覆盖 OpenAI (/v1/chat/completions)、Anthropic (/v1/messages) 与 Responses (/v1/responses)；
+    4. 环境变量 GATEWAY_DISABLE_PROMPT_FOLDING=1 零损耗穿透。
+    """
+    srv._make_provider = lambda key: EchoProvider()
+    client = TestClient(srv.app)
+
+    # 1. 正常短对话
+    r_short = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "你好"}]},
+    )
+    assert r_short.status_code == 200
+    assert r_short.headers.get("x-prompt-folding-applied") == "false"
+    assert r_short.headers.get("x-prompt-folding-saved-tokens") == "0"
+
+    # 2. 构造包含超长中间 tool 输出的对话
+    huge_tool_data = "Log line " * 800  # ~7200 字符
+    long_messages = [
+        {"role": "system", "content": "You are a coding agent."},
+        {"role": "user", "content": "Please check the build logs."},
+        {
+            "role": "assistant",
+            "content": "Checking logs...",
+            "tool_calls": [{"id": "call_1", "type": "function", "function": {"name": "Bash"}}],
+        },
+        {"role": "tool", "tool_call_id": "call_1", "content": huge_tool_data},
+        {"role": "assistant", "content": "I see the build logs."},
+        {"role": "user", "content": "Question 1"},
+        {"role": "assistant", "content": "Answer 1"},
+        {"role": "user", "content": "What is the final status?"},
+    ]
+
+    # 临时调小 max_tokens 以便在测试中稳定触发折叠
+    orig_max_tokens = srv.prompt_optimizer.max_tokens
+    srv.prompt_optimizer.max_tokens = 500
+    try:
+        # OpenAI 协议测试
+        r_folded_chat = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": long_messages},
+        )
+        assert r_folded_chat.status_code == 200
+        assert r_folded_chat.headers.get("x-prompt-folding-applied") == "true"
+        saved = int(r_folded_chat.headers.get("x-prompt-folding-saved-tokens", "0"))
+        assert saved > 0
+        orig_toks = int(r_folded_chat.headers.get("x-prompt-folding-original-tokens", "0"))
+        final_toks = int(r_folded_chat.headers.get("x-prompt-folding-final-tokens", "0"))
+        assert orig_toks > final_toks
+        assert orig_toks - final_toks == saved
+
+        # Anthropic 协议测试
+        ant_messages = [
+            {"role": "user", "content": "Please check the build logs."},
+            {
+                "role": "assistant",
+                "content": [
+                    {"type": "text", "text": "Running bash command..."},
+                    {"type": "tool_use", "id": "tu_1", "name": "Bash", "input": {"cmd": "build"}},
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "tu_1", "content": huge_tool_data}
+                ],
+            },
+            {"role": "assistant", "content": "I see the result."},
+            {"role": "user", "content": "Recent 1"},
+            {"role": "assistant", "content": "Answer 1"},
+            {"role": "user", "content": "What is the result?"},
+        ]
+        r_ant = client.post(
+            "/v1/messages",
+            headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+            json={
+                "model": "claude-3-7-sonnet",
+                "system": "You are a coding agent.",
+                "messages": ant_messages,
+            },
+        )
+        assert r_ant.status_code == 200
+        assert r_ant.headers.get("x-prompt-folding-applied") == "true"
+        assert int(r_ant.headers.get("x-prompt-folding-saved-tokens", "0")) > 0
+
+        # Responses 协议测试
+        resp_input = [
+            {"type": "message", "role": "user", "content": "Please check build"},
+            {"type": "message", "role": "assistant", "content": "Running..."},
+            {"type": "message", "role": "tool", "content": huge_tool_data},
+            {"type": "message", "role": "assistant", "content": "Done."},
+            {"type": "message", "role": "user", "content": "Query 1"},
+            {"type": "message", "role": "assistant", "content": "Answer 1"},
+            {"type": "message", "role": "user", "content": "Summary?"},
+        ]
+        r_resp = client.post(
+            "/v1/responses",
+            json={"model": "gpt-4o", "input": resp_input},
+        )
+        assert r_resp.status_code == 200
+        assert r_resp.headers.get("x-prompt-folding-applied") == "true"
+        assert int(r_resp.headers.get("x-prompt-folding-saved-tokens", "0")) > 0
+
+        # 环境变量禁用折叠测试
+        os.environ["GATEWAY_DISABLE_PROMPT_FOLDING"] = "1"
+        try:
+            r_disabled = client.post(
+                "/v1/chat/completions",
+                json={"model": "qwen", "messages": long_messages},
+            )
+            assert r_disabled.status_code == 200
+            assert r_disabled.headers.get("x-prompt-folding-applied") == "false"
+            assert r_disabled.headers.get("x-prompt-folding-saved-tokens") == "0"
+        finally:
+            os.environ.pop("GATEWAY_DISABLE_PROMPT_FOLDING", None)
+
+    finally:
+        srv.prompt_optimizer.max_tokens = orig_max_tokens
+
+    print("[PASS] test_prompt_folding_headers_and_truncation: 自适应折叠与全协议响应头透传验证通过")
+
+
 if __name__ == "__main__":
     test_unknown_model_404()
     test_empty_messages_400()
@@ -1649,4 +1784,5 @@ if __name__ == "__main__":
     test_reports_latest_endpoint()
     test_disabled_provider_zero_latency_switch()
     test_adaptive_load_balancer_metrics_and_degradation()
+    test_prompt_folding_headers_and_truncation()
     print("服务端集成测试全部通过")
