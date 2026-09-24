@@ -288,16 +288,14 @@ class CooldownTracker:
             # 401 令牌过期也需要避让
             is_auth_error = status == 401
 
-            if is_risk:
-                # 触发平台风控拦截（滑块、盾、CF、Token失效等），强制长效动态避让
-                cooldown_duration = max(base_cd * 2.0, base_cd * (1.2 ** min(cur_fails - 1, 3)))
-                logger.warning(
-                    f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: {risk_reason}，"
-                    f"触发长效避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
-                )
-            elif is_waf_or_rate:
-                # 针对频控加权冷却
+            if is_risk or is_waf_or_rate:
+                # 针对频控与风控加权冷却 (指数退避: base_cd * (1.2 ** min(cur_fails - 1, 3)))
                 cooldown_duration = base_cd * (1.2 ** min(cur_fails - 1, 3))
+                if is_risk:
+                    logger.warning(
+                        f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: {risk_reason}，"
+                        f"触发避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
+                    )
             elif is_auth_error:
                 cooldown_duration = max(60.0, base_cd)
             else:

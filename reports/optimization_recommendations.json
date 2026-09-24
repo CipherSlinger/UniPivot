@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-09-23 16:29:34",
+  "generated_at": "2026-09-24 12:08:07",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -49,6 +49,8 @@
   "optimization_opportunities": [
     {
       "id": "OPT-001",
+      "status": "COMPLETED",
+      "status_display": "已落地",
       "category": "性能与延迟优化",
       "title": "长上下文 Prompt Cache 预计算与复用机制",
       "priority": "P0",
@@ -82,6 +84,16 @@
       "priority": "P2",
       "description": "优化前端 index.html 与 Anthropic 思考块流式分包策略，使推理过程平滑呈现且支持客户端实时进度条提示。",
       "expected_impact": "提升复杂研发任务下的开发者端到端交互感知与调试透明度。"
+    },
+    {
+      "id": "OPT-005",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "稳定性与风控规避",
+      "title": "上游多平台反爬风控拦截避让与自适应流量整形 (TrafficPacer)",
+      "priority": "P0",
+      "description": "针对国内各大模型厂商 WAF（阿里 RGV587、字节盾、DeepSeek 认证失效、Cloudflare 人机挑战等）建立专用指纹识别库，引入动态并发控制与拟人 Jitter，并在命中风控时实现加权指数退避与同环透明零中断转移。",
+      "expected_impact": "彻底杜绝多会话并发导致的 WAF 拦截风暴，提高服务可用性至 99.9% 并提供透明的 x-risk-* 遥测指标。"
     }
   ],
   "system_health": "good"
