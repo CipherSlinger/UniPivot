@@ -233,6 +233,8 @@ class TaskEvaluator:
             },
             {
                 "id": "OPT-004",
+                "status": "COMPLETED",
+                "status_display": "已落地",
                 "category": "协议与体验增强",
                 "title": "思考流 (Thinking Stream) 增量语法高亮与折叠加速",
                 "priority": "P2",
@@ -296,7 +298,7 @@ class TaskEvaluator:
         md_lines.extend([
             "## 3. 验收结论与下一步演进路线",
             "当前网关在多协议转换（OpenAI Chat / Anthropic Messages / Realtime Responses）与五大上游提供方稳定性表现优异。",
-            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）及 `OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）均已全部落地并完成全套 11 个测试套件回归验证。",
+            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）及 `OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）均已全部落地并完成全套测试套件回归验证。",
             "网关已具备全自动自愈、自适应步调控制与长效反爬规避能力，全流程稳定健壮。",
             "",
         ])

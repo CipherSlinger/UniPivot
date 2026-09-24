@@ -1806,6 +1806,68 @@ def test_risk_avoidance_headers_and_cooldown():
     print("[PASS] test_risk_avoidance_headers_and_cooldown: 流量整形响应头与避让冷却透传验证通过")
 
 
+def test_thinking_telemetry_headers_and_diagnostics():
+    """验证思考流 (Thinking Stream) 遥测响应头与 /v1/diagnostics 扩展：
+    1. 非流式推理产出 reasoning 时，全协议 (OpenAI / Anthropic / Responses) 注入 x-thinking-duration-ms 与 x-thinking-tokens；
+    2. GET /v1/diagnostics 包含 thinking_stream 诊断与特性清单。
+    """
+    srv._make_provider = lambda key: ReasoningEchoProvider()
+    client = TestClient(srv.app)
+
+    # 1. OpenAI 协议非流式思考头验证
+    r_chat = client.post(
+        "/v1/chat/completions",
+        json={"model": "deepseek-reasoner", "messages": [{"role": "user", "content": "思考测试"}]},
+    )
+    assert r_chat.status_code == 200
+    assert "x-thinking-duration-ms" in r_chat.headers
+    assert "x-thinking-tokens" in r_chat.headers
+    duration_ms = float(r_chat.headers["x-thinking-duration-ms"])
+    assert duration_ms > 0.0
+    tokens = int(r_chat.headers["x-thinking-tokens"])
+    assert tokens > 0
+
+    # 2. Anthropic 协议非流式思考头验证
+    r_ant = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        json={"model": "claude-3-7-sonnet", "messages": [{"role": "user", "content": "思考测试"}]},
+    )
+    assert r_ant.status_code == 200
+    assert "x-thinking-duration-ms" in r_ant.headers
+    assert "x-thinking-tokens" in r_ant.headers
+    assert float(r_ant.headers["x-thinking-duration-ms"]) > 0.0
+    assert int(r_ant.headers["x-thinking-tokens"]) > 0
+
+    # 3. Responses (Codex CLI) 协议非流式思考头验证
+    r_resp = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4o", "input": "思考测试"},
+    )
+    assert r_resp.status_code == 200
+    assert "x-thinking-duration-ms" in r_resp.headers
+    assert "x-thinking-tokens" in r_resp.headers
+    assert float(r_resp.headers["x-thinking-duration-ms"]) > 0.0
+    assert int(r_resp.headers["x-thinking-tokens"]) > 0
+
+    # 4. GET /v1/diagnostics 诊断指标中 thinking_stream 校验
+    r_diag = client.get("/v1/diagnostics")
+    assert r_diag.status_code == 200
+    diag_data = r_diag.json()
+    assert "thinking_stream" in diag_data
+    ts_info = diag_data["thinking_stream"]
+    assert ts_info["status"] == "supported"
+    assert "openai_chat" in ts_info["supported_protocols"]
+    assert "anthropic_messages" in ts_info["supported_protocols"]
+    assert "openai_responses" in ts_info["supported_protocols"]
+    assert "reasoning_content_streaming" in ts_info["features"]
+    assert "thinking_block_state_machine" in ts_info["features"]
+    assert "telemetry_headers" in ts_info["features"]
+    assert "auto_fold_and_highlighting" in ts_info["features"]
+
+    print("[PASS] test_thinking_telemetry_headers_and_diagnostics: 思考流全协议遥测响应头与诊断架构验证通过")
+
+
 if __name__ == "__main__":
     test_unknown_model_404()
     test_empty_messages_400()
@@ -1847,4 +1909,5 @@ if __name__ == "__main__":
     test_adaptive_load_balancer_metrics_and_degradation()
     test_prompt_folding_headers_and_truncation()
     test_risk_avoidance_headers_and_cooldown()
+    test_thinking_telemetry_headers_and_diagnostics()
     print("服务端集成测试全部通过")

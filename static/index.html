@@ -758,7 +758,7 @@
     border-bottom: 1px solid var(--border);
   }
 
-  .think-summary-left {
+  .think-title-wrap {
     display: flex;
     align-items: center;
     gap: 7px;
@@ -2594,6 +2594,18 @@ function renderMarkdown(md) {
 }
 
 /**
+ * 虚拟闭合未闭合的代码块 (流式代码语法自愈)
+ */
+function balanceCodeFences(text) {
+  if (!text) return "";
+  const matches = text.match(/```/g);
+  if (matches && matches.length % 2 !== 0) {
+    return text + "\n```";
+  }
+  return text;
+}
+
+/**
  * 渲染整段消息内容（自动提取与流式支持 <think>...</think>）
  */
 function renderMessageContent(rawText, isStreaming = false) {
@@ -2615,39 +2627,79 @@ function renderMessageContent(rawText, isStreaming = false) {
 
     let html = "";
     if (before.trim()) {
-      html += renderMarkdown(before);
+      html += renderMarkdown(balanceCodeFences(before));
     }
 
     // 思考过程抽屉
     if (thinkText || isStreaming) {
       const isClosed = (thinkEnd !== -1);
       const openAttr = (!isClosed || isStreaming) ? " open" : "";
-      const statusTitle = isClosed ? "思考完成" : "深度思考中...";
+      const estToks = Math.max(1, Math.round(thinkText.length * 0.7));
+      const statusTitle = isClosed ? `✅ 已深度思考 (~${estToks} tok)` : "深度思考中...";
+      const badgeClass = isClosed ? "think-status-badge completed" : "think-status-badge thinking";
       const pulseIndicator = isClosed ? "" : '<span class="think-pulse-dot"></span>';
 
       html += `
-        <details class="think-box"${openAttr}>
+        <details class="think-box"${openAttr} data-raw-thinking="${escapeHtml(thinkText)}">
           <summary class="think-summary">
             <div class="think-title-wrap">
+              <span class="think-toggle-icon">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+              </span>
               ${pulseIndicator}
-              <span>💭 思考过程</span>
+              <span class="think-header-title">思考过程</span>
+              <span class="${badgeClass}">${statusTitle}</span>
             </div>
-            <span class="think-status-badge">${statusTitle}</span>
+            <div class="think-summary-right">
+              <button class="think-copy-btn" type="button" onclick="event.stopPropagation(); copyThinkingBlock(this)">
+                <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                  <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                  <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+                </svg>
+                <span>复制思考</span>
+              </button>
+            </div>
           </summary>
           <div class="think-body">
-            ${renderMarkdown(thinkText)}
+            ${renderMarkdown(balanceCodeFences(thinkText))}
             ${!isClosed ? '<span class="cursor"></span>' : ''}
           </div>
         </details>`;
     }
 
     if (after.trim() || (!after && thinkEnd !== -1 && isStreaming)) {
-      html += renderMarkdown(after);
+      html += renderMarkdown(balanceCodeFences(after));
     }
     return html;
   }
 
-  return renderMarkdown(rawText);
+  return renderMarkdown(balanceCodeFences(rawText));
+}
+
+/**
+ * 复制思考过程块文本
+ */
+function copyThinkingBlock(btn) {
+  const thinkBox = btn.closest(".think-box");
+  if (!thinkBox) return;
+  const rawText = thinkBox.getAttribute("data-raw-thinking") || thinkBox.querySelector(".think-body")?.innerText || "";
+  if (!rawText.trim()) return;
+
+  navigator.clipboard.writeText(rawText.trim()).then(() => {
+    const origHTML = btn.innerHTML;
+    btn.classList.add("copied");
+    btn.innerHTML = `
+      <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5">
+        <polyline points="20 6 9 17 4 12"></polyline>
+      </svg>
+      <span>已复制</span>`;
+    setTimeout(() => {
+      btn.innerHTML = origHTML;
+      btn.classList.remove("copied");
+    }, 2000);
+  }).catch(() => {
+    alert("复制失败，请手动选中文本");
+  });
 }
 
 /**
@@ -2777,6 +2829,197 @@ function appendMessage(role, content, modelName) {
     failoverContainer: wrap.querySelector(".failover-container"),
     failoverRendered: false,
     text: "",
+    reasoningText: "",
+    contentText: "",
+    thinkEl: null,
+    bodyEl: null,
+    thinkBodyEl: null,
+    thinkBadgeEl: null,
+    thinkPulseEl: null,
+    userManuallyToggledThink: false,
+    isThinking: false,
+    thinkingStartTime: null,
+    thinkingEndTime: null,
+    thinkingTimerInterval: null,
+    rafId: null,
+    pendingReasoningChange: false,
+    pendingContentChange: false,
+
+    initStreamContainers: function() {
+      if (this.thinkEl || this.bodyEl) return;
+      this.contentEl.innerHTML = "";
+
+      const thinkBox = document.createElement("details");
+      thinkBox.className = "think-box";
+      thinkBox.open = true;
+      thinkBox.style.display = "none";
+      thinkBox.innerHTML = `
+        <summary class="think-summary">
+          <div class="think-title-wrap">
+            <span class="think-toggle-icon">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5"><polyline points="9 18 15 12 9 6"></polyline></svg>
+            </span>
+            <span class="think-pulse-dot"></span>
+            <span class="think-header-title">思考过程</span>
+            <span class="think-status-badge thinking">深度思考中...</span>
+          </div>
+          <div class="think-summary-right">
+            <button class="think-copy-btn" type="button" onclick="event.stopPropagation(); copyThinkingBlock(this)">
+              <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+                <rect x="9" y="9" width="13" height="13" rx="2" ry="2"></rect>
+                <path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"></path>
+              </svg>
+              <span>复制思考</span>
+            </button>
+          </div>
+        </summary>
+        <div class="think-body"></div>
+      `;
+
+      thinkBox.addEventListener("toggle", (e) => {
+        if (e.isTrusted) {
+          this.userManuallyToggledThink = true;
+        }
+      });
+
+      const bodyWrap = document.createElement("div");
+      bodyWrap.className = "content-body-wrap";
+
+      this.contentEl.appendChild(thinkBox);
+      this.contentEl.appendChild(bodyWrap);
+
+      this.thinkEl = thinkBox;
+      this.thinkBodyEl = thinkBox.querySelector(".think-body");
+      this.thinkBadgeEl = thinkBox.querySelector(".think-status-badge");
+      this.thinkPulseEl = thinkBox.querySelector(".think-pulse-dot");
+      this.bodyEl = bodyWrap;
+    },
+
+    appendReasoning: function(delta) {
+      this.initStreamContainers();
+      if (!this.isThinking) {
+        this.isThinking = true;
+        this.thinkingStartTime = performance.now();
+        this.thinkEl.style.display = "block";
+        this.thinkEl.open = true;
+        this.startThinkingTimer();
+      }
+      this.reasoningText = (this.reasoningText || "") + delta;
+      this.pendingReasoningChange = true;
+      this.scheduleRafFlush();
+    },
+
+    appendContent: function(delta) {
+      this.initStreamContainers();
+      if (this.isThinking) {
+        this.finishThinking();
+      }
+      this.contentText = (this.contentText || "") + delta;
+      this.pendingContentChange = true;
+      this.scheduleRafFlush();
+    },
+
+    startThinkingTimer: function() {
+      if (this.thinkingTimerInterval) return;
+      this.thinkingTimerInterval = setInterval(() => {
+        if (!this.isThinking) {
+          clearInterval(this.thinkingTimerInterval);
+          this.thinkingTimerInterval = null;
+          return;
+        }
+        const elapsedSec = ((performance.now() - (this.thinkingStartTime || performance.now())) / 1000).toFixed(1);
+        if (this.thinkBadgeEl) {
+          this.thinkBadgeEl.textContent = `深度思考中 (${elapsedSec}s)...`;
+        }
+      }, 100);
+    },
+
+    finishThinking: function() {
+      if (!this.isThinking) return;
+      this.isThinking = false;
+      this.thinkingEndTime = performance.now();
+      if (this.thinkingTimerInterval) {
+        clearInterval(this.thinkingTimerInterval);
+        this.thinkingTimerInterval = null;
+      }
+      const durSec = ((this.thinkingEndTime - (this.thinkingStartTime || this.thinkingEndTime)) / 1000).toFixed(1);
+      const estToks = Math.max(1, Math.round((this.reasoningText || "").length * 0.7));
+
+      if (this.thinkBadgeEl) {
+        this.thinkBadgeEl.className = "think-status-badge completed";
+        this.thinkBadgeEl.textContent = `✅ 已深度思考 ${durSec}s (~${estToks} tok)`;
+      }
+      if (this.thinkPulseEl) {
+        this.thinkPulseEl.style.display = "none";
+      }
+      if (this.thinkEl) {
+        this.thinkEl.setAttribute("data-raw-thinking", this.reasoningText);
+        if (!this.userManuallyToggledThink) {
+          this.thinkEl.removeAttribute("open");
+        }
+      }
+      if (this.bodyEl && !this.contentText) {
+        this.bodyEl.innerHTML = '<span class="cursor"></span>';
+      }
+    },
+
+    scheduleRafFlush: function() {
+      if (this.rafId) return;
+      this.rafId = requestAnimationFrame(() => {
+        this.rafId = null;
+        this.flushDOM();
+      });
+    },
+
+    flushDOM: function() {
+      if (this.pendingReasoningChange && this.thinkBodyEl) {
+        this.pendingReasoningChange = false;
+        const balanced = balanceCodeFences(this.reasoningText);
+        this.thinkBodyEl.innerHTML = renderMarkdown(balanced) + (this.isThinking ? '<span class="cursor"></span>' : '');
+      }
+      if (this.pendingContentChange && this.bodyEl) {
+        this.pendingContentChange = false;
+        const balanced = balanceCodeFences(this.contentText);
+        this.bodyEl.innerHTML = renderMarkdown(balanced) + '<span class="cursor"></span>';
+      }
+      scrollMessageAreaToBottom();
+    },
+
+    finalize: function() {
+      if (this.rafId) {
+        cancelAnimationFrame(this.rafId);
+        this.rafId = null;
+      }
+      if (this.isThinking) {
+        this.finishThinking();
+      }
+      if (this.thinkingTimerInterval) {
+        clearInterval(this.thinkingTimerInterval);
+        this.thinkingTimerInterval = null;
+      }
+
+      if (this.reasoningText) {
+        this.text = `<think>\n${this.reasoningText}\n</think>\n` + (this.contentText || "");
+      } else {
+        this.text = this.contentText || "";
+      }
+
+      if (this.thinkEl) {
+        this.thinkEl.setAttribute("data-raw-thinking", this.reasoningText);
+        if (this.thinkBodyEl) {
+          this.thinkBodyEl.innerHTML = renderMarkdown(balanceCodeFences(this.reasoningText));
+        }
+      }
+      if (this.bodyEl) {
+        this.bodyEl.innerHTML = renderMarkdown(balanceCodeFences(this.contentText));
+      }
+
+      if (!this.text.trim()) {
+        this.text = "（上游返回空内容）";
+        this.contentEl.textContent = this.text;
+      }
+    },
+
     setFailover: function(info) {
       if (this.failoverRendered || !info) return;
       const fromP = escapeHtml(info.from_provider || info.from || "").trim();
@@ -2980,54 +3223,45 @@ async function send() {
                 firstTokenTime = Math.round(performance.now() - startTime);
               }
               receivedChunks++;
-              holder.reasoningText = (holder.reasoningText || "") + delta.reasoning_content;
-              holder.text = `<think>\n${holder.reasoningText}`;
-              holder.contentEl.innerHTML = renderMessageContent(holder.text, true) + '<span class="cursor"></span>';
-              scrollMessageAreaToBottom();
+              holder.appendReasoning(delta.reasoning_content);
             } else if (delta.content) {
               if (firstTokenTime === null) {
                 firstTokenTime = Math.round(performance.now() - startTime);
               }
               receivedChunks++;
-              holder.contentText = (holder.contentText || "") + delta.content;
-              if (holder.reasoningText) {
-                holder.text = `<think>\n${holder.reasoningText}\n</think>\n` + holder.contentText;
-              } else {
-                holder.text = holder.contentText;
-              }
-              holder.contentEl.innerHTML = renderMessageContent(holder.text, true) + '<span class="cursor"></span>';
-              scrollMessageAreaToBottom();
+              holder.appendContent(delta.content);
             }
           }
         }
       }
     }
 
-    if (holder.reasoningText && !holder.text.includes("</think>")) {
-      holder.text = `<think>\n${holder.reasoningText}\n</think>\n` + (holder.contentText || "");
-    }
+    holder.finalize();
 
     const totalDurationSec = ((performance.now() - startTime) / 1000).toFixed(1);
     const estTokens = Math.max(1, Math.round(holder.text.length * 0.7));
-
-    if (!holder.text) {
-      holder.text = "（上游返回空内容）";
-      holder.contentEl.textContent = holder.text;
-    } else {
-      holder.contentEl.innerHTML = renderMessageContent(holder.text, false);
-    }
 
     // 更新指标气泡
     if (holder.metricEl) {
       holder.metricEl.style.display = "inline-block";
       const ttftStr = firstTokenTime !== null ? `首包 ${firstTokenTime}ms` : "首包 -";
-      holder.metricEl.textContent = `${ttftStr} · 耗时 ${totalDurationSec}s · ~${estTokens} tok`;
+      let thinkMetricStr = "";
+      if (holder.thinkingEndTime && holder.thinkingStartTime) {
+        const thinkSec = ((holder.thinkingEndTime - holder.thinkingStartTime) / 1000).toFixed(1);
+        thinkMetricStr = ` · 思考 ${thinkSec}s`;
+      }
+      holder.metricEl.textContent = `${ttftStr}${thinkMetricStr} · 耗时 ${totalDurationSec}s · ~${estTokens} tok`;
     }
 
     messages.push({ role: "assistant", content: holder.text });
   } catch (err) {
+    holder.finalize();
     if (err.name === "AbortError") {
-      holder.contentEl.innerHTML = renderMessageContent(holder.text, false) + '<p style="color:var(--text-muted); font-size:12px; margin-top:8px;">[用户已停止生成]</p>';
+      if (holder.bodyEl) {
+        holder.bodyEl.innerHTML += '<p style="color:var(--text-muted); font-size:12px; margin-top:8px;">[用户已停止生成]</p>';
+      } else {
+        holder.contentEl.innerHTML = renderMessageContent(holder.text, false) + '<p style="color:var(--text-muted); font-size:12px; margin-top:8px;">[用户已停止生成]</p>';
+      }
       if (holder.metricEl) {
         holder.metricEl.style.display = "inline-block";
         holder.metricEl.textContent = "已停止";
@@ -3037,7 +3271,7 @@ async function send() {
       }
     } else {
       holder.wrap.classList.add("error");
-      holder.contentEl.innerHTML = `<div class="err-box">请���失败: ${escapeHtml(err.message)}</div>`;
+      holder.contentEl.innerHTML = `<div class="err-box">请求失败: ${escapeHtml(err.message)}</div>`;
       if (holder.metricEl) {
         holder.metricEl.style.display = "inline-block";
         holder.metricEl.textContent = "失败";

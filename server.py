@@ -529,6 +529,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _make_thinking_headers(
+    thinking_duration_ms: Optional[float] = None,
+    thinking_tokens: Optional[int] = None,
+) -> dict[str, str]:
+    """构造思考流耗时与 Token 统计响应头"""
+    headers = {}
+    if thinking_duration_ms is not None and thinking_duration_ms > 0:
+        headers["x-thinking-duration-ms"] = str(round(thinking_duration_ms, 2))
+    if thinking_tokens is not None and thinking_tokens > 0:
+        headers["x-thinking-tokens"] = str(thinking_tokens)
+    return headers
+
+
 def is_anthropic_request(request: Request) -> bool:
     """判断当前请求是否遵循 Anthropic 协议。
 
@@ -927,6 +940,16 @@ async def get_diagnostics():
         "http_pool": http_pool,
         "prompt_cache": prompt_cache,
         "prompt_optimizer": prompt_optimizer.get_stats(),
+        "thinking_stream": {
+            "status": "supported",
+            "supported_protocols": ["openai_chat", "anthropic_messages", "openai_responses"],
+            "features": [
+                "reasoning_content_streaming",
+                "thinking_block_state_machine",
+                "telemetry_headers",
+                "auto_fold_and_highlighting",
+            ],
+        },
         "risk_avoidance": risk_avoidance,
     }
 
@@ -1496,6 +1519,8 @@ async def chat_completions(req: ChatCompletionRequest):
     reasoning_chunks: list[str] = []
     conversation_id = req.conversation_id
     start_time = time.time()
+    thinking_start_time: Optional[float] = None
+    thinking_end_time: Optional[float] = None
     load_balancer.acquire(dispatched_provider)
     ttft_recorded = False
     success = False
@@ -1519,6 +1544,9 @@ async def chat_completions(req: ChatCompletionRequest):
                     conversation_id = meta["conversation_id"]
                 continue
             if meta and meta.get("reasoning"):
+                if thinking_start_time is None:
+                    thinking_start_time = time.time()
+                thinking_end_time = time.time()
                 reasoning_chunks.append(delta)
             else:
                 chunks.append(delta)
@@ -1550,9 +1578,19 @@ async def chat_completions(req: ChatCompletionRequest):
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
 
+    thinking_duration_ms = None
+    thinking_toks = None
+    if full_reasoning:
+        thinking_toks = max(1, _est_tokens(full_reasoning))
+        if thinking_start_time and thinking_end_time:
+            thinking_duration_ms = max(1.0, (thinking_end_time - thinking_start_time) * 1000.0)
+
+    thinking_headers = _make_thinking_headers(thinking_duration_ms, thinking_toks)
+
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
     resp_headers.update(risk_headers)
+    resp_headers.update(thinking_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1880,6 +1918,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     thinking_chunks: list[str] = []
     conv_id: Optional[str] = None
     start_time = time.time()
+    thinking_start_time: Optional[float] = None
+    thinking_end_time: Optional[float] = None
     load_balancer.acquire(dispatched_provider)
     ttft_recorded = False
     success = False
@@ -1903,6 +1943,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     conv_id = _meta["conversation_id"]
                 continue
             if _meta and _meta.get("reasoning"):
+                if thinking_start_time is None:
+                    thinking_start_time = time.time()
+                thinking_end_time = time.time()
                 thinking_chunks.append(delta)
             else:
                 chunks.append(delta)
@@ -1941,9 +1984,19 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     output_tokens = max(1, _est_tokens(full_output + full_thinking))
     msg_id = _id("msg", "_")
 
+    thinking_duration_ms = None
+    thinking_toks = None
+    if full_thinking:
+        thinking_toks = max(1, _est_tokens(full_thinking))
+        if thinking_start_time and thinking_end_time:
+            thinking_duration_ms = max(1.0, (thinking_end_time - thinking_start_time) * 1000.0)
+
+    thinking_headers = _make_thinking_headers(thinking_duration_ms, thinking_toks)
+
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
     resp_headers.update(risk_headers)
+    resp_headers.update(thinking_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -2351,6 +2404,8 @@ async def responses_endpoint(req: ResponsesRequest):
     chunks: list[str] = []
     reasoning_chunks: list[str] = []
     conv_id: Optional[str] = None
+    thinking_start_time: Optional[float] = None
+    thinking_end_time: Optional[float] = None
     try:
         async for delta, meta in stream:
             if not ttft_recorded and delta:
@@ -2363,6 +2418,9 @@ async def responses_endpoint(req: ResponsesRequest):
                     conv_id = meta["conversation_id"]
                 continue
             if meta and meta.get("reasoning"):
+                if thinking_start_time is None:
+                    thinking_start_time = time.time()
+                thinking_end_time = time.time()
                 reasoning_chunks.append(delta)
             else:
                 chunks.append(delta)
@@ -2390,6 +2448,16 @@ async def responses_endpoint(req: ResponsesRequest):
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
     output_tokens = max(1, _est_tokens(full_output + full_reasoning))
+
+    thinking_duration_ms = None
+    thinking_toks = None
+    if full_reasoning:
+        thinking_toks = max(1, _est_tokens(full_reasoning))
+        if thinking_start_time and thinking_end_time:
+            thinking_duration_ms = max(1.0, (thinking_end_time - thinking_start_time) * 1000.0)
+
+    thinking_headers = _make_thinking_headers(thinking_duration_ms, thinking_toks)
+    resp_headers.update(thinking_headers)
 
     tool_calls_list = None
     parsed = parse_tool_calls(full_output)
