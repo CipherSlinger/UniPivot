@@ -91,6 +91,16 @@ from .prompt_cache import (
     prompt_cache_manager,
 )
 from .qwen import QwenProvider
+from .json_repair import (
+    repair_json_string,
+    repair_truncated_json,
+    safe_loads_with_repair,
+)
+from .tool_streamer import (
+    SpeculativeToolStreamer,
+    StreamAction,
+    parse_tool_calls_with_healing,
+)
 
 __all__ = [
     "ProviderError",
@@ -163,4 +173,10 @@ __all__ = [
     "BalancingDecision",
     "SlidingWindowMetrics",
     "ProviderMetricsSnapshot",
+    "safe_loads_with_repair",
+    "repair_json_string",
+    "repair_truncated_json",
+    "SpeculativeToolStreamer",
+    "StreamAction",
+    "parse_tool_calls_with_healing",
 ]

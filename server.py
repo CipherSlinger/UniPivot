@@ -72,6 +72,8 @@ from providers import (
     last_user_content,
     parse_tool_call,
     parse_tool_calls,
+    parse_tool_calls_with_healing,
+    SpeculativeToolStreamer,
     sse_content_block_delta,
     sse_content_block_start,
     sse_content_block_stop,
@@ -542,6 +544,25 @@ def _make_thinking_headers(
     return headers
 
 
+_tool_healing_stats = {
+    "total_tool_calls": 0,
+    "healed_tool_calls": 0,
+}
+
+
+def _make_tool_headers(
+    tool_count: int = 0,
+    was_healed: bool = False,
+) -> dict[str, str]:
+    """构造工具调用与自愈修复响应头"""
+    headers = {}
+    if tool_count > 0:
+        headers["x-tool-calls-count"] = str(tool_count)
+    if was_healed:
+        headers["x-tool-healing"] = "1"
+    return headers
+
+
 def is_anthropic_request(request: Request) -> bool:
     """判断当前请求是否遵循 Anthropic 协议。
 
@@ -948,6 +969,21 @@ async def get_diagnostics():
                 "thinking_block_state_machine",
                 "telemetry_headers",
                 "auto_fold_and_highlighting",
+            ],
+        },
+        "tool_calling": {
+            "status": "supported",
+            "speculative_streaming": True,
+            "self_healing_json": True,
+            "supported_protocols": ["openai_chat", "anthropic_messages", "openai_responses"],
+            "total_tool_calls": _tool_healing_stats["total_tool_calls"],
+            "healed_tool_calls": _tool_healing_stats["healed_tool_calls"],
+            "features": [
+                "speculative_text_streaming",
+                "zero_latency_reasoning",
+                "deep_json_repair",
+                "truncated_json_auto_completion",
+                "telemetry_headers",
             ],
         },
         "risk_avoidance": risk_avoidance,
@@ -1360,7 +1396,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     )
                 return
 
-            # 2. Tools 模式：聚合后解析 tool_call
+            # 2. Tools 模式：推测式流式分发与自愈解析
             try:
                 stream, failover_event, active_provider = await failover_router.execute_chat(
                     primary_provider_key=dispatched_provider,
@@ -1368,6 +1404,10 @@ async def chat_completions(req: ChatCompletionRequest):
                     provider_factory=lambda pkey: _make_provider(pkey),
                     chat_args=chat_args,
                 )
+
+                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                first_frame_emitted = False
+
                 async for delta, meta in stream:
                     if not ttft_recorded and delta:
                         load_balancer.record_ttft(
@@ -1379,32 +1419,70 @@ async def chat_completions(req: ChatCompletionRequest):
                         if meta and meta.get("conversation_id"):
                             conversation_id = meta["conversation_id"]
                         continue
-                    if meta and meta.get("reasoning"):
-                        accumulated_reasoning.append(delta)
-                    else:
-                        accumulated_chunks.append(delta)
-                    if meta.get("conversation_id"):
+
+                    if meta and meta.get("conversation_id"):
                         conversation_id = meta["conversation_id"]
 
-                full_text = "".join(accumulated_chunks)
-                full_reasoning = "".join(accumulated_reasoning)
-                parsed = parse_tool_calls(full_text)
+                    is_r = bool(meta and meta.get("reasoning"))
+                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
+                    for act in actions:
+                        if act.action_type == "reasoning_delta":
+                            chunk = {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": req.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "reasoning_content": act.content},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            if not first_frame_emitted and failover_event:
+                                chunk["failover"] = failover_event.to_dict()
+                            yield sse_frame(chunk)
+                            first_frame_emitted = True
+                        elif act.action_type == "text_delta":
+                            chunk = {
+                                "id": cid,
+                                "object": "chat.completion.chunk",
+                                "created": created,
+                                "model": req.model,
+                                "choices": [{
+                                    "index": 0,
+                                    "delta": {"role": "assistant", "content": act.content},
+                                    "finish_reason": None,
+                                }],
+                            }
+                            if not first_frame_emitted and failover_event:
+                                chunk["failover"] = failover_event.to_dict()
+                            yield sse_frame(chunk)
+                            first_frame_emitted = True
 
-                if full_reasoning:
-                    yield sse_frame({
+                rem_text, tool_list, was_healed = streamer.finalize()
+                if rem_text:
+                    chunk = {
                         "id": cid,
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
                         "choices": [{
                             "index": 0,
-                            "delta": {"role": "assistant", "reasoning_content": full_reasoning},
+                            "delta": {"role": "assistant", "content": rem_text},
                             "finish_reason": None,
                         }],
-                    })
+                    }
+                    if not first_frame_emitted and failover_event:
+                        chunk["failover"] = failover_event.to_dict()
+                    yield sse_frame(chunk)
+                    first_frame_emitted = True
 
-                if parsed:
-                    prefix, tool_list = parsed
+                full_text = "".join(streamer.accumulated_text)
+
+                if tool_list:
+                    _tool_healing_stats["total_tool_calls"] += len(tool_list)
+                    if was_healed:
+                        _tool_healing_stats["healed_tool_calls"] += 1
                     delta_tool_calls = [
                         {
                             "index": idx,
@@ -1417,7 +1495,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         }
                         for idx, (tool_name, args) in enumerate(tool_list)
                     ]
-                    first_chunk = {
+                    tool_chunk = {
                         "id": cid,
                         "object": "chat.completion.chunk",
                         "created": created,
@@ -1426,17 +1504,16 @@ async def chat_completions(req: ChatCompletionRequest):
                             "index": 0,
                             "delta": {
                                 "role": "assistant",
-                                "content": prefix or None,
                                 "tool_calls": delta_tool_calls,
                             },
                             "finish_reason": None,
                         }],
                     }
+                    if not first_frame_emitted and failover_event:
+                        tool_chunk["failover"] = failover_event.to_dict()
                     if conversation_id:
-                        first_chunk["conversation_id"] = conversation_id
-                    if failover_event:
-                        first_chunk["failover"] = failover_event.to_dict()
-                    yield sse_frame(first_chunk)
+                        tool_chunk["conversation_id"] = conversation_id
+                    yield sse_frame(tool_chunk)
                     yield sse_frame({
                         "id": cid,
                         "object": "chat.completion.chunk",
@@ -1445,22 +1522,23 @@ async def chat_completions(req: ChatCompletionRequest):
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     })
                 else:
-                    first_chunk = {
-                        "id": cid,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": req.model,
-                        "choices": [{
-                            "index": 0,
-                            "delta": {"role": "assistant", "content": full_text},
-                            "finish_reason": None,
-                        }],
-                    }
-                    if conversation_id:
-                        first_chunk["conversation_id"] = conversation_id
-                    if failover_event:
-                        first_chunk["failover"] = failover_event.to_dict()
-                    yield sse_frame(first_chunk)
+                    if not first_frame_emitted:
+                        init_chunk = {
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": full_text},
+                                "finish_reason": None,
+                            }],
+                        }
+                        if failover_event:
+                            init_chunk["failover"] = failover_event.to_dict()
+                        if conversation_id:
+                            init_chunk["conversation_id"] = conversation_id
+                        yield sse_frame(init_chunk)
                     yield sse_frame({
                         "id": cid,
                         "object": "chat.completion.chunk",
@@ -1471,7 +1549,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
                 if req.stream_options and req.stream_options.get("include_usage"):
                     pt = _est_tokens(prompt_text)
-                    ct = max(1, _est_tokens(full_text + full_reasoning))
+                    ct = max(1, _est_tokens(full_text))
                     yield sse_frame({
                         "id": cid,
                         "object": "chat.completion.chunk",
@@ -1600,9 +1678,13 @@ async def chat_completions(req: ChatCompletionRequest):
         })
 
     if req.tools:
-        parsed = parse_tool_calls(full_output)
+        parsed, was_healed = parse_tool_calls_with_healing(full_output)
         if parsed:
             prefix, tool_list = parsed
+            _tool_healing_stats["total_tool_calls"] += len(tool_list)
+            if was_healed:
+                _tool_healing_stats["healed_tool_calls"] += 1
+            resp_headers.update(_make_tool_headers(len(tool_list), was_healed))
             tool_calls = [
                 {
                     "id": _id("call", "_"),
@@ -1795,15 +1877,20 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     success = True
                     return
 
-                # 2. Agent / 工具模式：聚合后解析 tool_call 协议
-                accumulated_chunks: list[str] = []
-                accumulated_thinking: list[str] = []
+                # 2. Agent / 工具模式：推测式流式分发与容错解析
                 stream, failover_event, active_provider = await failover_router.execute_chat(
                     primary_provider_key=dispatched_provider,
                     primary_wire_model=dispatched_model,
                     provider_factory=lambda pkey: _make_provider(pkey),
                     chat_args=chat_args,
                 )
+
+                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                yield sse_message_start(msg_id, req.model, input_tokens)
+
+                block_idx = 0
+                in_thinking_block = False
+                in_text_block = False
 
                 async for delta, _meta in stream:
                     if not ttft_recorded and delta:
@@ -1816,41 +1903,50 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         if _meta and _meta.get("conversation_id"):
                             conv_id = _meta["conversation_id"]
                         continue
-                    if _meta and _meta.get("reasoning"):
-                        accumulated_thinking.append(delta)
-                    else:
-                        accumulated_chunks.append(delta)
                     if _meta and _meta.get("conversation_id"):
                         conv_id = _meta["conversation_id"]
 
-                full_text = "".join(accumulated_chunks)
-                thinking_text = "".join(accumulated_thinking)
-                output_tokens = max(1, _est_tokens(full_text + thinking_text))
-                parsed = parse_tool_calls(full_text)
+                    is_r = bool(_meta and _meta.get("reasoning"))
+                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
+                    for act in actions:
+                        if act.action_type == "reasoning_delta":
+                            if not in_thinking_block:
+                                yield sse_content_block_start(block_idx, {"type": "thinking", "thinking": ""})
+                                in_thinking_block = True
+                            yield sse_content_block_delta(block_idx, {"type": "thinking_delta", "thinking": act.content})
+                        elif act.action_type == "text_delta":
+                            if in_thinking_block:
+                                yield sse_content_block_stop(block_idx)
+                                in_thinking_block = False
+                                block_idx += 1
+                            if not in_text_block:
+                                yield sse_content_block_start(block_idx, {"type": "text", "text": ""})
+                                in_text_block = True
+                            yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": act.content})
 
-                yield sse_message_start(msg_id, req.model, input_tokens)
-                block_idx = 0
-
-                if thinking_text:
-                    yield sse_content_block_start(
-                        block_idx, {"type": "thinking", "thinking": ""}
-                    )
-                    yield sse_content_block_delta(
-                        block_idx, {"type": "thinking_delta", "thinking": thinking_text}
-                    )
+                rem_text, tool_list, was_healed = streamer.finalize()
+                if in_thinking_block:
                     yield sse_content_block_stop(block_idx)
+                    in_thinking_block = False
                     block_idx += 1
 
-                if parsed:
-                    prefix, tool_list = parsed
-                    if prefix:
+                if rem_text:
+                    if not in_text_block:
                         yield sse_content_block_start(block_idx, {"type": "text", "text": ""})
-                        yield sse_content_block_delta(
-                            block_idx, {"type": "text_delta", "text": prefix}
-                        )
-                        yield sse_content_block_stop(block_idx)
-                        block_idx += 1
+                        in_text_block = True
+                    yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": rem_text})
 
+                if in_text_block:
+                    yield sse_content_block_stop(block_idx)
+                    in_text_block = False
+                    block_idx += 1
+
+                output_tokens = max(1, _est_tokens("".join(streamer.accumulated_text)))
+
+                if tool_list:
+                    _tool_healing_stats["total_tool_calls"] += len(tool_list)
+                    if was_healed:
+                        _tool_healing_stats["healed_tool_calls"] += 1
                     for tool_name, args in tool_list:
                         tool_use_id = _id("toolu", "_")[:22]
                         yield sse_content_block_start(
@@ -1874,10 +1970,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                     yield sse_message_delta("tool_use", output_tokens)
                 else:
-                    if full_text or not thinking_text:
-                        yield sse_content_block_start(block_idx, {"type": "text", "text": ""})
-                        yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": full_text})
-                        yield sse_content_block_stop(block_idx)
+                    if block_idx == 0:
+                        yield sse_content_block_start(0, {"type": "text", "text": ""})
+                        yield sse_content_block_stop(0)
                     yield sse_message_delta("end_turn", output_tokens)
 
                 yield sse_message_stop()
@@ -2010,9 +2105,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         blocks.append({"type": "thinking", "thinking": full_thinking})
 
     if req.tools:
-        parsed = parse_tool_calls(full_output)
+        parsed, was_healed = parse_tool_calls_with_healing(full_output)
         if parsed:
             prefix, tool_list = parsed
+            _tool_healing_stats["total_tool_calls"] += len(tool_list)
+            if was_healed:
+                _tool_healing_stats["healed_tool_calls"] += 1
+            resp_headers.update(_make_tool_headers(len(tool_list), was_healed))
             tool_blocks = build_anthropic_tool_blocks(prefix, tool_list)
             blocks.extend(tool_blocks)
             msg_data = anthropic_message_response(
@@ -2254,9 +2353,13 @@ async def responses_endpoint(req: ResponsesRequest):
                     success = True
                     return
 
-                # 2. Tools 模式：聚合后解析 tool_call 协议
-                accumulated_chunks: list[str] = []
-                accumulated_reasoning: list[str] = []
+                # 2. Tools 模式：推测式流式分发与自愈解析
+                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                yield sse_response_created(resp_id, req.model)
+
+                out_idx = 0
+                in_text_part = False
+
                 async for delta, _meta in stream:
                     if not ttft_recorded and delta:
                         load_balancer.record_ttft(
@@ -2268,33 +2371,32 @@ async def responses_endpoint(req: ResponsesRequest):
                         if _meta and _meta.get("conversation_id"):
                             conv_id = _meta["conversation_id"]
                         continue
-                    if _meta and _meta.get("reasoning"):
-                        accumulated_reasoning.append(delta)
-                    else:
-                        accumulated_chunks.append(delta)
                     if _meta and _meta.get("conversation_id"):
                         conv_id = _meta["conversation_id"]
 
-                full_text = "".join(accumulated_chunks)
-                full_reasoning = "".join(accumulated_reasoning)
-                out_tokens = max(1, _est_tokens(full_text + full_reasoning))
-                parsed = parse_tool_calls(full_text)
+                    is_r = bool(_meta and _meta.get("reasoning"))
+                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
+                    for act in actions:
+                        if act.action_type == "text_delta":
+                            if not in_text_part:
+                                yield sse_response_output_item_added(resp_id, out_idx, {
+                                    "id": msg_id,
+                                    "type": "message",
+                                    "status": "in_progress",
+                                    "role": "assistant",
+                                    "content": [],
+                                })
+                                yield sse_response_content_part_added(
+                                    resp_id, out_idx, 0, {"type": "text", "text": ""}
+                                )
+                                in_text_part = True
+                            yield sse_response_text_delta(
+                                act.content, resp_id=resp_id, output_index=out_idx, content_index=0
+                            )
 
-                yield sse_response_created(resp_id, req.model)
-
-                output_items: list[dict] = []
-                out_idx = 0
-
-                if parsed:
-                    prefix, tool_list = parsed
-                    if prefix and prefix.strip():
-                        item_msg = {
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": prefix}],
-                        }
+                rem_text, tool_list, was_healed = streamer.finalize()
+                if rem_text:
+                    if not in_text_part:
                         yield sse_response_output_item_added(resp_id, out_idx, {
                             "id": msg_id,
                             "type": "message",
@@ -2305,14 +2407,32 @@ async def responses_endpoint(req: ResponsesRequest):
                         yield sse_response_content_part_added(
                             resp_id, out_idx, 0, {"type": "text", "text": ""}
                         )
-                        yield sse_response_text_delta(prefix, resp_id=resp_id, output_index=out_idx, content_index=0)
-                        yield sse_response_content_part_done(
-                            prefix, resp_id=resp_id, output_index=out_idx, content_index=0
-                        )
-                        yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=out_idx)
-                        output_items.append(item_msg)
-                        out_idx += 1
+                        in_text_part = True
+                    yield sse_response_text_delta(
+                        rem_text, resp_id=resp_id, output_index=out_idx, content_index=0
+                    )
 
+                output_items: list[dict] = []
+                if in_text_part:
+                    full_emitted = "".join(streamer.emitted_text) + rem_text
+                    yield sse_response_content_part_done(
+                        full_emitted, resp_id=resp_id, output_index=out_idx, content_index=0
+                    )
+                    item_msg = {
+                        "id": msg_id,
+                        "type": "message",
+                        "status": "completed",
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": full_emitted}],
+                    }
+                    yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=out_idx)
+                    output_items.append(item_msg)
+                    out_idx += 1
+
+                if tool_list:
+                    _tool_healing_stats["total_tool_calls"] += len(tool_list)
+                    if was_healed:
+                        _tool_healing_stats["healed_tool_calls"] += 1
                     for tool_name, args in tool_list:
                         call_id = _id("call", "_")
                         args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args)
@@ -2340,31 +2460,34 @@ async def responses_endpoint(req: ResponsesRequest):
                         output_items.append(item_fn_done)
                         out_idx += 1
                 else:
-                    item_msg = {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": full_text}],
-                    }
-                    yield sse_response_output_item_added(resp_id, 0, {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": [],
-                    })
-                    yield sse_response_content_part_added(
-                        resp_id, 0, 0, {"type": "text", "text": ""}
-                    )
-                    if full_text:
-                        yield sse_response_text_delta(full_text, resp_id=resp_id, output_index=0, content_index=0)
-                    yield sse_response_content_part_done(
-                        full_text, resp_id=resp_id, output_index=0, content_index=0
-                    )
-                    yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=0)
-                    output_items.append(item_msg)
+                    if not in_text_part:
+                        full_text = "".join(streamer.accumulated_text)
+                        item_msg = {
+                            "id": msg_id,
+                            "type": "message",
+                            "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "text", "text": full_text}],
+                        }
+                        yield sse_response_output_item_added(resp_id, 0, {
+                            "id": msg_id,
+                            "type": "message",
+                            "status": "in_progress",
+                            "role": "assistant",
+                            "content": [],
+                        })
+                        yield sse_response_content_part_added(
+                            resp_id, 0, 0, {"type": "text", "text": ""}
+                        )
+                        if full_text:
+                            yield sse_response_text_delta(full_text, resp_id=resp_id, output_index=0, content_index=0)
+                        yield sse_response_content_part_done(
+                            full_text, resp_id=resp_id, output_index=0, content_index=0
+                        )
+                        yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=0)
+                        output_items.append(item_msg)
 
+                out_tokens = max(1, _est_tokens("".join(streamer.accumulated_text)))
                 yield sse_response_completed(
                     resp_id,
                     req.model,
@@ -2460,9 +2583,13 @@ async def responses_endpoint(req: ResponsesRequest):
     resp_headers.update(thinking_headers)
 
     tool_calls_list = None
-    parsed = parse_tool_calls(full_output)
-    if parsed:
-        prefix, tool_list = parsed
+    parsed_res, was_healed = parse_tool_calls_with_healing(full_output)
+    if parsed_res:
+        prefix, tool_list = parsed_res
+        _tool_healing_stats["total_tool_calls"] += len(tool_list)
+        if was_healed:
+            _tool_healing_stats["healed_tool_calls"] += 1
+        resp_headers.update(_make_tool_headers(len(tool_list), was_healed))
         tool_calls_list = [
             {
                 "id": _id("call", "_"),

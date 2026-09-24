@@ -160,7 +160,7 @@ _BLOCK_TOOL_PATTERN = re.compile(
     re.DOTALL,
 )
 _XML_TOOL_PATTERN = re.compile(
-    r"<(?:tool_call|function_call)(?:\s+[^>]*)?>([\s\S]*?)</(?:tool_call|function_call)>",
+    r"<(?:tool_call|function_call)(?:\s+[^>]*)?>([\s\S]*?)(?:</(?:tool_call|function_call)>|$)",
     re.DOTALL,
 )
 
@@ -221,39 +221,18 @@ def _safe_json_loads(s: str) -> Optional[Any]:
     if not s_clean:
         return None
 
-    # 1. 直接解析
-    try:
-        return json.loads(s_clean, strict=False)
-    except Exception:
-        pass
+    # 优先使用自愈式容错 JSON 修复引擎
+    from .json_repair import safe_loads_with_repair
+    parsed, _ = safe_loads_with_repair(s_clean)
+    if parsed is not None:
+        return parsed
 
-    # 2. 递归剥离多余尾部逗号
-    try:
-        no_trailing = _clean_trailing_commas(s_clean)
-        return json.loads(no_trailing, strict=False)
-    except Exception:
-        pass
-
-    # 3. 尝试作为安全 Python 字面量解析（支持单引号、True/False/None）
-    try:
-        return ast.literal_eval(s_clean)
-    except Exception:
-        pass
-
-    # 4. 尝试从混合文本中提取最外层平衡括号对象
+    # 尝试从混合文本中提取最外层平衡括号对象
     balanced = extract_balanced_json_objects(s_clean)
     for _, _, cand in balanced:
-        try:
-            return json.loads(cand, strict=False)
-        except Exception:
-            try:
-                no_trailing = _clean_trailing_commas(cand)
-                return json.loads(no_trailing, strict=False)
-            except Exception:
-                try:
-                    return ast.literal_eval(cand)
-                except Exception:
-                    pass
+        p, _ = safe_loads_with_repair(cand)
+        if p is not None:
+            return p
 
     return None
 
@@ -295,6 +274,10 @@ def _extract_single_tool(item: Any) -> Optional[Tuple[str, dict]]:
         if "arguments" in item
         else item.get("args")
         if "args" in item
+        else item.get("params")
+        if "params" in item
+        else item.get("param")
+        if "param" in item
         else item.get("input")
         if "input" in item
         else item.get("parameters")
@@ -303,7 +286,7 @@ def _extract_single_tool(item: Any) -> Optional[Tuple[str, dict]]:
         if "function" in item
         else item.get("action_input")
         if "action_input" in item
-        else {}
+        else {k: v for k, v in item.items() if k not in ("name", "tool_name", "tool", "action", "type")}
     )
     args = _normalize_tool_args(raw_args)
     return name.strip(), args

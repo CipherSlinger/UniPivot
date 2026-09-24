@@ -251,6 +251,16 @@ class TaskEvaluator:
                 "description": "针对国内各大模型厂商 WAF（阿里 RGV587、字节盾、DeepSeek 认证失效、Cloudflare 人机挑战等）建立专用指纹识别库，引入动态并发控制与拟人 Jitter，并在命中风控时实现加权指数退避与同环透明零中断转移。",
                 "expected_impact": "彻底杜绝多会话并发导致的 WAF 拦截风暴，提高服务可用性至 99.9% 并提供透明的 x-risk-* 遥测指标。",
             },
+            {
+                "id": "OPT-006",
+                "status": "COMPLETED",
+                "status_display": "已落地",
+                "category": "协议与智能体体验",
+                "title": "流式工具调用增量分发与容错修复引擎 (Speculative Tool Streaming & Self-Healing JSON)",
+                "priority": "P0",
+                "description": "针对 Claude Code CLI 与 Codex CLI 工具调用场景，消除全量缓冲带来的 10-30s 首字冻结；实现推��式文本流即时输出、思考流零延迟透传以及针对截断/全角/弱格式化 JSON 的渐进式自愈修复引擎。",
+                "expected_impact": "彻底消除 CLI 工具调用首包卡顿感，工具调用参数错误解析失败率降低 95% 以上，并提供透明的 x-tool-* 遥测指标。",
+            },
         ]
 
         report_data = {

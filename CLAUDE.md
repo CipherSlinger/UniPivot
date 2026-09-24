@@ -49,7 +49,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_server.py && \
 .venv/bin/python tests/test_session.py && \
 .venv/bin/python tests/test_healing.py && \
-.venv/bin/python tests/test_responses.py
+.venv/bin/python tests/test_responses.py && \
+.venv/bin/python tests/test_tools.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -57,6 +58,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_session.py     # Session persistence, POSIX atomicity, file permissions, and env priority
 .venv/bin/python tests/test_healing.py     # HealthMonitor state machine, HealingEngine, and AgentRunner discovery
 .venv/bin/python tests/test_responses.py   # OpenAI Responses protocol (/v1/responses) and Codex compatibility
+.venv/bin/python tests/test_tools.py       # Streaming tool calling, speculative streaming, and self-healing JSON engine
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
