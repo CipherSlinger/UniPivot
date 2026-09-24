@@ -258,8 +258,18 @@ class TaskEvaluator:
                 "category": "协议与智能体体验",
                 "title": "流式工具调用增量分发与容错修复引擎 (Speculative Tool Streaming & Self-Healing JSON)",
                 "priority": "P0",
-                "description": "针对 Claude Code CLI 与 Codex CLI 工具调用场景，消除全量缓冲带来的 10-30s 首字冻结；实现推��式文本流即时输出、思考流零延迟透传以及针对截断/全角/弱格式化 JSON 的渐进式自愈修复引擎。",
+                "description": "针对 Claude Code CLI 与 Codex CLI 工具调用场景，消除全量缓冲带来的 10-30s 首字冻结；实现推测式文本流即时输出、思考流零延迟透传以及针对截断/全角/弱格式化 JSON 的渐进式自愈修复引擎。",
                 "expected_impact": "彻底消除 CLI 工具调用首包卡顿感，工具调用参数错误解析失败率降低 95% 以上，并提供透明的 x-tool-* 遥测指标。",
+            },
+            {
+                "id": "OPT-007",
+                "status": "COMPLETED",
+                "status_display": "已落地",
+                "category": "路由与会话保持",
+                "title": "智能会话粘滞路由与跨模型状态迁移引擎 (Smart Session Affinity & State Handoff Engine)",
+                "priority": "P0",
+                "description": "基于 LRU 与 TTL 追踪多轮交互的会话归属，将后续轮次请求优先分配到已建立对话上下文的后端 Provider；在原 Provider 离线或风控熔断时，自动剥离异构会话 ID 并平滑迁移至同环/降级候选节点，维持多轮交互不中断并输出透明的 x-session-* 遥测指标。",
+                "expected_impact": "消除负载均衡导致的跨轮次会话分散与上下文丢失问题，在节点故障时平滑无缝漂移，会话连续性达到 99.99%。",
             },
         ]
 
@@ -308,8 +318,8 @@ class TaskEvaluator:
         md_lines.extend([
             "## 3. 验收结论与下一步演进路线",
             "当前网关在多协议转换（OpenAI Chat / Anthropic Messages / Realtime Responses）与五大上游提供方稳定性表现优异。",
-            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）及 `OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）均已全部落地并完成全套测试套件回归验证。",
-            "网关已具备全自动自愈、自适应步调控制与长效反爬规避能力，全流程稳定健壮。",
+            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）、`OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）、`OPT-006`（流式工具调用增量分发与容错修复引擎）及 `OPT-007`（智能会话粘滞路由与跨模型状态迁移引擎）均已全部落地并完成全套测试套件回归验证。",
+            "网关已具备全自动自愈、推测式流式工具输出、会话粘滞平滑漂移、自适应步调控制与长效反爬规避能力，全流程稳定健壮。",
             "",
         ])
 

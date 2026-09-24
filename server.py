@@ -103,6 +103,7 @@ from providers.base import _est_tokens, _id
 from providers import http_client
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
+from providers.session_affinity import AffinityDecision, session_affinity_manager
 from session_store import (
     MAX_AGE,
     resolve_deepseek,
@@ -563,6 +564,27 @@ def _make_tool_headers(
     return headers
 
 
+def _make_affinity_headers(decision: AffinityDecision) -> dict[str, str]:
+    """构造会话粘滞与跨模型状态迁移响应头。"""
+    headers = {
+        "x-session-affinity": decision.status,
+        "x-session-turns": str(decision.turn_count),
+    }
+    if decision.is_handoff and decision.original_provider:
+        headers["x-session-handoff-from"] = decision.original_provider
+    return headers
+
+
+def _is_provider_healthy(pkey: str) -> bool:
+    """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。"""
+    disabled = os.getenv("DISABLED_PROVIDERS", "").split(",")
+    if pkey in [d.strip() for d in disabled if d.strip()]:
+        return False
+    if failover_router.cooldown_tracker.is_in_cooldown(pkey):
+        return False
+    return True
+
+
 def is_anthropic_request(request: Request) -> bool:
     """判断当前请求是否遵循 Anthropic 协议。
 
@@ -986,6 +1008,7 @@ async def get_diagnostics():
                 "telemetry_headers",
             ],
         },
+        "session_affinity": session_affinity_manager.get_diagnostics(),
         "risk_avoidance": risk_avoidance,
     }
 
@@ -1242,9 +1265,20 @@ async def chat_completions(req: ChatCompletionRequest):
     dispatched_provider = decision.provider_key
     dispatched_model = decision.wire_model
 
+    # 2.1 智能会话粘滞解析与跨模型状态迁移
+    affinity_decision = session_affinity_manager.resolve_affinity(
+        session_id=req.conversation_id,
+        primary_provider=dispatched_provider,
+        primary_model=dispatched_model,
+        is_provider_available=_is_provider_healthy,
+    )
+    affinity_headers = _make_affinity_headers(affinity_decision)
+    dispatched_provider = affinity_decision.provider_key
+    dispatched_model = affinity_decision.wire_model
+
     chat_args = {
         "messages": messages,
-        "conversation_id": req.conversation_id,
+        "conversation_id": affinity_decision.upstream_conv_id,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "thinking": req.thinking,
@@ -1263,6 +1297,7 @@ async def chat_completions(req: ChatCompletionRequest):
         stream_headers.update(lb_headers)
         stream_headers.update(fold_headers)
         stream_headers.update(risk_headers)
+        stream_headers.update(affinity_headers)
 
         async def gen():
             cid = _id("chatcmpl")
@@ -1373,6 +1408,14 @@ async def chat_completions(req: ChatCompletionRequest):
                         })
 
                     yield "data: [DONE]\n\n"
+
+                    if conversation_id:
+                        session_affinity_manager.record_turn(
+                            req.conversation_id or conversation_id,
+                            dispatched_provider,
+                            dispatched_model,
+                            conversation_id,
+                        )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conversation_id))
@@ -1565,6 +1608,14 @@ async def chat_completions(req: ChatCompletionRequest):
 
                 yield "data: [DONE]\n\n"
 
+                if conversation_id:
+                    session_affinity_manager.record_turn(
+                        req.conversation_id or conversation_id,
+                        dispatched_provider,
+                        dispatched_model,
+                        conversation_id,
+                    )
+
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conversation_id))
                 success = True
@@ -1649,6 +1700,14 @@ async def chat_completions(req: ChatCompletionRequest):
             error_msg=error_msg,
         )
 
+    if conversation_id:
+        session_affinity_manager.record_turn(
+            req.conversation_id or conversation_id,
+            dispatched_provider,
+            dispatched_model,
+            conversation_id,
+        )
+
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
         asyncio.create_task(active_provider.delete_conversation(conversation_id))
 
@@ -1669,6 +1728,7 @@ async def chat_completions(req: ChatCompletionRequest):
     resp_headers.update(fold_headers)
     resp_headers.update(risk_headers)
     resp_headers.update(thinking_headers)
+    resp_headers.update(affinity_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1768,9 +1828,20 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     dispatched_provider = decision.provider_key
     dispatched_model = decision.wire_model
 
+    # 2.1 智能会话粘滞解析与跨模型状态迁移
+    affinity_decision = session_affinity_manager.resolve_affinity(
+        session_id=req.conversation_id,
+        primary_provider=dispatched_provider,
+        primary_model=dispatched_model,
+        is_provider_available=_is_provider_healthy,
+    )
+    affinity_headers = _make_affinity_headers(affinity_decision)
+    dispatched_provider = affinity_decision.provider_key
+    dispatched_model = affinity_decision.wire_model
+
     chat_args = {
         "messages": gateway_messages,
-        "conversation_id": req.conversation_id,
+        "conversation_id": affinity_decision.upstream_conv_id,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "thinking": enable_thinking,
@@ -1787,6 +1858,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         stream_headers.update(lb_headers)
         stream_headers.update(fold_headers)
         stream_headers.update(risk_headers)
+        stream_headers.update(affinity_headers)
 
         async def gen():
             msg_id = _id("msg", "_")
@@ -1871,6 +1943,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     )
                     yield sse_message_delta("end_turn", output_tokens)
                     yield sse_message_stop()
+
+                    if conv_id or req.conversation_id:
+                        session_affinity_manager.record_turn(
+                            req.conversation_id or conv_id,
+                            dispatched_provider,
+                            dispatched_model,
+                            conv_id,
+                        )
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conv_id))
@@ -1977,6 +2057,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                 yield sse_message_stop()
 
+                if conv_id or req.conversation_id:
+                    session_affinity_manager.record_turn(
+                        req.conversation_id or conv_id,
+                        dispatched_provider,
+                        dispatched_model,
+                        conv_id,
+                    )
+
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conv_id))
                 success = True
@@ -2071,6 +2159,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             error_msg=error_msg,
         )
 
+    if conv_id or req.conversation_id:
+        session_affinity_manager.record_turn(
+            req.conversation_id or conv_id,
+            dispatched_provider,
+            dispatched_model,
+            conv_id,
+        )
+
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
         asyncio.create_task(active_provider.delete_conversation(conv_id))
 
@@ -2092,6 +2188,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     resp_headers.update(fold_headers)
     resp_headers.update(risk_headers)
     resp_headers.update(thinking_headers)
+    resp_headers.update(affinity_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -2210,9 +2307,20 @@ async def responses_endpoint(req: ResponsesRequest):
     dispatched_provider = decision.provider_key
     dispatched_model = decision.wire_model
 
+    # 2.1 智能会话粘滞解析与跨模型状态迁移
+    affinity_decision = session_affinity_manager.resolve_affinity(
+        session_id=req.conversation_id,
+        primary_provider=dispatched_provider,
+        primary_model=dispatched_model,
+        is_provider_available=_is_provider_healthy,
+    )
+    affinity_headers = _make_affinity_headers(affinity_decision)
+    dispatched_provider = affinity_decision.provider_key
+    dispatched_model = affinity_decision.wire_model
+
     chat_args = {
         "messages": gateway_messages,
-        "conversation_id": req.conversation_id,
+        "conversation_id": affinity_decision.upstream_conv_id,
         "temperature": temperature,
         "max_tokens": max_tokens,
         "thinking": enable_thinking,
@@ -2260,6 +2368,7 @@ async def responses_endpoint(req: ResponsesRequest):
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
     resp_headers.update(risk_headers)
+    resp_headers.update(affinity_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -2347,6 +2456,14 @@ async def responses_endpoint(req: ResponsesRequest):
                         conversation_id=conv_id or req.conversation_id,
                     )
                     yield sse_response_done()
+
+                    if conv_id or req.conversation_id:
+                        session_affinity_manager.record_turn(
+                            req.conversation_id or conv_id,
+                            dispatched_provider,
+                            dispatched_model,
+                            conv_id,
+                        )
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                         asyncio.create_task(active_provider.delete_conversation(conv_id))
@@ -2499,6 +2616,14 @@ async def responses_endpoint(req: ResponsesRequest):
                 )
                 yield sse_response_done()
 
+                if conv_id or req.conversation_id:
+                    session_affinity_manager.record_turn(
+                        req.conversation_id or conv_id,
+                        dispatched_provider,
+                        dispatched_model,
+                        conv_id,
+                    )
+
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     asyncio.create_task(active_provider.delete_conversation(conv_id))
                 success = True
@@ -2563,6 +2688,14 @@ async def responses_endpoint(req: ResponsesRequest):
             success=success,
             is_rate_limit=is_rate_limit,
             error_msg=error_msg,
+        )
+
+    if conv_id or req.conversation_id:
+        session_affinity_manager.record_turn(
+            req.conversation_id or conv_id,
+            dispatched_provider,
+            dispatched_model,
+            conv_id,
         )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):

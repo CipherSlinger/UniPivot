@@ -50,7 +50,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_session.py && \
 .venv/bin/python tests/test_healing.py && \
 .venv/bin/python tests/test_responses.py && \
-.venv/bin/python tests/test_tools.py
+.venv/bin/python tests/test_tools.py && \
+.venv/bin/python tests/test_affinity.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -59,6 +60,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_healing.py     # HealthMonitor state machine, HealingEngine, and AgentRunner discovery
 .venv/bin/python tests/test_responses.py   # OpenAI Responses protocol (/v1/responses) and Codex compatibility
 .venv/bin/python tests/test_tools.py       # Streaming tool calling, speculative streaming, and self-healing JSON engine
+.venv/bin/python tests/test_affinity.py    # Session affinity, cross-model state handoff, LRU/TTL, and telemetry headers
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -148,5 +150,10 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
    - `responses_compat.py`: Standard OpenAI Responses protocol serializer with `function_call_arguments.delta` / `done`.
    - `base.py`: Token estimation (`_est_tokens`) supporting bilingual CJK weighting.
 
-6. **Web Frontend (`static/index.html`)**:
+6. **Smart Session Affinity & State Handoff Engine (`providers/session_affinity.py`)**:
+   - Manages LRU and TTL-based conversation tracking to pin multi-turn agent sessions to the same upstream provider.
+   - Detects provider degradation, WAF cooldown, or failure and performs seamless cross-model state handoff with heterogeneous upstream conversation ID stripping.
+   - Emits `x-session-affinity`, `x-session-handoff-from`, and `x-session-turns` telemetry headers across all protocols.
+
+7. **Web Frontend (`static/index.html`)**:
    - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

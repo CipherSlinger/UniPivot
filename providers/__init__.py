@@ -101,6 +101,11 @@ from .tool_streamer import (
     StreamAction,
     parse_tool_calls_with_healing,
 )
+from .session_affinity import (
+    AffinityDecision,
+    SessionAffinityManager,
+    session_affinity_manager,
+)
 
 __all__ = [
     "ProviderError",
@@ -179,4 +184,7 @@ __all__ = [
     "SpeculativeToolStreamer",
     "StreamAction",
     "parse_tool_calls_with_healing",
+    "SessionAffinityManager",
+    "AffinityDecision",
+    "session_affinity_manager",
 ]
