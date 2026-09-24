@@ -58,7 +58,10 @@ from .failover import (
     ProviderRiskMeta,
     RING_DEFINITIONS,
     RiskLevel,
+    TrafficPacer,
     classify_capability_ring,
+    get_traffic_pacer,
+    is_risk_interception,
 )
 from .load_balancer import (
     AdaptiveLoadBalancer,

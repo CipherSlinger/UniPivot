@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import random
@@ -171,6 +172,47 @@ def classify_capability_ring(provider_key: str, wire_model: str) -> CapabilityRi
     return CapabilityRing.FLAGSHIP
 
 
+def is_risk_interception(exc_or_text: Any) -> Tuple[bool, str]:
+    """识别错误或异常文本是否属于平台级风控/WAF/滑块验证拦截/Token失效。
+    返回: (is_risk: bool, reason_detail: str)
+    """
+    if exc_or_text is None:
+        return False, ""
+    msg = str(exc_or_text).lower()
+
+    # 1. 阿里巴巴 (Tongyi Qianwen / Aliyun WAF)
+    if any(k in msg for k in ("rgv587", "fail_sys_user_validate", "aliyun waf", "sec_token")):
+        return True, "Alibaba WAF (RGV587 / 人机验证)"
+    if "人机" in msg and any(k in msg for k in ("qwen", "千问", "ali", "rgv")):
+        return True, "Alibaba WAF (RGV587 / 人机验证)"
+
+    # 2. 字节跳动 (Doubao / Acrawler)
+    if any(k in msg for k in ("豆包触发风控", "acrawler", "verify_ticket", "need_verify")):
+        return True, "ByteDance Risk Engine (Acrawler / 滑块验证)"
+    if "人机验证" in msg and any(k in msg for k in ("豆包", "doubao")):
+        return True, "ByteDance Risk Engine (Acrawler / 滑块验证)"
+
+    # 3. DeepSeek / Cloudflare
+    if any(k in msg for k in ("authorization failed (invalid token)", "turnstile", "cf_clearance")):
+        return True, "DeepSeek Risk / Cloudflare Interception"
+    if "deepseek" in msg and any(k in msg for k in ("authorization failed", "403 forbidden", "cloudflare")):
+        return True, "DeepSeek Risk / Cloudflare Interception"
+
+    # 4. 月之暗面 (Kimi)
+    if any(k in msg for k in ("rate_limit_exceeded", "kimi rate limit")):
+        return True, "Moonshot Kimi Rate Limit"
+
+    # 5. 智谱 (GLM)
+    if any(k in msg for k in ("智谱 glm 令牌无效或已过期", "glm 令牌无效", "chatglm_token")):
+        return True, "Zhipu GLM Auth Expiration"
+
+    # 6. 通用 WAF / 滑块验证码通用匹配
+    if any(k in msg for k in ("人机验证", "滑块验证", "captcha", "security check")):
+        return True, "Generic WAF / Captcha Challenge"
+
+    return False, ""
+
+
 class CooldownTracker:
     """动态冷却与避让跟踪器"""
 
@@ -301,6 +343,92 @@ class CooldownTracker:
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()
         }
+
+
+class TrafficPacer:
+    """网关自适应流量整形器：提供并发信号量管理、随机抖动防风控与等待度量。"""
+
+    def __init__(self, cooldown_tracker: Optional[CooldownTracker] = None):
+        self.cooldown_tracker = cooldown_tracker
+        self._semaphores: Dict[str, asyncio.Semaphore] = {
+            pk: asyncio.Semaphore(meta.max_concurrency)
+            for pk, meta in PROVIDER_RISK_SPECS.items()
+        }
+        self._last_call_times: Dict[str, float] = {}
+        self._lock = asyncio.Lock()
+        self._total_waits: int = 0
+        self._total_delay_ms: float = 0.0
+
+    @asynccontextmanager
+    async def acquire(self, provider_key: str) -> AsyncIterator[float]:
+        """获取并发许可并在必要时应用拟人随机延迟 Jitter。
+        yields: 注入的等待毫秒数 wait_ms (float)。
+        """
+        pk = (provider_key or "").lower()
+        if pk not in self._semaphores:
+            meta = PROVIDER_RISK_SPECS.get(pk)
+            limit = meta.max_concurrency if meta else 2
+            self._semaphores[pk] = asyncio.Semaphore(limit)
+
+        sem = self._semaphores[pk]
+        async with sem:
+            wait_ms = 0.0
+            if os.getenv("GATEWAY_DISABLE_PACING") != "1":
+                meta = PROVIDER_RISK_SPECS.get(pk)
+                if meta:
+                    async with self._lock:
+                        now = time.time()
+                        last = self._last_call_times.get(pk, 0.0)
+                        elapsed = now - last
+                        jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
+                        target_interval = meta.min_call_interval + jitter
+                        if elapsed < target_interval:
+                            wait_time = target_interval - elapsed
+                            wait_ms = wait_time * 1000.0
+                            self._last_call_times[pk] = now + wait_time
+                        else:
+                            self._last_call_times[pk] = now
+
+                    if wait_ms > 0:
+                        await asyncio.sleep(wait_ms / 1000.0)
+                        self._total_waits += 1
+                        self._total_delay_ms += wait_ms
+
+            yield round(wait_ms, 2)
+
+    def get_stats(self) -> Dict[str, Any]:
+        active_semaphores = {}
+        providers_info = {}
+        for pk, sem in self._semaphores.items():
+            meta = PROVIDER_RISK_SPECS.get(pk)
+            limit = meta.max_concurrency if meta else 2
+            cur_available = getattr(sem, "_value", limit)
+            in_use = max(0, limit - cur_available)
+            active_semaphores[pk] = in_use
+            providers_info[pk] = {
+                "max_concurrency": limit,
+                "in_use": in_use,
+                "min_interval_s": meta.min_call_interval if meta else 0.1,
+                "jitter_s": list(meta.jitter_range) if meta else [0.01, 0.05],
+                "risk_level": meta.risk_level.value if meta else "medium",
+            }
+        return {
+            "active_semaphores": active_semaphores,
+            "providers": providers_info,
+            "total_waits": self._total_waits,
+            "avg_delay_ms": round(self._total_delay_ms / max(1, self._total_waits), 2),
+        }
+
+
+_traffic_pacer_instance: Optional[TrafficPacer] = None
+
+
+def get_traffic_pacer() -> TrafficPacer:
+    """获取全局单例流量整形器"""
+    global _traffic_pacer_instance
+    if _traffic_pacer_instance is None:
+        _traffic_pacer_instance = TrafficPacer()
+    return _traffic_pacer_instance
 
 
 @dataclass
