@@ -253,6 +253,16 @@ class CooldownTracker:
         end_time = self._cooldowns.get(provider_key, 0.0)
         return max(0.0, end_time - now)
 
+    def get_all_cooldowns(self) -> Dict[str, float]:
+        """获取所有当前处于冷却���态的节点及剩余冷却时间（秒）"""
+        now = time.time()
+        res = {}
+        for pk, end_time in list(self._cooldowns.items()):
+            rem = end_time - now
+            if rem > 0:
+                res[pk] = round(rem, 2)
+        return res
+
     async def record_failure(
         self,
         provider_key: str,
@@ -271,14 +281,22 @@ class CooldownTracker:
             base_cd = custom_cooldown or (meta.default_cooldown if meta else 30.0)
 
             # 429 限流或人机验证 (RGV587 / 验证码) 强制冷却
-            is_waf_or_rate = status == 429 or any(
+            is_risk, risk_reason = is_risk_interception(error_msg)
+            is_waf_or_rate = is_risk or status == 429 or any(
                 k in error_msg.lower() for k in ("rgv587", "captcha", "人机", "验证码", "rate_limit", "频控")
             )
             # 401 令牌过期也需要避让
             is_auth_error = status == 401
 
-            if is_waf_or_rate:
-                # 针对风控加权冷却
+            if is_risk:
+                # 触发平台风控拦截（滑块、盾、CF、Token失效等），强制长效动态避让
+                cooldown_duration = max(base_cd * 2.0, base_cd * (1.2 ** min(cur_fails - 1, 3)))
+                logger.warning(
+                    f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: {risk_reason}，"
+                    f"触发长效避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
+                )
+            elif is_waf_or_rate:
+                # 针对频控加权冷却
                 cooldown_duration = base_cd * (1.2 ** min(cur_fails - 1, 3))
             elif is_auth_error:
                 cooldown_duration = max(60.0, base_cd)

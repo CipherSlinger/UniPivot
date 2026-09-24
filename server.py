@@ -896,6 +896,25 @@ async def get_diagnostics():
             node.get("request_count", 0) for node in lb_stats.get("nodes", {}).values()
         )
 
+    # 8. 流量整形与风控避让遥测指标
+    pacer_stats = traffic_pacer.get_stats()
+    cooldown_nodes = failover_router.cooldown_tracker.get_all_cooldowns()
+    risk_avoidance = {
+        "status": "active" if os.getenv("GATEWAY_DISABLE_PACING") != "1" else "disabled",
+        "active_semaphores": pacer_stats.get("active_semaphores", {}),
+        "cooldown_nodes": cooldown_nodes,
+        "traffic_pacing": pacer_stats,
+        "provider_risk_specs": {
+            pk: {
+                "risk_level": meta.risk_level.value,
+                "max_concurrency": meta.max_concurrency,
+                "min_interval_s": meta.min_call_interval,
+                "default_cooldown_s": meta.default_cooldown,
+            }
+            for pk, meta in PROVIDER_RISK_SPECS.items()
+        },
+    }
+
     return {
         "status": "ok",
         "timestamp": time.time(),
@@ -908,6 +927,7 @@ async def get_diagnostics():
         "http_pool": http_pool,
         "prompt_cache": prompt_cache,
         "prompt_optimizer": prompt_optimizer.get_stats(),
+        "risk_avoidance": risk_avoidance,
     }
 
 

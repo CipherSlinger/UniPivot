@@ -1402,6 +1402,14 @@ def test_diagnostics_endpoint():
         assert "preserve_recent_turns" in po
         assert "folding_enabled" in po
 
+        # 9. 验证 risk_avoidance 与 traffic_pacing 风控避让遥测指标
+        assert "risk_avoidance" in data
+        ra = data["risk_avoidance"]
+        assert "active_semaphores" in ra
+        assert "cooldown_nodes" in ra
+        assert "traffic_pacing" in ra
+        assert "provider_risk_specs" in ra
+
     print("[PASS] server: GET /v1/diagnostics 与 /diagnostics 诊断指标接口验证通过")
 
 
