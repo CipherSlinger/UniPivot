@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
@@ -1745,6 +1746,58 @@ def test_prompt_folding_headers_and_truncation():
     print("[PASS] test_prompt_folding_headers_and_truncation: 自适应折叠与全协议响应头透传验证通过")
 
 
+def test_risk_avoidance_headers_and_cooldown():
+    """验证风控拦截避让与自适应流量整形响应头透传：
+    1. 正常请求时，响应头包含 x-risk-pacing-delay-ms；
+    2. 当主选节点处于冷却中时，响应头包含 x-risk-cooldown-active 或无缝同环故障转移；
+    3. 覆盖 OpenAI (/v1/chat/completions)、Anthropic (/v1/messages) 与 Responses (/v1/responses) 协议。
+    """
+    srv._make_provider = lambda key: EchoProvider()
+    client = TestClient(srv.app)
+
+    # 1. OpenAI 协议请求，验证响应头包含流量整形指标
+    r_chat = client.post(
+        "/v1/chat/completions",
+        json={"model": "qwen", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert r_chat.status_code == 200
+    assert "x-risk-pacing-delay-ms" in r_chat.headers
+    delay_val = float(r_chat.headers["x-risk-pacing-delay-ms"])
+    assert delay_val >= 0.0
+
+    # 2. Anthropic 协议请求
+    r_ant = client.post(
+        "/v1/messages",
+        headers={"x-api-key": "test-key", "anthropic-version": "2023-06-01"},
+        json={"model": "claude-3-7-sonnet", "messages": [{"role": "user", "content": "ping"}]},
+    )
+    assert r_ant.status_code == 200
+    assert "x-risk-pacing-delay-ms" in r_ant.headers
+
+    # 3. Responses (Codex CLI) 协议请求
+    r_resp = client.post(
+        "/v1/responses",
+        json={"model": "gpt-4o", "input": "ping"},
+    )
+    assert r_resp.status_code == 200
+    assert "x-risk-pacing-delay-ms" in r_resp.headers
+
+    # 4. 模拟节点处于冷却期时，响应头暴露 x-risk-cooldown-active
+    srv.failover_router.cooldown_tracker._cooldowns["qwen"] = time.time() + 45.0
+    try:
+        r_cd = client.post(
+            "/v1/chat/completions",
+            json={"model": "qwen", "messages": [{"role": "user", "content": "ping"}]},
+        )
+        assert r_cd.status_code == 200
+        assert "x-risk-pacing-delay-ms" in r_cd.headers
+        assert "x-risk-cooldown-active" in r_cd.headers or r_cd.headers.get("x-load-balancing-action") == "shedded"
+    finally:
+        srv.failover_router.cooldown_tracker.reset()
+
+    print("[PASS] test_risk_avoidance_headers_and_cooldown: 流量整形响应头与避让冷却透传验证通过")
+
+
 if __name__ == "__main__":
     test_unknown_model_404()
     test_empty_messages_400()
@@ -1785,4 +1838,5 @@ if __name__ == "__main__":
     test_disabled_provider_zero_latency_switch()
     test_adaptive_load_balancer_metrics_and_degradation()
     test_prompt_folding_headers_and_truncation()
+    test_risk_avoidance_headers_and_cooldown()
     print("服务端集成测试全部通过")

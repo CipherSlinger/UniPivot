@@ -56,6 +56,9 @@ from providers import (
     AdaptiveLoadBalancer,
     BalancingDecision,
     PROVIDER_RISK_SPECS,
+    TrafficPacer,
+    get_traffic_pacer,
+    is_risk_interception,
     anthropic_error_response,
     anthropic_message_response,
     anthropic_sse_event,
@@ -125,6 +128,10 @@ task_dispatcher = TaskDispatcher(port=PORT)
 # 全局五大模型对等互备路由调度器
 failover_router = FailoverRouter()
 
+# 全局自适应流量整形器（并发与反爬步调控制）
+traffic_pacer = get_traffic_pacer()
+traffic_pacer.cooldown_tracker = failover_router.cooldown_tracker
+
 # 全局冷热动态负载均衡与自适应降级调度引擎
 load_balancer = AdaptiveLoadBalancer(cooldown_tracker=failover_router.cooldown_tracker)
 
@@ -140,6 +147,21 @@ def _make_lb_headers(decision: BalancingDecision) -> dict[str, str]:
         headers["x-load-balancing-reason"] = urllib.parse.quote(
             decision.reason, safe=" /:;=@[](){}<>_-,."
         )
+    return headers
+
+
+def _make_risk_headers(
+    delay_ms: float, provider_key: str, primary_provider: Optional[str] = None
+) -> dict[str, str]:
+    """构造流量整形等待耗时与风控避让冷却响应头"""
+    headers = {
+        "x-risk-pacing-delay-ms": str(round(delay_ms, 2)),
+    }
+    rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(provider_key)
+    if rem_cd <= 0 and primary_provider:
+        rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(primary_provider)
+    if rem_cd > 0:
+        headers["x-risk-cooldown-active"] = str(round(rem_cd, 2))
     return headers
 
 # ---------------------------------------------------------------- 模型表
@@ -1151,6 +1173,9 @@ async def chat_completions(req: ChatCompletionRequest):
         "stream": req.stream,
     }
 
+    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
+        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
@@ -1158,6 +1183,7 @@ async def chat_completions(req: ChatCompletionRequest):
         }
         stream_headers.update(lb_headers)
         stream_headers.update(fold_headers)
+        stream_headers.update(risk_headers)
 
         async def gen():
             cid = _id("chatcmpl")
@@ -1275,6 +1301,9 @@ async def chat_completions(req: ChatCompletionRequest):
                 except ProviderError as e:
                     is_rate_limit = (e.status == 429)
                     error_msg = e.message
+                    is_risk, _ = is_risk_interception(e.message)
+                    if is_risk:
+                        await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                     yield sse_frame(error_response(e.message, e.status, e.err_type))
                 except Exception as e:
                     error_msg = str(e)
@@ -1421,6 +1450,9 @@ async def chat_completions(req: ChatCompletionRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
+                is_risk, _ = is_risk_interception(e.message)
+                if is_risk:
+                    await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                 yield sse_frame(error_response(e.message, e.status, e.err_type))
             except Exception as e:
                 error_msg = str(e)
@@ -1476,6 +1508,9 @@ async def chat_completions(req: ChatCompletionRequest):
     except ProviderError as e:
         is_rate_limit = (e.status == 429)
         error_msg = e.message
+        is_risk, _ = is_risk_interception(e.message)
+        if is_risk:
+            await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
         error_msg = str(e)
@@ -1497,6 +1532,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
+    resp_headers.update(risk_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1600,6 +1636,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         "thinking": enable_thinking,
     }
 
+    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
+        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
@@ -1607,6 +1646,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         }
         stream_headers.update(lb_headers)
         stream_headers.update(fold_headers)
+        stream_headers.update(risk_headers)
 
         async def gen():
             msg_id = _id("msg", "_")
@@ -1790,6 +1830,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
+                is_risk, _ = is_risk_interception(e.message)
+                if is_risk:
+                    await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                 yield anthropic_sse_event(
                     "error", anthropic_error_response(e.message, e.status, e.err_type)
                 )
@@ -1849,6 +1892,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     except ProviderError as e:
         is_rate_limit = (e.status == 429)
         error_msg = e.message
+        is_risk, _ = is_risk_interception(e.message)
+        if is_risk:
+            await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         return JSONResponse(
             anthropic_error_response(e.message, e.status, e.err_type),
             status_code=e.status,
@@ -1877,6 +1923,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
+    resp_headers.update(risk_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1999,6 +2046,9 @@ async def responses_endpoint(req: ResponsesRequest):
         "thinking": enable_thinking,
     }
 
+    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
+        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+
     resp_id = _id("resp", "_")
     msg_id = _id("msg", "_")
     start_time = time.time()
@@ -2016,6 +2066,9 @@ async def responses_endpoint(req: ResponsesRequest):
             chat_args=chat_args,
         )
     except ProviderError as e:
+        is_risk, _ = is_risk_interception(e.message)
+        if is_risk:
+            await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         load_balancer.release(
             dispatched_provider,
             success=False,
@@ -2034,6 +2087,7 @@ async def responses_endpoint(req: ResponsesRequest):
 
     resp_headers = dict(lb_headers)
     resp_headers.update(fold_headers)
+    resp_headers.update(risk_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
