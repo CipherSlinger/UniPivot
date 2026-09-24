@@ -8,6 +8,7 @@ import sys
 import time
 from typing import Any, Dict, List, Optional, Tuple
 
+from providers.failover import get_traffic_pacer
 from providers.http_client import close_http_client, get_http_client
 from server import PROVIDER_SPECS
 
@@ -113,7 +114,7 @@ async def execute_model_task(
     wire_model: str,
     prompt: str,
     client: Any,
-    timeout: float = 20.0,
+    timeout: float = 45.0,
 ) -> Dict[str, Any]:
     resolver, err_msg, factory = PROVIDER_SPECS[p_name]
     session = resolver()
@@ -121,31 +122,33 @@ async def execute_model_task(
         return {"error": "无有效 Session 凭据", "success": False}
 
     provider = factory(session, client=client)
+    pacer = get_traffic_pacer()
     t0 = time.time()
     ttft: Optional[float] = None
     output_tokens = 0
     full_text = []
 
     try:
-        async def _stream():
-            nonlocal ttft, output_tokens
-            messages = [{"role": "user", "content": prompt}]
-            async for chunk in provider.chat(messages, model=wire_model, stream=True):
-                delta = ""
-                if isinstance(chunk, tuple):
-                    delta = chunk[0]
-                elif isinstance(chunk, dict):
-                    delta = chunk.get("delta", {}).get("content", "")
-                elif isinstance(chunk, str):
-                    delta = chunk
+        async with pacer.acquire(p_name):
+            async def _stream():
+                nonlocal ttft, output_tokens
+                messages = [{"role": "user", "content": prompt}]
+                async for chunk in provider.chat(messages, model=wire_model, stream=True):
+                    delta = ""
+                    if isinstance(chunk, tuple):
+                        delta = chunk[0]
+                    elif isinstance(chunk, dict):
+                        delta = chunk.get("delta", {}).get("content", "")
+                    elif isinstance(chunk, str):
+                        delta = chunk
 
-                if delta:
-                    if ttft is None:
-                        ttft = round((time.time() - t0) * 1000, 2)
-                    full_text.append(delta)
-                    output_tokens += max(1, len(delta) // 2)
+                    if delta:
+                        if ttft is None:
+                            ttft = round((time.time() - t0) * 1000, 2)
+                        full_text.append(delta)
+                        output_tokens += max(1, len(delta) // 2)
 
-        await asyncio.wait_for(_stream(), timeout=timeout)
+            await asyncio.wait_for(_stream(), timeout=timeout)
         tot_time = round((time.time() - t0) * 1000, 2)
         final_str = "".join(full_text)
         tps = round(output_tokens / (tot_time / 1000.0), 1) if tot_time > 0 else 0.0
@@ -201,7 +204,14 @@ def evaluate_task_1(result: Dict[str, Any]) -> Tuple[float, str]:
     # 动态安全执行沙箱
     local_scope: Dict[str, Any] = {}
     try:
-        exec(test_harness, {"__builtins__": __builtins__}, local_scope)
+        import collections, threading, time
+        globals_dict = dict(__builtins__ if isinstance(__builtins__, dict) else __builtins__.__dict__)
+        globals_dict.update({
+            "OrderedDict": collections.OrderedDict,
+            "threading": threading,
+            "time": time,
+        })
+        exec(test_harness, globals_dict, local_scope)
         return 100.0, "代码编译通过，并发缓存与 TTL 过期测试全 PASS"
     except AssertionError as ae:
         return 40.0, f"语法正确但逻辑断言失败: {ae}"
@@ -296,7 +306,7 @@ async def main():
     t1_res = []
     for p, m, label in MODELS:
         print(f"  -> 测试 {label}...", end=" ", flush=True)
-        r = await execute_model_task(p, m, TASK_1_CODE_GEN["prompt"], client, timeout=25.0)
+        r = await execute_model_task(p, m, TASK_1_CODE_GEN["prompt"], client, timeout=45.0)
         status = f"✅ 完成 ({r['total_ms']}ms, {r['output_tokens']} tokens)" if r["success"] else f"❌ 失败: {r['error']}"
         print(status, flush=True)
         t1_res.append(r)
@@ -305,7 +315,7 @@ async def main():
     t2_res = []
     for p, m, label in MODELS:
         print(f"  -> 测试 {label}...", end=" ", flush=True)
-        r = await execute_model_task(p, m, TASK_2_DEBUG["prompt"], client, timeout=25.0)
+        r = await execute_model_task(p, m, TASK_2_DEBUG["prompt"], client, timeout=45.0)
         status = f"✅ 完成 ({r['total_ms']}ms, {r['output_tokens']} tokens)" if r["success"] else f"❌ 失败: {r['error']}"
         print(status, flush=True)
         t2_res.append(r)
@@ -314,7 +324,7 @@ async def main():
     t3_res = []
     for p, m, label in MODELS:
         print(f"  -> 测试 {label}...", end=" ", flush=True)
-        r = await execute_model_task(p, m, TASK_3_TOOL_CALL["prompt"], client, timeout=25.0)
+        r = await execute_model_task(p, m, TASK_3_TOOL_CALL["prompt"], client, timeout=45.0)
         status = f"✅ 完成 ({r['total_ms']}ms, {r['output_tokens']} tokens)" if r["success"] else f"❌ 失败: {r['error']}"
         print(status, flush=True)
         t3_res.append(r)
