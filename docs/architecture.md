@@ -177,6 +177,13 @@ PROVIDER_RISK_SPECS = {
 - **风控与故障解耦**：冷却期探针既不累计 `consecutive_failures` 也不触发自愈，避免把风控封禁误判为节点故障而派发无效热修复风暴。
 - **遥测**：`/v1/diagnostics` 的 `healing_status.cooldown_probe_skips` 输出各节点被门控跳过的探针计数；`GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1` 可无损回退。
 
+#### 6.1 读取时冷却叠加与自愈大脑选举避让 (`healing/monitor.py:get_status` / `healing/healer.py:pick_healer_model`)
+
+- **问题**：`ProviderHealth.status` 默认即为 `healthy`。在首个探针周期完成前（或进程刚重启、冷却状态已由 `risk_ledger` 恢复但尚未探针覆盖时），处于风控避让冷却期的节点依然对外报告 `healthy`。自愈大脑选举 `pick_healer_model` 仅按 `status == "healthy"` 过滤，会把**已被封禁的节点选为修复引擎**，进而经本网关发出一次真实上游补全请求——这正是整条冷却门控体系要杜绝的隐蔽触碰通道，且优先级表第二位即为 DeepSeek。
+- **读取时叠加**：`get_status()` / `get_all_statuses()` 在返回前叠加实时冷却查询结果（`status` 覆盖为 `cooling` 并附带 `cooldown_remaining`）。叠加**不落盘、不粘滞**，冷却解除后自动消失，因此对所有状态消费方（自愈选举、状态面板、诊断接口）一次性生效。
+- **选举避让**：`pick_healer_model` 先对全部候选取一次冷却快照，两轮遍历共享同一视图（避免重复统计），冷却节点一律排除并计入 `cooldown_healer_skips`；当除故障节点外**已无可用候选**时返回 `None`，由上层「缺少健康备选模型」分支安全推迟自愈，而非强行触碰封禁节点。
+- **总开关**：`GATEWAY_DISABLE_COOLDOWN_GATE=1` 统一关闭探针门控、状态叠加与选举避让（`GATEWAY_DISABLE_PROBE_COOLDOWN_GATE` 保留为向后兼容别名）。
+
 #### 7. 启动期令牌静默刷新的风控冷却门控 (`server.py:_auto_refresh_stale_sessions`)
 
 - **冷却即暂缓**：启动时的静默令牌刷新先查询 `CooldownTracker`，处于风控避让冷却期的节点**暂缓刷新**——对已被上游封禁的账号发起登录/刷新请求同样会被风控记录并加剧封禁。
@@ -358,6 +365,7 @@ PROVIDER_RISK_SPECS = {
    - 健康探针同样必须遵守冷却门控：处于避让冷却期的节点禁止发起任何真实上游探针（含自愈复检），杜绝「周期探针」成为持续触碰已封禁节点的隐蔽通道。
    - 启动期静默令牌刷新同样必须遵守冷却门控：处于避让冷却期的节点暂缓刷新，冷却解除后由有界后台线程补刷，杜绝「重启即刷新」成为封禁窗口的隐形延长器。
    - 临时会话删除同样必须遵守冷却门控：处于避让冷却期的节点暂缓删除其临时会话（记录保留在持久化队列且不消耗重试次数），冷却解除后补做，杜绝「会话回收」成为封禁窗口的又一条隐蔽触碰通道。
+   - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
 
 ---
 
@@ -384,6 +392,7 @@ PROVIDER_RISK_SPECS = {
 ```
 
 ### 测试矩阵要求：
+0. **测试隔离与零污染**：所有测试套件必须设置 `TESTING=1`（或显式关闭持久化），使风控台账、拦截 JSONL 与会话回收队列落于临时目录，**严禁污染开发者真实 `session/` 目录**。由于 `CooldownTracker` 会从进程内共享的台账单例恢复冷却状态，未隔离的套件会因用例执行顺序不同而产生非确定性结果——纯内存冷却语义的用例（如 `tests/test_failover.py`）应显式设置 `GATEWAY_DISABLE_RISK_LEDGER=1`，跨重启持久化语义则由 `tests/test_risk_ledger.py` 专测。
 1. **协议正确性**：验证 OpenAI Chat Completions、Anthropic Messages、OpenAI Responses 三大协议在流式与非流式下的 JSON 结构与事件时序。
 2. **容错与转译**：验证 400、401、404、429、500、502 状态码在不同协议下的标准转译。
 3. **思考链完整性**：验证思维链内容能够正确抽取到 `reasoning_content`（OpenAI）与 `type: "thinking"`（Anthropic）。

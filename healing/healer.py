@@ -36,12 +36,37 @@ PREFERRED_HEALER_MODELS = {
 
 
 def pick_healer_model(monitor: HealthMonitor, failing_provider: str) -> Optional[str]:
-    """从当前除 failing_provider 之外 healthy 的 Provider 中，选出最强的模型别名。"""
+    """从当前除 failing_provider 之外 healthy 的 Provider 中，选出最强的模型别名。
+
+    [OPT-018] 处于风控避让冷却期的节点一律排除：驱动修复的模型别名最终会经本网关
+    转发为一次真实上游调用，选到被封禁节点等同于在封禁窗口内持续触碰该账号。
+    冷却节点被跳过后若已无可用候选，则返回 None，交由上层「缺少健康备选模型」分支
+    安全推迟自愈，而不是强行触碰封禁节点。
+    """
     # 优先顺序：qwen(qwen3.7-max) -> deepseek(deepseek-chat) -> doubao(doubao-pro) -> kimi(kimi-explore) -> glm(glm-4-plus)
     priority = ["qwen", "deepseek", "doubao", "kimi", "glm"]
 
+    def _cooling(cand: str) -> bool:
+        try:
+            remaining = monitor.get_cooldown_remaining(cand)
+        except Exception:  # noqa: BLE001 - 门控查询失败按「无冷却」处理，不影响可用性
+            return False
+        if remaining > 0:
+            monitor.record_healer_skip(cand)
+            logger.warning(
+                "[自愈选举] 跳过处于风控避让冷却中的节点 %s (剩余 %.0fs)，避免在封禁窗口内触碰该账号",
+                cand,
+                remaining,
+            )
+            return True
+        return False
+
+    # 先对全部候选求一次冷却快照：两轮遍历共享同一视图，
+    # 避免同一节点在两个循环中被重复统计为跳过。
+    cooling = {cand for cand in priority if cand != failing_provider and _cooling(cand)}
+
     for cand in priority:
-        if cand == failing_provider:
+        if cand == failing_provider or cand in cooling:
             continue
         info = monitor.get_status(cand)
         if info and info.get("status") == "healthy":
@@ -49,7 +74,7 @@ def pick_healer_model(monitor: HealthMonitor, failing_provider: str) -> Optional
 
     # 如果没有完全健康的，但有处于 degraded 状态的（只偶尔超时但未彻底 offline），也可以做备选
     for cand in priority:
-        if cand == failing_provider:
+        if cand == failing_provider or cand in cooling:
             continue
         info = monitor.get_status(cand)
         if info and info.get("status") == "degraded":

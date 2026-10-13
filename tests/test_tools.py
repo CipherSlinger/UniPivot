@@ -12,6 +12,9 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# [OPT-019] 隔离运行：风控冷却台账 / 会话回收队列在 TESTING=1 下写入临时目录，
+# 杜绝测试运行污染开发者真实 session/ 目录，并消除用例间的持久化状态串扰。
+os.environ["TESTING"] = "1"
 os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
 os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
 os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"

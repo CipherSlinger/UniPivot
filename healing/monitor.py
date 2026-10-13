@@ -82,6 +82,8 @@ class HealthMonitor:
         # [OPT-012] 风控冷却门控：返回节点剩余冷却秒数的回调 (>0 表示处于避让期)
         self._cooldown_probe_gate: Optional[Callable[[str], float]] = None
         self._probe_skip_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
+        # [OPT-018] 自愈大脑选举的冷却避让统计
+        self._healer_skip_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
         self._check_locks: Dict[str, asyncio.Lock] = {
             name: asyncio.Lock() for name in self._states
         }
@@ -119,9 +121,20 @@ class HealthMonitor:
         """
         self._cooldown_probe_gate = gate
 
+    def _cooldown_gate_disabled(self) -> bool:
+        """[OPT-018] 冷却避让总开关：探针门控、状态叠加与自愈选举共用同一开关。
+
+        `GATEWAY_DISABLE_COOLDOWN_GATE` 为语义化新名，`GATEWAY_DISABLE_PROBE_COOLDOWN_GATE`
+        为历史名（向后兼容），任一为真即整体回退为「无冷却感知」。
+        """
+        for env in ("GATEWAY_DISABLE_COOLDOWN_GATE", "GATEWAY_DISABLE_PROBE_COOLDOWN_GATE"):
+            if os.getenv(env, "").strip().lower() in ("1", "true", "yes"):
+                return True
+        return False
+
     def _probe_cooldown_remaining(self, name: str) -> float:
         """查询节点剩余风控冷却秒数（未注册回调或已关闭门控时返回 0）。"""
-        if os.getenv("GATEWAY_DISABLE_PROBE_COOLDOWN_GATE", "").strip().lower() in ("1", "true", "yes"):
+        if self._cooldown_gate_disabled():
             return 0.0
         gate = self._cooldown_probe_gate
         if gate is None:
@@ -130,6 +143,27 @@ class HealthMonitor:
             return max(0.0, float(gate(name)))
         except Exception:  # noqa: BLE001 - 门控查询失败绝不阻断探测流程
             return 0.0
+
+    def get_cooldown_remaining(self, name: str) -> float:
+        """[OPT-018] 公开接口：查询节点剩余风控冷却秒数（>0 表示处于避让期）。
+
+        与探针门控共享同一 CooldownTracker 数据源与同一开关，供自愈大脑选举、
+        状态叠加等读取侧消费方使用，避免各自实现冷却判断而产生分歧。
+        """
+        return self._probe_cooldown_remaining(name)
+
+    def record_healer_skip(self, name: str) -> None:
+        """[OPT-018] 记录一次因风控冷却而被排除出候选的自愈大脑选举。"""
+        self._healer_skip_stats["total"] = int(self._healer_skip_stats.get("total", 0)) + 1
+        per = self._healer_skip_stats.setdefault("per_provider", {})
+        per[name] = per.get(name, 0) + 1
+
+    def get_healer_skip_stats(self) -> Dict[str, Any]:
+        """[OPT-018] 返回因冷却被排除出候选的选举次数统计。"""
+        return {
+            "total": int(self._healer_skip_stats.get("total", 0)),
+            "per_provider": dict(self._healer_skip_stats.get("per_provider", {})),
+        }
 
     def get_probe_skip_stats(self) -> Dict[str, Any]:
         """[OPT-012] 返回被冷却门控跳过的探针统计。"""
@@ -150,7 +184,19 @@ class HealthMonitor:
             if self._states[name].last_error == "节点已被禁用 (DISABLED_PROVIDERS)":
                 self._states[name].last_error = None
         h = self._states.get(name)
-        return h.to_dict() if h else None
+        if h is None:
+            return None
+        info = h.to_dict()
+        # [OPT-018] 冷却状态在读取时叠加（不落盘、不粘滞）：
+        # ProviderHealth 默认 status="healthy"，进程刚重启或节点尚未被探针覆盖时，
+        # 处于风控冷却期的节点会被所有消费方（自愈大脑选举、状态面板等）
+        # 误判为健康并加以触碰。此处以实时冷却查询覆盖之。
+        if info.get("status") not in ("disabled", "offline"):
+            remaining = self._probe_cooldown_remaining(name)
+            if remaining > 0:
+                info["status"] = "cooling"
+                info["cooldown_remaining"] = round(remaining, 1)
+        return info
 
     def get_all_statuses(self) -> Dict[str, Dict[str, Any]]:
         # 刷新 disabled 状态与动态解禁
@@ -175,7 +221,17 @@ class HealthMonitor:
                 self._states[name].status = "offline"
                 self._states[name].last_error = "未配置令牌"
 
-        return {k: v.to_dict() for k, v in self._states.items()}
+        # [OPT-018] 与 get_status 一致，读取时叠加实时冷却状态
+        result: Dict[str, Dict[str, Any]] = {}
+        for k, v in self._states.items():
+            info = v.to_dict()
+            if info.get("status") not in ("disabled", "offline"):
+                remaining = self._probe_cooldown_remaining(k)
+                if remaining > 0:
+                    info["status"] = "cooling"
+                    info["cooldown_remaining"] = round(remaining, 1)
+            result[k] = info
+        return result
 
     def mark_recovering(self, name: str) -> None:
         if name in self._states:

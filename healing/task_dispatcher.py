@@ -371,6 +371,26 @@ class TaskEvaluator:
                 "description": "删除临时会话本身也是一次真实上游请求。原实现会对任何节点立即发起删除，包括正处于风控避让冷却期（即已触发验证码/429/封禁）的节点——这等同于在封禁窗口内持续触碰该账号，人为延长封禁。与健康探针（OPT-012）、令牌刷新（OPT-013）属同一类隐蔽通道。本次为 ConversationGC 注入 CooldownTracker 门控：冷却期节点的删除动作被推迟，记录保留在持久化队列且不消耗重试次数，冷却解除后由后台 drain 自然补做；门控查询异常时绝不阻断回收。",
                 "expected_impact": "彻底关闭「会话回收」这条持续触碰封禁节点的隐蔽通道，杜绝因删除流量而延长封禁窗口；推迟不消耗重试次数，冷却解除后删除仍会补做，无功能回退；GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1 可单独回退，deferred_by_cooldown 经 /v1/diagnostics 可审计。",
             },
+            {
+                "id": "OPT-018",
+                "status": "COMPLETED",
+                "status_display": "已落地",
+                "category": "风控避让与自愈",
+                "title": "读取时冷却叠加与自愈大脑选举避让 (Cooldown-Aware Healer Election)",
+                "priority": "P1",
+                "description": "ProviderHealth.status 默认即为 healthy，在首个探针周期完成前（或进程刚重启、冷却状态已由 risk_ledger 恢复但尚未被探针覆盖时），处于风控避让冷却期的节点依然报告 healthy。自愈大脑选举 pick_healer_model 仅按 status==healthy 过滤，会把已被封禁的节点选为修复引擎，进而经本网关发出一次真实上游补全请求——这正是整条冷却门控体系要杜绝的隐蔽触碰通道，且优先级表第二位即为 DeepSeek。本次在 get_status/get_all_statuses 读取时叠加实时冷却（不落盘、不粘滞），并在 pick_healer_model 中对全部候选取一次冷却快照统一排除，无可用候选时返回 None 交由上层安全推迟自愈。",
+                "expected_impact": "封堵「自愈驱动模型」这条持续触碰封禁节点的通道，杜绝重启后或探针空窗期把封禁节点误判为健康并对其发起真实补全；候选耗尽时安全推迟自愈而非触碰封禁节点，功能不中断；cooldown_healer_skips 经 /v1/diagnostics 可审计；GATEWAY_DISABLE_COOLDOWN_GATE=1 统一回退（旧名 GATEWAY_DISABLE_PROBE_COOLDOWN_GATE 保留兼容）。",
+            },
+            {
+                "id": "OPT-019",
+                "status": "COMPLETED",
+                "status_display": "已落地",
+                "category": "工程质量与可测性",
+                "title": "持久化存储的测试隔离与零污染 (Durable-Store Test Isolation)",
+                "priority": "P2",
+                "description": "风控台账冷却、拦截 JSONL 与会话回收队列在 TESTING=1 下落到临时目录，但 test_server / test_responses / test_tools / test_failover 等套件只注入假 Token 而未设置 TESTING，导致测试运行把伪造的冷却状态写入开发者真实 session/ 目录；又因 CooldownTracker 构造时从进程内共享台账单例恢复状态，同一进程内先前用例记录的冷却会被后续用例继承，使结果依赖执行顺序（tests/test_failover.py 因此长期红灯）。本次为受影响套件补齐 TESTING=1 隔离，并让 test_failover 显式关闭跨重启恢复以回归其纯内存冷却状态机的设计初衷。",
+                "expected_impact": "测试运行不再污染开发者真实凭证目录与长期风控画像；消除用例间的持久化状态串扰与非确定性失败，全部 23 个测试套件首次全绿；隔离策略写入架构文档测试矩阵第 0 条作为强制规范。",
+            },
         ]
 
         report_data = {
@@ -418,7 +438,7 @@ class TaskEvaluator:
         md_lines.extend([
             "## 3. 验收结论与下一步演进路线",
             "当前网关在多协议转换（OpenAI Chat / Anthropic Messages / Realtime Responses）与五大上游提供方稳定性表现优异。",
-            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）、`OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）、`OPT-006`（流式工具调用增量分发与容错修复引擎）、`OPT-007`（智能会话粘滞路由与跨模型状态迁移引擎）、`OPT-008`（智能并发语义去重与流式请求合并引擎 SingleFlight）、`OPT-009`（客户端断连传播与上游资源回收引擎）、`OPT-010`（请求生命周期终局保障与并发配额确定性回收引擎）、`OPT-011`（风控拦截持久化台账与冷却状态跨重启恢复引擎）、`OPT-012`（风控感知健康探针门控）、`OPT-013`（启动期令牌静默刷新的风控冷却门控）、`OPT-014`（风控证据驱动的自适应步调强化引擎）、`OPT-015`（在途请求优雅停机排空引擎）、`OPT-016`（远端临时会话删除的持久化重试队列）以及 `OPT-017`（风控冷却感知的临时会话回收割让）均已全部落地并完成全套测试套件回归验证。",
+            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）、`OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）、`OPT-006`（流式工具调用增量分发与容错修复引擎）、`OPT-007`（智能会话粘滞路由与跨模型状态迁移引擎）、`OPT-008`（智能并发语义去重与流式请求合并引擎 SingleFlight）、`OPT-009`（客户端断连传播与上游资源回收引擎）、`OPT-010`（请求生命周期终局保障与并发配额确定性回收引擎）、`OPT-011`（风控拦截持久化台账与冷却状态跨重启恢复引擎）、`OPT-012`（风控感知健康探针门控）、`OPT-013`（启动期令牌静默刷新的风控冷却门控）、`OPT-014`（风控证据驱动的自适应步调强化引擎）、`OPT-015`（在途请求优雅停机排空引擎）、`OPT-016`（远端临时会话删除的持久化重试队列）、`OPT-017`（风控冷却感知的临时会话回收割让）、`OPT-018`（读取时冷却叠加与自愈大脑选举避让）以及 `OPT-019`（持久化存储的测试隔离与零污染）均已全部落地并完成全套测试套件回归验证。",
             "网关已具备全自动自愈、推测式流式工具输出、会话粘滞平滑漂移、并发去重广播、断连配额回收、请求全生命周期终局保障、风控避让跨重启持久化、冷却感知探针与刷新门控、风控证据驱动自适应降速、优雅停机排空、确定性计数记忆化与长效反爬规避能力，全流程稳定健壮。",
             "",
         ])

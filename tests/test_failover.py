@@ -45,6 +45,13 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 # 禁用自动化后台探测与外部依赖，注入假 Token
 os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
+# [OPT-019] 强制隔离运行：
+#  - TESTING=1 使风控台账落到临时目录，绝不污染开发者真实 session/ 目录；
+#  - GATEWAY_DISABLE_RISK_LEDGER=1 关闭跨重启冷却恢复，使本套件回到其设计初衷
+#    ——验证纯内存冷却状态机。持久化恢复语义由 tests/test_risk_ledger.py 专测。
+#    否则同一进程内先前用例记录的冷却会被后续 CooldownTracker() 恢复，导致用例互相污染。
+os.environ["TESTING"] = "1"
+os.environ["GATEWAY_DISABLE_RISK_LEDGER"] = "1"
 os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
 os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"
 os.environ["DOUBAO_AUTH_TOKEN"] = "fake_doubao"

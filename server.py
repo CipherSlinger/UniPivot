@@ -1088,6 +1088,7 @@ async def get_diagnostics():
         "last_check": float(last_check_ts),
         "check_count": int(getattr(health_monitor, "check_count", 0)),
         "cooldown_probe_skips": health_monitor.get_probe_skip_stats(),
+        "cooldown_healer_skips": health_monitor.get_healer_skip_stats(),
         "current_healing_task": current_healing_task,
         "running_tasks": running_tasks,
         "active_count": len(running_tasks),

@@ -53,6 +53,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_tools.py && \
 .venv/bin/python tests/test_affinity.py && \
 .venv/bin/python tests/test_singleflight.py && \
+.venv/bin/python tests/test_failover.py && \
 .venv/bin/python tests/test_disconnect.py && \
 .venv/bin/python tests/test_token_cache.py && \
 .venv/bin/python tests/test_lifecycle.py && \
@@ -71,11 +72,12 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_tools.py       # Streaming tool calling, speculative streaming, and self-healing JSON engine
 .venv/bin/python tests/test_affinity.py    # Session affinity, cross-model state handoff, LRU/TTL, and telemetry headers
 .venv/bin/python tests/test_singleflight.py # Deterministic SHA-256 fingerprinting, streaming broadcast fanout, and debounce coalescing
+.venv/bin/python tests/test_failover.py     # Capability rings, fallback candidate ordering/cooldown demotion, risk metadata, and transparent failover
 .venv/bin/python tests/test_disconnect.py   # Client-disconnect propagation, upstream stream reclamation, and orphaned flight recovery
 .venv/bin/python tests/test_token_cache.py  # Deterministic token-count memoization, bounded LRU, and count_tokens endpoint integration
 .venv/bin/python tests/test_lifecycle.py    # Request lifecycle finalization, flight-group abort terminality, and load-balancer quota reclamation
 .venv/bin/python tests/test_risk_ledger.py  # Risk-control severity tiers, durable cross-restart cooldowns, and the JSONL interception ledger
-.venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating (banned nodes are never re-probed)
+.venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating + read-time cooling overlay and healer-election avoidance (banned nodes are never re-probed or used for healing)
 .venv/bin/python tests/test_refresh_gate.py # Cooldown-aware token refresh gating with bounded deferred retry
 .venv/bin/python tests/test_adaptive_pacing.py # Evidence-driven pacing multiplier from the risk ledger
 .venv/bin/python tests/test_graceful_drain.py # In-flight request drain on shutdown (streaming-safe) and inflight telemetry
@@ -201,6 +203,7 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 12. **Cooldown-Aware Health Probe Gate (`healing/monitor.py`)**:
     - `HealthMonitor` consults `CooldownTracker` before every probe: a node in a risk-avoidance cooldown is marked `cooling` and the real network probe is skipped entirely. Without this the 300s audit loop re-poked an upstream-banned node every interval, lengthening the ban window — exactly the failure mode the durable ledger guards against, one layer up.
     - Cooling probes neither increment `consecutive_failures` nor trigger self-healing, so a risk ban is never misread as a node fault; `GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1` disables the gate and `/v1/diagnostics` exposes `healing_status.cooldown_probe_skips`. See `tests/test_probe_gate.py`.
+    - **[OPT-018] Read-time cooldown overlay + healer election avoidance**: `ProviderHealth.status` defaults to `healthy`, so before the first probe cycle (or right after a restart) a node sitting in a risk-avoidance cooldown still *reports* healthy — and `pick_healer_model` would elect it as the self-healing brain, dispatching a real upstream completion through a banned account. `get_status()`/`get_all_statuses()` now overlay live cooldown state ("cooling") at read time without persisting it, `pick_healer_model` excludes cooling candidates via `monitor.get_cooldown_remaining()` and records `cooldown_healer_skips`, and when no non-cooling candidate remains it returns `None` so healing is deferred instead of touching the banned node. The single master switch for all cooldown avoidance is `GATEWAY_DISABLE_COOLDOWN_GATE=1` (`GATEWAY_DISABLE_PROBE_COOLDOWN_GATE` remains as a back-compatible alias).
 
 13. **Cooldown-Aware Token Refresh Gate (`server.py:_auto_refresh_stale_sessions`)**:
     - The startup silent token-refresh pass consults the cooldown tracker: a node in a risk-avoidance cooldown is not refreshed (a login/refresh call to an upstream-banned account would only deepen the ban). Deferred nodes are retried by a bounded background thread (`GATEWAY_REFRESH_DEFER_POLL`, `GATEWAY_REFRESH_DEFER_MAX_WAIT`, default 24h) that refreshes once the cooldown clears and otherwise gives up cleanly. See `tests/test_refresh_gate.py`.
@@ -215,5 +218,8 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - Anonymous calls (no client `conversation_id`) leave a temporary session in the user's upstream web sidebar, so the gateway deletes it afterwards. The old `asyncio.create_task(provider.delete_conversation(cid))` was fire-and-forget: a failed delete or a process restart silently leaked the session forever. `ConversationGC` now enqueues each deletion in a POSIX-atomic JSON queue (dir `0o700`, file `0o600`) that survives restarts, retries via a background drain (bounded by `GATEWAY_CONVERSATION_GC_MAX_ATTEMPTS`, default 5, then drops with a warning), and drains once at startup to clean up the previous process's leftovers. `GATEWAY_DISABLE_CONVERSATION_GC=1` degrades to the legacy fire-and-forget behavior. Exposed as `conversation_gc` in `/v1/diagnostics`. See `tests/test_conversation_gc.py`.
     - **[OPT-017] Cooldown-aware deletion gate**: a delete is itself a real upstream request, so firing one at a node in a risk-avoidance cooldown is just another channel that keeps touching a banned account. Deletions for a cooling provider are deferred — the entry stays queued and does **not** consume a retry attempt — and are performed by a later drain once the cooldown clears. Mirrors the probe gate (OPT-012) and the refresh gate (OPT-013). `GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1` reverts; deferrals are exposed as `deferred_by_cooldown` in `/v1/diagnostics`. A gate-query failure never blocks deletion (zero-regression default).
 
-17. **Web Frontend (`static/index.html`)**:
+17. **Test Isolation of Durable Stores (`tests/*`)**:
+    - The durable stores (risk ledger cooldowns, interception JSONL, conversation GC queue) resolve to a `tempfile.mkdtemp()` directory under `TESTING=1`, but several legacy suites set fake tokens *without* setting `TESTING`, so a test run wrote fake cooldowns into the developer's real `session/` directory — and, because every `CooldownTracker` restores from the shared ledger singleton, later cases in the same process inherited cooldowns recorded by earlier ones, making results order-dependent (`tests/test_failover.py` was red for this reason). Those suites now set `TESTING=1` (isolated temp dir, zero writes to `session/`), and `tests/test_failover.py` additionally sets `GATEWAY_DISABLE_RISK_LEDGER=1` so it tests pure in-memory cooldown semantics as designed — cross-restart durability has its own suite, `tests/test_risk_ledger.py`.
+
+18. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
