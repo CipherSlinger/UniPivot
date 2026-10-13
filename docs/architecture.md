@@ -157,6 +157,13 @@ PROVIDER_RISK_SPECS = {
 - **解析优先级**：
   `环境变量 (QWEN_AUTH_TOKEN 等) > 本地凭证文件 (session/*.json) > 空`
 
+#### 5. 风控拦截持久化台账与冷却状态跨重启恢复 (`providers/risk_ledger.py`)
+
+- **冷却状态持久化**：将各 Provider 的冷却截止时间戳与连续失败计数以 POSIX 原子写（`os.replace` + `os.fsync`，目录 `0o700` / 文件 `0o600`）落盘，进程重启后自动恢复避让，杜绝「重启即重置避让、立刻再次触碰已被上游风控封禁的节点」从而人为延长封禁窗口。
+- **拦截台账 (JSONL)**：每一次风控 / WAF 人机验证 / 认证失效拦截均以 JSONL 追加落盘（时间、节点、HTTP 状态、严重度、原因、证据摘要），形成可跨重启审计的长期风控画像，超过 `GATEWAY_RISK_LEDGER_MAX_LINES` 自动裁剪保留后一半。
+- **严重度分级**：`auth > ratelimit > waf` 三级。认证失效仅在连续 ≥3 次后按 2 的幂次升级为长效冷却（`GATEWAY_AUTH_COOLDOWN_BASE` × 2ⁿ，封顶 `GATEWAY_AUTH_COOLDOWN_MAX=86400s`），首次失败仍维持既有短冷却，避免误锁刚完成重登的健康节点。
+- **遥测**：`GET /v1/diagnostics` 暴露 `risk_ledger` 段，`GET /health` 输出 24h 汇总；`GATEWAY_DISABLE_RISK_LEDGER=1` 可无损退化为纯内存冷却。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -300,6 +307,8 @@ PROVIDER_RISK_SPECS = {
 3. **网络与风控避让规范**：
    - 严禁高并发连续向同一 Provider 刷请求。调用必须受 `CooldownTracker` 信号量与调用间歇（Pacing）约束。
    - 遇到人机验证（RGV587 / 验证码）时，立即对该 Provider 施加冷却，自动切流至备用节点，并在日志中明确提示用户执行 `python login.py <provider>` 进行人机滑块解锁。
+   - 冷却避让必须跨进程重启持续生效：所有冷却截止时间与连续失败计数经 `providers/risk_ledger.py` 原子落盘，重启后自动恢复，严禁通过重启「抹除」避让状态而重新触碰已封禁节点。
+   - 账号级风控封禁无法通过技术手段绕开：唯一正确策略是识别、退避并在封禁窗口内零误触，等待平台自然解封；重登仅能恢复「令牌/会话失效」一类，对账号级封禁无效。
 
 ---
 

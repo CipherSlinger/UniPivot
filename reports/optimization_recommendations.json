@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 18:13:34",
+  "generated_at": "2026-10-13 18:29:26",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -146,6 +146,16 @@
       "priority": "P0",
       "description": "针对非流式请求在首个上游响应阶段被客户端中断（CancelledError 属于 BaseException，既有 except Exception 分支永不执行）的场景，在三大协议（OpenAI Chat / Anthropic Messages / Responses）的 finally 中补齐飞行组终局兜底与并发配额回收：修复非流式 Leader 中断后 SingleFlight 飞行组永不终结、Follower 悬挂至 TIMEOUT(600s) 的缺陷；修复 Responses 端点缺失 finally 导致 load_balancer 并发槽位在中断后永久泄漏、进而使负载均衡器持续避让该 Provider 直至进程重启的缺陷。",
       "expected_impact": "任何客户端中断都不再残留永不终结的飞行组或泄漏并发配额，Follower 零悬挂、并发槽位零泄漏，全协议请求生命周期确定性闭合。"
+    },
+    {
+      "id": "OPT-011",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控治理与避让",
+      "title": "风控拦截持久化台账与冷却状态跨重启恢复引擎 (Durable Risk-Control Ledger & Cross-Restart Cooldown Recovery Engine)",
+      "priority": "P0",
+      "description": "将各 Provider 的冷却截止时间与连续失败计数以 POSIX 原子写（os.replace + os.fsync，目录 0o700 / 文件 0o600）持久化落盘，进程重启后自动恢复避让状态，杜绝「重启即重置避让、立刻再次触碰已被上游风控封禁的节点」导致封禁窗口被高频重试无限延长的风险；对每一次风控 / WAF 人机验证 / 认证失效拦截以 JSONL 追加落盘，形成可审计、可跨重启检索的长期风控画像，超限自动裁剪；引入 auth > ratelimit > waf 三级严重度分级，认证失效仅在连续 ≥3 次后按 2 的幂次升级为长效冷却（受 GATEWAY_AUTH_COOLDOWN_MAX 封顶），首次失败仍维持既有短冷却以避免误锁刚完成重登的健康节点。",
+      "expected_impact": "冷却避让跨进程重启持续生效，被风控封禁节点在恢复窗口内零误触，封禁窗口不再被人为延长；全量拦截事件可审计可回溯，风控画像一目了然；GATEWAY_DISABLE_RISK_LEDGER=1 可无损退化为纯内存冷却，零行为回退风险。"
     }
   ],
   "system_health": "good"

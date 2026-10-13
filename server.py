@@ -112,6 +112,7 @@ from providers.singleflight import (
     stream_follower_gen,
     terminate_aborted_group,
 )
+from providers.risk_ledger import risk_ledger
 from providers.token_counter_cache import compute_count_key, token_counter_cache
 from session_store import (
     MAX_AGE,
@@ -752,9 +753,17 @@ async def health():
         p_info["remaining_cooldown_seconds"] = round(rem_cd, 1)
 
     healing_status = healing_engine.get_healing_status()
+    risk_recent = risk_ledger.recent_interceptions(hours=24.0)
     return {
         "status": "ok",
         "disabled_providers": sorted(list(disabled_set)),
+        "risk_ledger": {
+            "enabled": not risk_ledger.is_disabled(),
+            "recent_24h_total": risk_recent["total"],
+            "recent_24h_per_provider": {
+                pk: bucket["count"] for pk, bucket in risk_recent["per_provider"].items()
+            },
+        },
         "qwen_configured": _configured(resolve_qwen),
         "deepseek_configured": _configured(resolve_deepseek),
         "doubao_configured": _configured(resolve_doubao),
@@ -1039,6 +1048,7 @@ async def get_diagnostics():
         "singleflight": singleflight_manager.get_diagnostics(),
         "disconnect_guard": disconnect_guard.get_diagnostics(),
         "token_counter_cache": token_counter_cache.get_diagnostics(),
+        "risk_ledger": risk_ledger.get_diagnostics(),
         "risk_avoidance": risk_avoidance,
     }
 

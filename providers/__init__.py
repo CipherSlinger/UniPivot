@@ -102,6 +102,15 @@ from .json_repair import (
     repair_truncated_json,
     safe_loads_with_repair,
 )
+from .risk_ledger import (
+    SEVERITY_AUTH,
+    SEVERITY_RATE_LIMIT,
+    SEVERITY_WAF,
+    RiskLedger,
+    classify_interception_severity,
+    get_risk_ledger,
+    risk_ledger,
+)
 from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
@@ -209,6 +218,13 @@ __all__ = [
     "broadcast_stream_wrapper",
     "stream_follower_gen",
     "terminate_aborted_group",
+    "RiskLedger",
+    "risk_ledger",
+    "get_risk_ledger",
+    "classify_interception_severity",
+    "SEVERITY_RATE_LIMIT",
+    "SEVERITY_WAF",
+    "SEVERITY_AUTH",
     "DisconnectGuard",
     "disconnect_guard",
     "guard_stream",

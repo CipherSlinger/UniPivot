@@ -47,6 +47,14 @@ from typing import (
 )
 
 from .base import ProviderError
+from .risk_ledger import (
+    SEVERITY_AUTH,
+    SEVERITY_RATE_LIMIT,
+    SEVERITY_WAF,
+    _MAX_EVIDENCE_CHARS,
+    classify_interception_severity,
+    get_risk_ledger,
+)
 
 logger = logging.getLogger("gateway.failover")
 
@@ -236,6 +244,49 @@ class CooldownTracker:
         }
         # 保护锁
         self._lock = asyncio.Lock()
+        # 风控拦截台账与冷却状态持久化（best-effort）
+        self.risk_ledger = get_risk_ledger()
+        self._restore_persisted_state()
+
+    def _restore_persisted_state(self) -> None:
+        """从磁盘恢复冷却状态与连续失败计数，使避让策略跨重启生效。"""
+        try:
+            state = self.risk_ledger.load_state()
+        except Exception:  # noqa: BLE001 - 恢复失败不得影响启动
+            return
+        if not state:
+            return
+        now = time.time()
+        cooldowns = state.get("cooldowns") or {}
+        failures = state.get("failure_counts") or {}
+        restored_cd = 0
+        if isinstance(cooldowns, dict):
+            for pk, end in cooldowns.items():
+                if isinstance(end, (int, float)) and end > now:
+                    self._cooldowns[str(pk)] = float(end)
+                    restored_cd += 1
+        if isinstance(failures, dict):
+            for pk, n in failures.items():
+                if isinstance(n, int) and n > 0:
+                    self._failure_counts[str(pk)] = n
+        if restored_cd:
+            logger.warning(
+                "[风控避让] 已从磁盘恢复 %d 个节点的跨重启冷却状态: %s",
+                restored_cd,
+                {k: round(v - now, 1) for k, v in self._cooldowns.items()},
+            )
+
+    def _persist_state(self) -> None:
+        """持久化冷却状态与失败计数（best-effort，绝不上抛）。"""
+        try:
+            self.risk_ledger.save_state(
+                {
+                    "cooldowns": {k: v for k, v in self._cooldowns.items()},
+                    "failure_counts": {k: v for k, v in self._failure_counts.items()},
+                }
+            )
+        except Exception:  # noqa: BLE001
+            pass
 
     def is_disabled(self, provider_key: str) -> bool:
         """检查指定 Provider 是否被配置主动禁用"""
@@ -288,16 +339,35 @@ class CooldownTracker:
             # 401 令牌过期也需要避让
             is_auth_error = status == 401
 
-            if is_risk or is_waf_or_rate:
+            # 严重度分级：auth（令牌/账号级）> ratelimit（频控）> waf（人机验证）
+            severity = classify_interception_severity(
+                is_risk=is_risk, risk_reason=risk_reason, status=status, error_msg=error_msg
+            )
+            escalated = False
+            if severity == SEVERITY_AUTH or is_auth_error:
+                # 认证失效通常需重新登录，且高频重试会加剧上游封禁：
+                # 首次维持既有短冷却，连续 ≥3 次后按 2 的幂次长效升级并持久化。
+                cooldown_duration = max(60.0, base_cd)
+                if cur_fails >= 3:
+                    long_base = float(os.getenv("GATEWAY_AUTH_COOLDOWN_BASE", "1800"))
+                    long_cap = float(os.getenv("GATEWAY_AUTH_COOLDOWN_MAX", "86400"))
+                    cooldown_duration = min(
+                        long_cap, long_base * (2 ** min(cur_fails - 3, 6))
+                    )
+                    escalated = True
+                logger.warning(
+                    f"[风控拦截避让] 节点 [{provider_key}] 认证失效 (HTTP {status}, {severity})，"
+                    f"触发{'长效' if escalated else ''}冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次连续失败)"
+                )
+            elif is_risk or is_waf_or_rate:
                 # 针对频控与风控加权冷却 (指数退避: base_cd * (1.2 ** min(cur_fails - 1, 3)))
-                cooldown_duration = base_cd * (1.2 ** min(cur_fails - 1, 3))
+                waf_cap = float(os.getenv("GATEWAY_WAF_COOLDOWN_MAX", "900"))
+                cooldown_duration = min(waf_cap, base_cd * (1.2 ** min(cur_fails - 1, 3)))
                 if is_risk:
                     logger.warning(
                         f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: {risk_reason}，"
                         f"触发避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
                     )
-            elif is_auth_error:
-                cooldown_duration = max(60.0, base_cd)
             else:
                 # 普通网络超时或 5xx
                 cooldown_duration = min(base_cd, 15.0 * cur_fails)
@@ -305,6 +375,24 @@ class CooldownTracker:
             end_time = time.time() + cooldown_duration
             # 如果已有更长的冷却期，保留较长者
             self._cooldowns[provider_key] = max(self._cooldowns.get(provider_key, 0.0), end_time)
+
+            # 台账记录：仅记录真正的拦截事件（风控 / 频控 / 认证失效），
+            # 普通 5xx 与超时不入账，避免污染风控画像。
+            if is_risk or is_waf_or_rate or is_auth_error:
+                try:
+                    self.risk_ledger.record_interception(
+                        provider=provider_key,
+                        status=status,
+                        reason=risk_reason or error_msg[:_MAX_EVIDENCE_CHARS],
+                        severity=severity,
+                        cooldown_seconds=cooldown_duration,
+                        evidence=error_msg,
+                    )
+                except Exception:  # noqa: BLE001 - 台账失败绝不影响请求流程
+                    pass
+
+            # 持久化冷却状态与失败计数，使避让跨重启生效
+            self._persist_state()
 
             logger.warning(
                 f"[对等互备网格] 节点 [{provider_key}] 失败 (HTTP {status})，进入冷却避让期 "
@@ -317,6 +405,7 @@ class CooldownTracker:
         async with self._lock:
             self._failure_counts[provider_key] = 0
             self._cooldowns.pop(provider_key, None)
+            self._persist_state()
 
     async def apply_pacing_and_acquire(self, provider_key: str) -> None:
         """自适应调用步调（Pacing & Jitter）及并发获取"""
@@ -359,6 +448,11 @@ class CooldownTracker:
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()
         }
+        # 同步清除持久化状态，避免内存已重置而磁盘仍残留旧冷却
+        try:
+            self.risk_ledger.save_state({"cooldowns": {}, "failure_counts": {}})
+        except Exception:  # noqa: BLE001
+            pass
 
 
 class TrafficPacer:
