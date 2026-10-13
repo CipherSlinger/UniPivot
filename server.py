@@ -690,9 +690,10 @@ async def _conversation_gc_loop() -> None:
         try:
             await asyncio.sleep(interval)
             result = await conversation_gc.drain_once()
-            if result.get("attempted"):
+            if result.get("attempted") or result.get("deferred"):
                 print(
-                    f"[会话回收] 重试 {result['attempted']} 个待删除会话，成功 {result['succeeded']} 个。"
+                    f"[会话回收] 重试 {result['attempted']} 个待删除会话，成功 {result['succeeded']} 个，"
+                    f"因风控冷却推迟 {result.get('deferred', 0)} 个。"
                 )
         except asyncio.CancelledError:
             raise
@@ -1418,6 +1419,8 @@ for _p_name, (_resolver, _err_msg, _factory) in PROVIDER_SPECS.items():
 
 # 会话回收队列复用 provider 构造器（后台重试时重建节点实例）
 conversation_gc.set_resolver(_make_provider)
+# [OPT-017] 会话删除同样遵守风控冷却门控：冷却期节点不得被删除请求触碰
+conversation_gc.set_cooldown_gate(failover_router.cooldown_tracker.get_remaining_cooldown)
 
 
 @app.post("/v1/chat/completions")

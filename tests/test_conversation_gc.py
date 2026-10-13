@@ -10,6 +10,7 @@
 7. GATEWAY_DISABLE_CONVERSATION_GC=1 时退化为历史 fire-and-forget 行为
 8. 无事件循环时 schedule 仅入队不炸（等待后台 drain）
 9. server 侧接线：dispatched_provider 路由到队列、resolver 已注入、诊断暴露
+10. [OPT-017] 风控冷却门控：冷却期节点不得被删除请求触碰（推迟且不消耗重试次数）
 
 运行: .venv/bin/python tests/test_conversation_gc.py
 """
@@ -193,7 +194,7 @@ def test_drain_once_uses_resolver():
     gc.enqueue("deepseek", "drain-2")
     result = asyncio.run(gc.drain_once())
 
-    assert result == {"attempted": 2, "succeeded": 2}
+    assert result == {"attempted": 2, "succeeded": 2, "deferred": 0}
     assert calls["n"] == 2, "必须通过 resolver 重建 provider 实例"
     assert gc.get_diagnostics()["pending_count"] == 0
     shutil.rmtree(tmp, ignore_errors=True)
@@ -204,7 +205,7 @@ def test_drain_once_without_resolver_is_noop():
     tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
     gc = _fresh(tmp)
     gc.enqueue("qwen", "no-resolver")
-    assert asyncio.run(gc.drain_once()) == {"attempted": 0, "succeeded": 0}
+    assert asyncio.run(gc.drain_once()) == {"attempted": 0, "succeeded": 0, "deferred": 0}
     assert gc.get_diagnostics()["pending_count"] == 1, "无 resolver 时记录必须保留"
     shutil.rmtree(tmp, ignore_errors=True)
     print("test_drain_once_without_resolver_is_noop: PASSED")
@@ -303,6 +304,138 @@ def test_server_wiring():
     print("test_server_wiring: PASSED")
 
 
+# ------------------------------------------------------------------ 10. [OPT-017] 冷却门控
+
+def test_cooldown_gate_defers_delete_on_schedule():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    gc = _fresh(tmp)
+    gc.set_cooldown_gate(lambda pk: 120.0 if pk == "deepseek" else 0.0)
+    provider = FakeProvider(result=True)
+
+    async def _run():
+        gc.schedule(provider, "deepseek", "cooling-1")
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_run())
+    assert provider.deleted == [], "冷却期节点绝不能被删除请求触碰"
+    diag = gc.get_diagnostics()
+    assert diag["pending_count"] == 1, "推迟必须保留队列记录"
+    assert diag["pending"][0]["attempts"] == 0, "推迟不得消耗重试次数"
+    assert diag["deferred_by_cooldown"]["total"] == 1
+    assert diag["deferred_by_cooldown"]["per_provider"]["deepseek"] == 1
+    assert diag["cooldown_gate_enabled"] is True
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_defers_delete_on_schedule: PASSED")
+
+
+def test_cooldown_gate_skips_in_drain_once():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    gc = _fresh(tmp)
+    gc.set_cooldown_gate(lambda pk: 300.0 if pk == "qwen" else 0.0)
+    gc.set_resolver(lambda pk: FakeProvider(result=True))
+    gc.enqueue("qwen", "cool-drain")
+    gc.enqueue("glm", "warm-drain")
+
+    result = asyncio.run(gc.drain_once())
+    assert result == {"attempted": 1, "succeeded": 1, "deferred": 1}, result
+    diag = gc.get_diagnostics()
+    assert diag["pending_count"] == 1, "仅冷却节点被推迟，健康节点应正常删除"
+    assert diag["pending"][0]["provider"] == "qwen"
+    assert diag["pending"][0]["attempts"] == 0
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_skips_in_drain_once: PASSED")
+
+
+def test_cooldown_gate_resumes_after_cooldown_clears():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    gc = _fresh(tmp)
+    state = {"cooling": 45.0}
+    gc.set_cooldown_gate(lambda pk: state["cooling"])
+    provider = FakeProvider(result=True)
+    gc.set_resolver(lambda pk: provider)
+    gc.enqueue("kimi", "resume-1")
+
+    first = asyncio.run(gc.drain_once())
+    assert first["deferred"] == 1 and provider.deleted == [], "冷却期必须推迟"
+
+    state["cooling"] = 0.0  # 冷却解除
+    second = asyncio.run(gc.drain_once())
+    assert second == {"attempted": 1, "succeeded": 1, "deferred": 0}, second
+    assert provider.deleted == ["resume-1"], "冷却解除后必须补做删除"
+    assert gc.get_diagnostics()["pending_count"] == 0
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_resumes_after_cooldown_clears: PASSED")
+
+
+def test_cooldown_gate_disable_switch():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    os.environ["GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE"] = "1"
+    try:
+        gc = _fresh(tmp)
+        gc.set_cooldown_gate(lambda pk: 999.0)
+        provider = FakeProvider(result=True)
+        gc.set_resolver(lambda pk: provider)
+        gc.enqueue("qwen", "no-gate")
+        result = asyncio.run(gc.drain_once())
+        assert result == {"attempted": 1, "succeeded": 1, "deferred": 0}, result
+        assert provider.deleted == ["no-gate"], "关闭门控后必须照常删除"
+        assert gc.get_diagnostics()["cooldown_gate_enabled"] is False
+    finally:
+        os.environ.pop("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", None)
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_disable_switch: PASSED")
+
+
+def test_cooldown_gate_failure_never_blocks():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    gc = _fresh(tmp)
+
+    def _boom(provider_key):
+        raise RuntimeError("gate exploded")
+
+    gc.set_cooldown_gate(_boom)
+    provider = FakeProvider(result=True)
+    gc.set_resolver(lambda pk: provider)
+    gc.enqueue("qwen", "gate-boom")
+    result = asyncio.run(gc.drain_once())
+    assert result == {"attempted": 1, "succeeded": 1, "deferred": 0}, result
+    assert provider.deleted == ["gate-boom"], "门控查询异常不得阻断会话回收"
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_failure_never_blocks: PASSED")
+
+
+def test_cooldown_gate_no_gate_zero_regression():
+    tmp = Path(tempfile.mkdtemp(prefix="cgc_test_"))
+    gc = _fresh(tmp)
+    provider = FakeProvider(result=True)
+    gc.set_resolver(lambda pk: provider)
+    gc.enqueue("qwen", "no-regression")
+    result = asyncio.run(gc.drain_once())
+    assert result == {"attempted": 1, "succeeded": 1, "deferred": 0}, result
+    assert provider.deleted == ["no-regression"]
+    shutil.rmtree(tmp, ignore_errors=True)
+    print("test_cooldown_gate_no_gate_zero_regression: PASSED")
+
+
+def test_server_wires_cooldown_gate():
+    srv = importlib.import_module("server")
+    assert srv.conversation_gc._cooldown_gate is not None, "server 必须注入冷却门控"
+    # 门控直连 CooldownTracker：冷却中的节点返回 > 0
+    tracker = srv.failover_router.cooldown_tracker
+    asyncio.run(tracker.record_failure("qwen", 429, "test"))
+    assert srv.conversation_gc._cooldown_remaining("qwen") > 0, (
+        "刚触发 429 的节点其会话删除必须被门控推迟"
+    )
+    assert srv.conversation_gc._cooldown_remaining("glm") == 0.0, "健康节点不得被误伤"
+    tracker.reset()
+    from fastapi.testclient import TestClient
+
+    diag = TestClient(srv.app).get("/v1/diagnostics").json()["conversation_gc"]
+    assert diag["cooldown_gate_enabled"] is True
+    assert "deferred_by_cooldown" in diag
+    print("test_server_wires_cooldown_gate: PASSED")
+
+
 def run_all():
     test_enqueue_persists_atomically()
     test_enqueue_is_idempotent()
@@ -317,7 +450,14 @@ def run_all():
     test_schedule_without_event_loop_keeps_entry()
     test_schedule_success_clears_entry()
     test_server_wiring()
-    print("\n✅ All conversation GC tests (OPT-016) passed!")
+    test_cooldown_gate_defers_delete_on_schedule()
+    test_cooldown_gate_skips_in_drain_once()
+    test_cooldown_gate_resumes_after_cooldown_clears()
+    test_cooldown_gate_disable_switch()
+    test_cooldown_gate_failure_never_blocks()
+    test_cooldown_gate_no_gate_zero_regression()
+    test_server_wires_cooldown_gate()
+    print("\n✅ All conversation GC tests (OPT-016 / OPT-017) passed!")
 
 
 if __name__ == "__main__":

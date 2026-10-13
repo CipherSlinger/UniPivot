@@ -16,6 +16,14 @@
      重试/放弃计数），供仪表盘审计远端会话清理健康度。
    - GATEWAY_DISABLE_CONVERSATION_GC=1 可完全关闭（退化为历史 fire-and-forget）。
 
+实现 [P1] OPT-017：风控冷却感知的会话回收割让 (Cooldown-Aware Deletion Gate)
+   - 删除临时会话本身也是一次真实上游请求。当节点正处于风控避让冷却期时
+     发起删除等同于持续触碰已被封禁的节点，会人为延长封禁窗口——这与健康
+     探针（OPT-012）、令牌刷新（OPT-013）属于同一类隐蔽通道。
+   - 因此本模块在真正发起删除前查询 CooldownTracker：冷却期内的节点其删除
+     动作被**推迟**（记录保留在队列，且不消耗重试次数），冷却解除后由后台
+     drain 自然补做。GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1 可回退。
+
 磁盘写入全部为 best-effort：落盘失败绝不阻断、绝不改变请求处理流程。
 """
 
@@ -47,6 +55,8 @@ class ConversationGC:
         # key = "<provider>:<conversation_id>" -> entry
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._resolver: Optional[Callable[[str], Any]] = None
+        self._cooldown_gate: Optional[Callable[[str], float]] = None
+        self._defer_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
         self._stats = {
             "scheduled": 0,
             "deleted": 0,
@@ -75,6 +85,42 @@ class ConversationGC:
     def set_resolver(self, resolver: Callable[[str], Any]) -> None:
         """注册 provider 构造器：入参 provider 名，返回可删除会话的 provider 实例。"""
         self._resolver = resolver
+
+    def set_cooldown_gate(self, gate: Callable[[str], float]) -> None:
+        """[OPT-017] 注册风控冷却查询回调：入参 provider 名，返回剩余冷却秒数。
+
+        返回 > 0 时表示该节点正处风控避让期，其临时会话删除必须推迟——
+        删除同样是一次真实上游请求，冷却期发起只会持续触碰已封禁节点。
+        """
+        self._cooldown_gate = gate
+
+    def _cooldown_remaining(self, provider_key: str) -> float:
+        """查询节点剩余风控冷却秒数（未注册回调或已关闭门控时返回 0）。"""
+        if os.getenv("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        ):
+            return 0.0
+        gate = self._cooldown_gate
+        if gate is None:
+            return 0.0
+        try:
+            return max(0.0, float(gate(provider_key)))
+        except Exception:  # noqa: BLE001 - 门控查询失败绝不阻断回收流程
+            return 0.0
+
+    def _record_defer(self, provider_key: str, remaining: float) -> None:
+        with self._lock:
+            self._defer_stats["total"] += 1
+            per = self._defer_stats["per_provider"]
+            key = (provider_key or "unknown").lower()
+            per[key] = per.get(key, 0) + 1
+        logger.warning(
+            "[会话回收] 节点 %s 处于风控避让冷却中 (剩余 %.0fs)，推迟其临时会话删除以避免触碰封禁账号",
+            provider_key,
+            remaining,
+        )
 
     @staticmethod
     def _key(provider_key: str, conversation_id: str) -> str:
@@ -196,6 +242,11 @@ class ConversationGC:
             return
         self.enqueue(provider_key, conversation_id)
         self._stats["scheduled"] += 1
+        # [OPT-017] 冷却期节点推迟删除：记录保留在队列，不消耗重试次数
+        remaining = self._cooldown_remaining(provider_key)
+        if remaining > 0:
+            self._record_defer(provider_key, remaining)
+            return
         try:
             asyncio.get_running_loop()
         except RuntimeError:
@@ -250,15 +301,24 @@ class ConversationGC:
         return ok
 
     async def drain_once(self) -> Dict[str, int]:
-        """对队列中所有待删除会话各尝试一次（启动时与后台周期调用）。"""
+        """对队列中所有待删除会话各尝试一次（启动时与后台周期调用）。
+
+        处于风控冷却期的节点被跳过（记录保留、不消耗重试次数），
+        冷却解除后由后续轮次自然补做。
+        """
         if self.is_disabled() or self._resolver is None:
-            return {"attempted": 0, "succeeded": 0}
+            return {"attempted": 0, "succeeded": 0, "deferred": 0}
         with self._lock:
             items: Tuple[Tuple[str, str], ...] = tuple(
                 (entry["provider"], entry["conversation_id"]) for entry in self._pending.values()
             )
-        attempted = succeeded = 0
+        attempted = succeeded = deferred = 0
         for pk, cid in items:
+            remaining = self._cooldown_remaining(pk)
+            if remaining > 0:
+                self._record_defer(pk, remaining)
+                deferred += 1
+                continue
             try:
                 provider = self._resolver(pk)
             except Exception:  # noqa: BLE001 - 构造失败视为本轮未成功，保留队列
@@ -266,7 +326,7 @@ class ConversationGC:
             attempted += 1
             if await self._attempt(provider, pk, cid):
                 succeeded += 1
-        return {"attempted": attempted, "succeeded": succeeded}
+        return {"attempted": attempted, "succeeded": succeeded, "deferred": deferred}
 
     # ------------------------------------------------------------ 诊断
 
@@ -282,6 +342,10 @@ class ConversationGC:
                 for e in self._pending.values()
             ]
             stats = dict(self._stats)
+            defer_stats = {
+                "total": int(self._defer_stats.get("total", 0)),
+                "per_provider": dict(self._defer_stats.get("per_provider", {})),
+            }
         return {
             "enabled": not self.is_disabled(),
             "directory": str(self.directory),
@@ -290,12 +354,19 @@ class ConversationGC:
             "pending_count": len(pending),
             "pending": pending[:50],
             "stats": stats,
+            "cooldown_gate_enabled": (
+                self._cooldown_gate is not None
+                and os.getenv("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", "").strip().lower()
+                not in ("1", "true", "yes")
+            ),
+            "deferred_by_cooldown": defer_stats,
         }
 
     def clear(self) -> None:
         """清空队列与统计（测试用）。"""
         with self._lock:
             self._pending.clear()
+            self._defer_stats = {"total": 0, "per_provider": {}}
             self._stats = {
                 "scheduled": 0,
                 "deleted": 0,
