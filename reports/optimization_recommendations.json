@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 19:50:09",
+  "generated_at": "2026-10-13 20:02:14",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -236,6 +236,16 @@
       "priority": "P2",
       "description": "风控台账冷却、拦截 JSONL 与会话回收队列在 TESTING=1 下落到临时目录，但 test_server / test_responses / test_tools / test_failover 等套件只注入假 Token 而未设置 TESTING，导致测试运行把伪造的冷却状态写入开发者真实 session/ 目录；又因 CooldownTracker 构造时从进程内共享台账单例恢复状态，同一进程内先前用例记录的冷却会被后续用例继承，使结果依赖执行顺序（tests/test_failover.py 因此长期红灯）。本次为受影响套件补齐 TESTING=1 隔离，并让 test_failover 显式关闭跨重启恢复以回归其纯内存冷却状态机的设计初衷。",
       "expected_impact": "测试运行不再污染开发者真实凭证目录与长期风控画像；消除用例间的持久化状态串扰与非确定性失败，全部 23 个测试套件首次全绿；隔离策略写入架构文档测试矩阵第 0 条作为强制规范。"
+    },
+    {
+      "id": "OPT-020",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控避让与运维",
+      "title": "运维长期封禁租约 (Operator Quarantine Lease)",
+      "priority": "P1",
+      "description": "自动风控冷却存在时长上限（认证类封顶 GATEWAY_AUTH_COOLDOWN_MAX，默认 24h），而账号级封禁（如 DeepSeek 已触发的封禁）往往持续数天。上限到期后，全部冷却门控会同时放行，网关将重新触碰仍处于封禁窗口的节点，人为延长封禁——这是冷却体系最后一个未被覆盖的时间维度缺口。本次新增 providers/quarantine.py：运维可显式设定跨重启持久化的长期封禁租约（POSIX 原子写，目录 0o700 / 文件 0o600），租约折入 CooldownTracker.get_remaining_cooldown() / is_in_cooldown() 这一单一事实来源，因此健康探针、令牌刷新、会话回收、自愈选举、路由选点与自适应步调**全部自动遵循**，无需逐处接线亦无遗漏可能。租约读取端取 max(自动冷却, 人工租约) 且 set_lease 拒绝更早的到期时间，只延长不缩短。",
+      "expected_impact": "补齐「封禁时长长于冷却上限」的最后一个时间维度缺口，运维可一键将封禁节点置于数天级零误触避让；误设短租约绝不可能提前放行封禁节点，解除人工租约也不会连带清除真实风控自动冷却；支持 GATEWAY_QUARANTINE 环境变量启动即生效与 GET/POST/DELETE /v1/admin/quarantine 运行期管理，租约经 /health 与 /v1/diagnostics 可审计，GATEWAY_DISABLE_QUARANTINE=1 可整体关闭。"
     }
   ],
   "system_health": "good"

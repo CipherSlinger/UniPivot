@@ -62,7 +62,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_refresh_gate.py && \
 .venv/bin/python tests/test_adaptive_pacing.py && \
 .venv/bin/python tests/test_graceful_drain.py && \
-.venv/bin/python tests/test_conversation_gc.py
+.venv/bin/python tests/test_conversation_gc.py && \
+.venv/bin/python tests/test_quarantine.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -82,6 +83,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_adaptive_pacing.py # Evidence-driven pacing multiplier from the risk ledger
 .venv/bin/python tests/test_graceful_drain.py # In-flight request drain on shutdown (streaming-safe) and inflight telemetry
 .venv/bin/python tests/test_conversation_gc.py # Durable retry queue for remote temporary-conversation deletion (survives restarts)
+.venv/bin/python tests/test_quarantine.py   # Operator long-duration quarantine leases (folded into every cooldown gate + admin API)
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -221,5 +223,10 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 17. **Test Isolation of Durable Stores (`tests/*`)**:
     - The durable stores (risk ledger cooldowns, interception JSONL, conversation GC queue) resolve to a `tempfile.mkdtemp()` directory under `TESTING=1`, but several legacy suites set fake tokens *without* setting `TESTING`, so a test run wrote fake cooldowns into the developer's real `session/` directory — and, because every `CooldownTracker` restores from the shared ledger singleton, later cases in the same process inherited cooldowns recorded by earlier ones, making results order-dependent (`tests/test_failover.py` was red for this reason). Those suites now set `TESTING=1` (isolated temp dir, zero writes to `session/`), and `tests/test_failover.py` additionally sets `GATEWAY_DISABLE_RISK_LEDGER=1` so it tests pure in-memory cooldown semantics as designed — cross-restart durability has its own suite, `tests/test_risk_ledger.py`.
 
-18. **Web Frontend (`static/index.html`)**:
+18. **Operator Quarantine Lease (`providers/quarantine.py`)**:
+    - Automatic cooldowns are **capped** (`GATEWAY_AUTH_COOLDOWN_MAX`, default 24h), but a real account-level ban lasts days. When the cap expires the gateway would re-touch a still-banned node and deepen the ban. `QuarantineStore` lets an operator set a durable long-duration lease per provider — resolved by absolute expiry timestamp, POSIX-atomic on disk (dir `0o700`, file `0o600`), re-applied on restart, and expiring lazily. Leases only ever **extend** the avoidance window (reads take `max()`), so a mistyped short lease can never release a banned node early.
+    - **Single source of truth**: the lease is folded into `CooldownTracker.get_remaining_cooldown()` / `is_in_cooldown()`, so *every* existing gate honors it with zero extra wiring — health probe (OPT-012), token refresh (OPT-013), conversation GC (OPT-017), healer election (OPT-018), router selection and adaptive pacing.
+    - Configuration and admin surface: `GATEWAY_QUARANTINE="deepseek:72h,glm:30m,kimi:2026-10-20T00:00:00"` applies at startup (durations `s/m/h/d` or ISO-8601), `GET/POST/DELETE /v1/admin/quarantine` views/sets/clears at runtime, `GATEWAY_DISABLE_QUARANTINE=1` turns the store off, and `GATEWAY_QUARANTINE_DIR` overrides the location. Exposed as `quarantine` on `/health` (active leases) and `/v1/diagnostics`. See `tests/test_quarantine.py`.
+
+19. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

@@ -112,6 +112,7 @@ from providers.singleflight import (
     stream_follower_gen,
     terminate_aborted_group,
 )
+from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
 from providers.risk_ledger import risk_ledger
 from providers.conversation_gc import conversation_gc
 from providers.token_counter_cache import compute_count_key, token_counter_cache
@@ -924,6 +925,7 @@ async def health():
                 pk: bucket["count"] for pk, bucket in risk_recent["per_provider"].items()
             },
         },
+        "quarantine": quarantine_store.list_active(),
         "qwen_configured": _configured(resolve_qwen),
         "deepseek_configured": _configured(resolve_deepseek),
         "doubao_configured": _configured(resolve_doubao),
@@ -1213,10 +1215,102 @@ async def get_diagnostics():
         "disconnect_guard": disconnect_guard.get_diagnostics(),
         "token_counter_cache": token_counter_cache.get_diagnostics(),
         "risk_ledger": risk_ledger.get_diagnostics(),
+        "quarantine": quarantine_store.get_diagnostics(),
         "conversation_gc": conversation_gc.get_diagnostics(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
+
+
+# ---------------------------------------------------------------- [OPT-020] 运维人工长期封禁租约
+
+class QuarantineRequest(BaseModel):
+    provider: str
+    duration_hours: Optional[float] = None
+    duration: Optional[str] = None
+    until: Optional[str] = None
+    reason: str = ""
+
+
+@app.get("/v1/admin/quarantine")
+@app.get("/admin/quarantine")
+async def list_quarantine():
+    """查看当前生效的运维封禁租约。"""
+    return JSONResponse(quarantine_store.get_diagnostics())
+
+
+@app.post("/v1/admin/quarantine")
+@app.post("/admin/quarantine")
+async def set_quarantine(req: QuarantineRequest):
+    """设定/延长某节点的长期封禁租约。
+
+    - `duration_hours`: 小时数，如 72 表示封禁 3 天；
+    - `duration`: 时长表达式，如 `"72h"` / `"3d"` / `"30m"`；
+    - `until`: 绝对时间（ISO-8601，如 `"2026-10-20T00:00:00"`），优先级最高。
+
+    租约只延长避让窗口、绝不缩短既有冷却，因此不存在「误操作提前放行」的风险。
+    """
+    provider = (req.provider or "").strip().lower()
+    if provider not in PROVIDER_SPECS:
+        return JSONResponse(
+            error_response(
+                f"未知 Provider: {req.provider}，支持: {', '.join(PROVIDER_SPECS.keys())}",
+                404,
+                "not_found",
+            ),
+            status_code=404,
+        )
+    until: Optional[float] = None
+    if req.until:
+        until = parse_quarantine_until(req.until)
+        if until is None:
+            return JSONResponse(
+                error_response(f"无法解析 until 时间表达式: {req.until}", 400, "invalid_request_error"),
+                status_code=400,
+            )
+    elif req.duration:
+        until = parse_quarantine_until(req.duration)
+        if until is None:
+            return JSONResponse(
+                error_response(f"无法解析 duration 时长表达式: {req.duration}", 400, "invalid_request_error"),
+                status_code=400,
+            )
+    elif req.duration_hours is None:
+        return JSONResponse(
+            error_response("必须提供 duration_hours、duration 或 until 之一", 400, "invalid_request_error"),
+            status_code=400,
+        )
+
+    duration_seconds = req.duration_hours * 3600.0 if req.duration_hours is not None else None
+    effective = quarantine_store.set_lease(
+        provider,
+        duration_seconds=duration_seconds,
+        until=until,
+        reason=req.reason or "admin_api",
+    )
+    return JSONResponse(
+        {
+            "status": "ok",
+            "provider": provider,
+            "until": round(effective, 3),
+            "remaining_hours": round(max(0.0, effective - time.time()) / 3600.0, 2),
+            "active": quarantine_store.list_active(),
+        }
+    )
+
+
+@app.delete("/v1/admin/quarantine")
+@app.delete("/admin/quarantine")
+async def clear_quarantine(provider: Optional[str] = None):
+    """解除指定节点（省略 provider 则解除全部）的封禁租约。
+
+    仅解除「人工租约」；由真实风控拦截产生的自动冷却不受影响，仍会按其自身
+    退避窗口自然到期。
+    """
+    count = quarantine_store.clear(provider)
+    return JSONResponse(
+        {"status": "ok", "cleared": count, "active": quarantine_store.list_active()}
+    )
 
 
 # ---------------------------------------------------------------- 优化空间报告接口

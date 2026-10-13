@@ -197,6 +197,15 @@ PROVIDER_RISK_SPECS = {
 - **冷却门控 [OPT-017]**：删除同样是一次真实上游请求，对已封禁节点发起删除等同持续触碰该账号。处于风控避让冷却期的节点其删除动作被**推迟**（记录保留在队列且**不消耗重试次数**），冷却解除后由后台 drain 自然补做；门控查询异常时绝不阻断回收（零回归默认）。
 - **遥测**：`GET /v1/diagnostics` 暴露 `conversation_gc` 段（待删除数、成功/失败/重试/放弃计数、`deferred_by_cooldown` 冷却推迟计数）；`GATEWAY_DISABLE_CONVERSATION_GC=1` 可无损退化为历史即发即忘行为，`GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1` 可单独回退冷却门控。
 
+#### 9. 运维长期封禁租约 (`providers/quarantine.py`)
+
+- **问题**：自动风控冷却存在**上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁（如 DeepSeek 已触发的封禁）往往持续**数天**。上限到期后网关会重新触碰仍处于封禁窗口的节点，人为延长封禁。
+- **租约**：`QuarantineStore` 提供**运维可显式设定**的长期封禁租约，以绝对到期时间持久化落盘（POSIX 原子写，目录 `0o700` / 文件 `0o600`），进程重启后自动恢复，到期惰性失效。
+- **只延长不缩短**：租约读取端取 `max(自动冷却, 人工租约)`，且 `set_lease` 拒绝比现有租约更早的到期时间——误设的短租约绝不可能提前放行一个正在封禁的节点。
+- **单一事实来源**：租约折入 `CooldownTracker.get_remaining_cooldown()` / `is_in_cooldown()`，因此**所有**既有门控自动遵循，无需逐处接线：健康探针 (OPT-012)、令牌刷新 (OPT-013)、临时会话回收 (OPT-017)、自愈大脑选举 (OPT-018)、路由选点与自适应步调 (OPT-014)。
+- **配置与运维**：`GATEWAY_QUARANTINE="deepseek:72h,glm:30m,kimi:2026-10-20T00:00:00"` 启动即生效（支持 `s/m/h/d` 后缀与 ISO-8601 绝对时间）；`GET/POST/DELETE /v1/admin/quarantine` 供运行期查看、设定与解除；`GATEWAY_DISABLE_QUARANTINE=1` 关闭；`GATEWAY_QUARANTINE_DIR` 覆盖落盘位置。
+- **遥测**：`/health` 暴露生效中的租约（`quarantine`），`/v1/diagnostics` 暴露完整租约诊断（生效数、明细、统计）。解除人工租约**不会**连带清除真实风控产生的自动冷却。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -264,6 +273,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── responses_compat.py     # OpenAI Responses API (/v1/responses) 协议转译器
 │   ├── risk_ledger.py          # 风控拦截持久化台账：严重度分级、JSONL 审计、冷却状态跨重启恢复
 │   ├── conversation_gc.py      # 远端临时会话删除的持久化重试队列（跨重启防泄漏、有界重试）
+│   ├── quarantine.py           # 运维长期封禁租约：跨重启持久化、只延长不缩短、折入全局冷却门控
 │   ├── session_affinity.py     # 会话亲和与跨模型状态移交引擎（LRU/TTL、异构上游会话 ID 剥离）
 │   ├── singleflight.py         # 单飞去重与流式扇出引擎（SHA-256 指纹、Leader/Follower 广播）
 │   ├── token_counter_cache.py  # Token 计量结果缓存
@@ -337,7 +347,8 @@ PROVIDER_RISK_SPECS = {
 │   ├── test_refresh_gate.py    # 冷却感知令牌刷新门控与有界延迟补刷测试
 │   ├── test_adaptive_pacing.py # 证据驱动自适应步调放大测试
 │   ├── test_graceful_drain.py  # 在途请求优雅停机排空测试
-│   └── test_conversation_gc.py # 临时会话删除持久化队列与有界重试测试
+│   ├── test_conversation_gc.py # 临时会话删除持久化队列与有界重试测试
+│   └── test_quarantine.py      # 运维长期封禁租约：解析、落盘恢复、只延长与全门控遵循测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -366,6 +377,7 @@ PROVIDER_RISK_SPECS = {
    - 启动期静默令牌刷新同样必须遵守冷却门控：处于避让冷却期的节点暂缓刷新，冷却解除后由有界后台线程补刷，杜绝「重启即刷新」成为封禁窗口的隐形延长器。
    - 临时会话删除同样必须遵守冷却门控：处于避让冷却期的节点暂缓删除其临时会话（记录保留在持久化队列且不消耗重试次数），冷却解除后补做，杜绝「会话回收」成为封禁窗口的又一条隐蔽触碰通道。
    - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
+   - 自动冷却存在**时长上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁可持续数天；因此长于冷却上限的封禁**必须**通过运维长期租约表达：`providers/quarantine.py`（`GATEWAY_QUARANTINE` 环境变量或 `POST /v1/admin/quarantine`），租约经 `CooldownTracker.get_remaining_cooldown()` 折入全局冷却读数，使**所有**既有门控自动遵循。租约只延长不缩短，误操作不可能提前放行封禁节点；解除人工租约**不得**连带清除真实风控产生的自动冷却。
 
 ---
 
@@ -388,7 +400,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_refresh_gate.py && \
 .venv/bin/python tests/test_adaptive_pacing.py && \
 .venv/bin/python tests/test_graceful_drain.py && \
-.venv/bin/python tests/test_conversation_gc.py
+.venv/bin/python tests/test_conversation_gc.py && \
+.venv/bin/python tests/test_quarantine.py
 ```
 
 ### 测试矩阵要求：

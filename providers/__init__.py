@@ -110,6 +110,12 @@ from .conversation_gc import (
     conversation_gc,
     get_conversation_gc,
 )
+from .quarantine import (
+    QuarantineStore,
+    get_quarantine_store,
+    parse_quarantine_until,
+    quarantine_store,
+)
 from .risk_ledger import (
     SEVERITY_AUTH,
     SEVERITY_RATE_LIMIT,
@@ -236,6 +242,10 @@ __all__ = [
     "SEVERITY_RATE_LIMIT",
     "SEVERITY_WAF",
     "SEVERITY_AUTH",
+    "QuarantineStore",
+    "quarantine_store",
+    "get_quarantine_store",
+    "parse_quarantine_until",
     "ConversationGC",
     "conversation_gc",
     "get_conversation_gc",

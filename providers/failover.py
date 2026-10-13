@@ -48,6 +48,7 @@ from typing import (
 )
 
 from .base import ProviderError
+from .quarantine import get_quarantine_store
 from .risk_ledger import (
     SEVERITY_AUTH,
     SEVERITY_RATE_LIMIT,
@@ -313,6 +314,8 @@ class CooldownTracker:
         self._lock = asyncio.Lock()
         # 风控拦截台账与冷却状态持久化（best-effort）
         self.risk_ledger = get_risk_ledger()
+        # [OPT-020] 运维人工长期封禁租约：折入冷却读数，使所有门控自动遵循
+        self.quarantine = get_quarantine_store()
         self._restore_persisted_state()
 
     def _restore_persisted_state(self) -> None:
@@ -360,16 +363,25 @@ class CooldownTracker:
         return (provider_key or "").lower() in self.disabled_providers
 
     def is_in_cooldown(self, provider_key: str) -> bool:
-        """检查指定 Provider 是否处于冷却避让期"""
-        now = time.time()
-        end_time = self._cooldowns.get(provider_key, 0.0)
-        return now < end_time
+        """检查指定 Provider 是否处于冷却避让期（含运维封禁租约）"""
+        return self.get_remaining_cooldown(provider_key) > 0.0
 
     def get_remaining_cooldown(self, provider_key: str) -> float:
-        """获取剩余冷却时间（秒），若未处于冷却期则返回 0.0"""
+        """获取剩余冷却时间（秒），若未处于冷却期则返回 0.0。
+
+        [OPT-020] 读取端取「自动冷却」与「运维封禁租约」的最大值：
+        租约只能延长避让窗口、绝不缩短既有冷却，因此所有冷却门控
+        （探针 / 刷新 / 会话回收 / 自愈选举 / 路由选点 / 自适应步调）
+        都能自动遵循人工长期封禁，无需逐处接线。
+        """
         now = time.time()
         end_time = self._cooldowns.get(provider_key, 0.0)
-        return max(0.0, end_time - now)
+        remaining = max(0.0, end_time - now)
+        try:
+            lease = self.quarantine.remaining(provider_key, now)
+        except Exception:  # noqa: BLE001 - 租约查询失败绝不阻断既有冷却语义
+            lease = 0.0
+        return max(remaining, lease)
 
     def get_all_cooldowns(self) -> Dict[str, float]:
         """获取所有当前处于冷却���态的节点及剩余冷却时间（秒）"""
