@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 18:43:52",
+  "generated_at": "2026-10-13 18:50:23",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -166,6 +166,16 @@
       "priority": "P0",
       "description": "健康监控的周期探针（默认 300s）此前无差别发起真实上游调用，导致已被上游风控封禁的节点被每隔数分钟持续触碰，人为延长封禁窗口——这与 OPT-011 的持久化避让目标在同一条链路上相互抵消。本次将 CooldownTracker 冷却状态接入 HealthMonitor 探针门控：处于避让冷却期的节点标记为 cooling 并跳过真实网络探针，既不触碰已封禁节点，也不累计失败计数、不触发自愈（避免把风控封禁误判为节点故障而派发无效热修复）。",
       "expected_impact": "被风控封禁节点在整个冷却窗口内零探针触碰，封禁恢复不再被人为延长；风控封禁与真实节点故障彻底解耦，杜绝无效自愈风暴；GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1 可无损回退，/v1/diagnostics 暴露 cooldown_probe_skips 审计指标。"
+    },
+    {
+      "id": "OPT-013",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控治理与避让",
+      "title": "启动期令牌静默刷新的风控冷却门控 (Cooldown-Aware Token Refresh Gate)",
+      "priority": "P0",
+      "description": "启动时的静默令牌刷新会无差别复用浏览器配置对全部 Provider 发起登录/刷新请求，对已被上游风控封禁的账号而言是又一条隐蔽的持续触碰通道（登录请求同样会被风控记录并加剧封禁）。本次将 CooldownTracker 冷却状态接入刷新流程：处于避让冷却期的节点暂缓刷新，改由有界后台线程在冷却解除后补做刷新（默认最多等待 24h，超时放弃本轮，绝不无限阻塞），使「重启后静默刷新」不再成为封禁窗口的隐形延长器。",
+      "expected_impact": "风控封禁节点在冷却窗口内零登录/刷新触碰，封禁恢复窗口不再被启动期刷新行为延长；冷却解除后令牌自动补齐，无需人工干预，避免「跳过即永久放弃」的功能回退；GATEWAY_REFRESH_DEFER_POLL / GATEWAY_REFRESH_DEFER_MAX_WAIT 可调。"
     }
   ],
   "system_health": "good"

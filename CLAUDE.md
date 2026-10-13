@@ -57,7 +57,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_token_cache.py && \
 .venv/bin/python tests/test_lifecycle.py && \
 .venv/bin/python tests/test_risk_ledger.py && \
-.venv/bin/python tests/test_probe_gate.py
+.venv/bin/python tests/test_probe_gate.py && \
+.venv/bin/python tests/test_refresh_gate.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -73,6 +74,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_lifecycle.py    # Request lifecycle finalization, flight-group abort terminality, and load-balancer quota reclamation
 .venv/bin/python tests/test_risk_ledger.py  # Risk-control severity tiers, durable cross-restart cooldowns, and the JSONL interception ledger
 .venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating (banned nodes are never re-probed)
+.venv/bin/python tests/test_refresh_gate.py # Cooldown-aware token refresh gating with bounded deferred retry
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -195,5 +197,8 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - `HealthMonitor` consults `CooldownTracker` before every probe: a node in a risk-avoidance cooldown is marked `cooling` and the real network probe is skipped entirely. Without this the 300s audit loop re-poked an upstream-banned node every interval, lengthening the ban window — exactly the failure mode the durable ledger guards against, one layer up.
     - Cooling probes neither increment `consecutive_failures` nor trigger self-healing, so a risk ban is never misread as a node fault; `GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1` disables the gate and `/v1/diagnostics` exposes `healing_status.cooldown_probe_skips`. See `tests/test_probe_gate.py`.
 
-13. **Web Frontend (`static/index.html`)**:
+13. **Cooldown-Aware Token Refresh Gate (`server.py:_auto_refresh_stale_sessions`)**:
+    - The startup silent token-refresh pass consults the cooldown tracker: a node in a risk-avoidance cooldown is not refreshed (a login/refresh call to an upstream-banned account would only deepen the ban). Deferred nodes are retried by a bounded background thread (`GATEWAY_REFRESH_DEFER_POLL`, `GATEWAY_REFRESH_DEFER_MAX_WAIT`, default 24h) that refreshes once the cooldown clears and otherwise gives up cleanly. See `tests/test_refresh_gate.py`.
+
+14. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

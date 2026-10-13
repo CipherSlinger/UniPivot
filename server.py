@@ -495,6 +495,67 @@ class DispatchTaskRequest(BaseModel):
 
 # ---------------------------------------------------------------- 应用
 
+def _provider_cooldown_remaining(name: str) -> float:
+    """[OPT-013] 查询节点剩余风控冷却秒数（查询失败按 0 处理，绝不阻断刷新流程）。"""
+    try:
+        return max(0.0, float(failover_router.cooldown_tracker.get_remaining_cooldown(name)))
+    except Exception:  # noqa: BLE001
+        return 0.0
+
+
+def _refresh_stale_provider(name: str, resolver, refresher) -> str:
+    """按需对单个 Provider 执行静默令牌刷新。
+
+    返回: "fresh"（无需刷新）/ "cooling"（风控避让中，暂缓）/ "refreshed" / "failed"。
+    [OPT-013] 处于风控避让冷却期的节点绝不发起登录/刷新请求，
+    避免「静默刷新」成为持续触碰已被上游封禁账号的隐蔽通道。
+    """
+    s = resolver()
+    if not s or not s.token or getattr(s, "age", 0.0) < MAX_AGE:
+        return "fresh"
+    if _provider_cooldown_remaining(name) > 0:
+        print(f"[网关] {name} 处于风控避让冷却期，暂缓令牌刷新（避免加剧上游封禁）")
+        return "cooling"
+    print(f"[网关] {name} 令牌已超过 {MAX_AGE // 3600}h，尝试静默刷新…")
+    ns = refresher(timeout=60)
+    if ns:
+        print(f"[网关] {name} 令牌刷新成功")
+        return "refreshed"
+    print(f"[网关] {name} 静默刷新失败（可能已退出登录）")
+    return "failed"
+
+
+def _deferred_refresh_after_cooldown(deferred: list, max_wait: Optional[float] = None, poll: Optional[float] = None) -> None:
+    """[OPT-013] 冷却期结束后，对启动时被暂缓的节点补做令牌刷新。
+
+    有界等待：最多等待 max_wait 秒（默认 24h），每 poll 秒（默认 300s）检查一次冷却是否解除；
+    到期仍未解除则放弃本轮刷新（下一个启动周期再评估），绝不无限阻塞。
+    """
+    if not deferred:
+        return
+    if poll is None:
+        poll = float(os.getenv("GATEWAY_REFRESH_DEFER_POLL", "300"))
+    if max_wait is None:
+        max_wait = float(os.getenv("GATEWAY_REFRESH_DEFER_MAX_WAIT", "86400"))
+    deadline = time.time() + max_wait
+    while True:
+        if not any(_provider_cooldown_remaining(name) > 0 for name, _, _ in deferred):
+            break
+        remaining_wait = deadline - time.time()
+        if remaining_wait <= 0:
+            break
+        time.sleep(min(poll, remaining_wait))
+
+    for name, resolver, refresher in deferred:
+        if _provider_cooldown_remaining(name) > 0:
+            print(f"[网关] {name} 风控冷却未解除（已达等待上限 {max_wait / 3600:.1f}h），跳过本轮令牌刷新")
+            continue
+        try:
+            _refresh_stale_provider(name, resolver, refresher)
+        except Exception as e:  # noqa: BLE001
+            print(f"[网关] {name} 延迟静默刷新异常: {type(e).__name__}: {e}")
+
+
 def _auto_refresh_stale_sessions() -> None:
     """启动时后台线程：对超过 MAX_AGE 的会话做一次静默刷新（复用已登录
     的浏览器配置，不弹窗）。刷新失败不影响服务，请求报 401 时再提示登录。"""
@@ -503,6 +564,7 @@ def _auto_refresh_stale_sessions() -> None:
 
     from login import refresh_deepseek, refresh_doubao, refresh_glm, refresh_kimi, refresh_qwen
 
+    deferred: list = []
     for name, resolver, refresher in (
         ("qwen", resolve_qwen, refresh_qwen),
         ("deepseek", resolve_deepseek, refresh_deepseek),
@@ -511,17 +573,15 @@ def _auto_refresh_stale_sessions() -> None:
         ("glm", resolve_glm, refresh_glm),
     ):
         try:
-            s = resolver()
-            if not s or not s.token or s.age < MAX_AGE:
-                continue
-            print(f"[网关] {name} 令牌已超过 {MAX_AGE // 3600}h，尝试静默刷新…")
-            ns = refresher(timeout=60)
-            if ns:
-                print(f"[网关] {name} 令牌刷新成功")
-            else:
-                print(f"[网关] {name} 静默刷新失败（可能已退出登录）")
+            if _refresh_stale_provider(name, resolver, refresher) == "cooling":
+                deferred.append((name, resolver, refresher))
         except Exception as e:
             print(f"[网关] {name} 静默刷新异常: {type(e).__name__}: {e}")
+
+    if deferred:
+        threading.Thread(
+            target=_deferred_refresh_after_cooldown, args=(deferred,), daemon=True
+        ).start()
 
 
 @asynccontextmanager
