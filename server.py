@@ -110,6 +110,7 @@ from providers.singleflight import (
     broadcast_stream_wrapper,
     singleflight_manager,
     stream_follower_gen,
+    terminate_aborted_group,
 )
 from providers.token_counter_cache import compute_count_key, token_counter_cache
 from session_store import (
@@ -1731,6 +1732,7 @@ async def chat_completions(req: ChatCompletionRequest):
     load_balancer.acquire(dispatched_provider)
     ttft_recorded = False
     success = False
+    group_finalized = False
     is_rate_limit = False
     error_msg = ""
     try:
@@ -1768,19 +1770,25 @@ async def chat_completions(req: ChatCompletionRequest):
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
     finally:
+        # 客户端断连（CancelledError）等 BaseException 不会进入上述 except 分支，
+        # 必须在 finally 中确定性回收并发配额并补齐飞行组终局，避免 Follower 悬挂。
         load_balancer.release(
             dispatched_provider,
             success=success,
             is_rate_limit=is_rate_limit,
             error_msg=error_msg,
         )
+        if not success and not group_finalized and flight_decision and flight_decision.is_leader:
+            terminate_aborted_group(flight_decision.group)
 
     if conversation_id:
         session_affinity_manager.record_turn(
@@ -2242,6 +2250,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     load_balancer.acquire(dispatched_provider)
     ttft_recorded = False
     success = False
+    group_finalized = False
     is_rate_limit = False
     error_msg = ""
     try:
@@ -2279,6 +2288,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(
             anthropic_error_response(e.message, e.status, e.err_type),
             status_code=e.status,
@@ -2287,17 +2297,22 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(
             anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error"),
             status_code=502,
         )
     finally:
+        # 客户端断连（CancelledError）等 BaseException 不会进入上述 except 分支，
+        # 必须在 finally 中确定性回收并发配额并补齐飞行组终局，避免 Follower 悬挂。
         load_balancer.release(
             dispatched_provider,
             success=success,
             is_rate_limit=is_rate_limit,
             error_msg=error_msg,
         )
+        if not success and not group_finalized and flight_decision and flight_decision.is_leader:
+            terminate_aborted_group(flight_decision.group)
 
     if conv_id or req.conversation_id:
         session_affinity_manager.record_turn(
@@ -2546,8 +2561,24 @@ async def responses_endpoint(req: ResponsesRequest):
     load_balancer.acquire(dispatched_provider)
     ttft_recorded = False
     success = False
+    group_finalized = False
     is_rate_limit = False
     error_msg = ""
+    lb_released = False
+    lb_handed_off = False
+
+    def _release_lb() -> None:
+        """幂等释放并发配额：首个上游调用阶段中断时由 finally 兜底调用。"""
+        nonlocal lb_released
+        if lb_released:
+            return
+        lb_released = True
+        load_balancer.release(
+            dispatched_provider,
+            success=success,
+            is_rate_limit=is_rate_limit,
+            error_msg=error_msg,
+        )
 
     try:
         stream, failover_event, active_provider = await failover_router.execute_chat(
@@ -2556,29 +2587,31 @@ async def responses_endpoint(req: ResponsesRequest):
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
+        # 配额所有权移交下游流式/聚合分支，由其负责释放
+        lb_handed_off = True
     except ProviderError as e:
         is_risk, _ = is_risk_interception(e.message)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
+        is_rate_limit = (e.status == 429)
+        error_msg = e.message
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
-        load_balancer.release(
-            dispatched_provider,
-            success=False,
-            is_rate_limit=(e.status == 429),
-            error_msg=e.message,
-        )
+            group_finalized = True
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
+        error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
-        load_balancer.release(
-            dispatched_provider,
-            success=False,
-            is_rate_limit=False,
-            error_msg=str(e),
-        )
+            group_finalized = True
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
+    finally:
+        # 首个上游响应前被中断（客户端断连 CancelledError 等 BaseException）时，
+        # 上述 except 分支不会执行：必须在此确定性回收并发配额并作废飞行组。
+        if not lb_handed_off:
+            _release_lb()
+            if not group_finalized and flight_decision and flight_decision.is_leader:
+                terminate_aborted_group(flight_decision.group)
 
     resp_headers = dict(base_headers)
     if failover_event:
@@ -2847,12 +2880,7 @@ async def responses_endpoint(req: ResponsesRequest):
                 error_msg = str(e)
                 yield sse_response_error(f"上游服务异常: {e}", 502, "upstream_error")
             finally:
-                load_balancer.release(
-                    dispatched_provider,
-                    success=success,
-                    is_rate_limit=is_rate_limit,
-                    error_msg=error_msg,
-                )
+                _release_lb()
 
         stream_body = gen()
         if flight_decision and flight_decision.is_leader:
@@ -2899,19 +2927,20 @@ async def responses_endpoint(req: ResponsesRequest):
         error_msg = e.message
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
+            group_finalized = True
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
     finally:
-        load_balancer.release(
-            dispatched_provider,
-            success=success,
-            is_rate_limit=is_rate_limit,
-            error_msg=error_msg,
-        )
+        # 客户端断连（CancelledError）等 BaseException 不会进入上述 except 分支，
+        # 必须在 finally 中确定性回收并发配额并补齐飞行组终局，避免 Follower 悬挂。
+        _release_lb()
+        if not success and not group_finalized and flight_decision and flight_decision.is_leader:
+            terminate_aborted_group(flight_decision.group)
 
     if conv_id or req.conversation_id:
         session_affinity_manager.record_turn(

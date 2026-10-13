@@ -291,6 +291,16 @@ class TaskEvaluator:
                 "description": "将客户端中途放弃流式响应的中止信号实时传播至上游异步生成器，显式 aclose() 上游流以瞬时释放 HTTP/2 连接槽位与上游并发配额，杜绝「客户端已走、上游仍在生成」的配额空耗；同时修复 SingleFlight Leader 断连后飞行组永不终结导致 Follower 永久挂起与内存无界泄漏的缺陷（陈旧飞行组回收与等待者唤醒）；并对确定性的 /v1/messages/count_tokens 计数结果实施有界 LRU 记忆化。",
                 "expected_impact": "被放弃的生成不再空耗上游配额（对风控敏感节点尤为关键），杜绝悬挂连接与内存泄漏，count_tokens 重复调用零计算成本，并输出透明的 x-disconnect-guard 遥测指标。",
             },
+            {
+                "id": "OPT-010",
+                "status": "COMPLETED",
+                "status_display": "已落地",
+                "category": "资源治理与配额保护",
+                "title": "请求生命周期终局保障与并发配额确定性回收引擎 (Request Lifecycle Finalization & Deterministic Quota Reclamation Engine)",
+                "priority": "P0",
+                "description": "针对非流式请求在首个上游响应阶段被客户端中断（CancelledError 属于 BaseException，既有 except Exception 分支永不执行）的场景，在三大协议（OpenAI Chat / Anthropic Messages / Responses）的 finally 中补齐飞行组终局兜底与并发配额回收：修复非流式 Leader 中断后 SingleFlight 飞行组永不终结、Follower 悬挂至 TIMEOUT(600s) 的缺陷；修复 Responses 端点缺失 finally 导致 load_balancer 并发槽位在中断后永久泄漏、进而使负载均衡器持续避让该 Provider 直至进程重启的缺陷。",
+                "expected_impact": "任何客户端中断都不再残留永不终结的飞行组或泄漏并发配额，Follower 零悬挂、并发槽位零泄漏，全协议请求生命周期确定性闭合。",
+            },
         ]
 
         report_data = {
@@ -338,8 +348,8 @@ class TaskEvaluator:
         md_lines.extend([
             "## 3. 验收结论与下一步演进路线",
             "当前网关在多协议转换（OpenAI Chat / Anthropic Messages / Realtime Responses）与五大上游提供方稳定性表现优异。",
-            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）、`OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）、`OPT-006`（流式工具调用增量分发与容错修复引擎）、`OPT-007`（智能会话粘滞路由与跨模型状态迁移引擎）、`OPT-008`（智能并发语义去重与流式请求合并引擎 SingleFlight）以及 `OPT-009`（客户端断连传播与上游资源回收引擎）均已全部落地并完成全套测试套件回归验证。",
-            "网关已具备全自动自愈、推测式流式工具输出、会话粘滞平滑漂移、并发去重广播、断连配额回收、确定性计数记忆化、自适应步调控制与长效反爬规避能力，全流程稳定健壮。",
+            "`OPT-001`（Prompt Cache）、`OPT-002`（提示词自适应压缩与历史折叠算法）、`OPT-003`（冷热模型动态负载均衡与自适应降级矩阵）、`OPT-004`（思考流增量渲染与自动折叠加速）、`OPT-005`（上游多平台反爬风控拦截避让与自适应流量整形 TrafficPacer）、`OPT-006`（流式工具调用增量分发与容错修复引擎）、`OPT-007`（智能会话粘滞路由与跨模型状态迁移引擎）、`OPT-008`（智能并发语义去重与流式请求合并引擎 SingleFlight）、`OPT-009`（客户端断连传播与上游资源回收引擎）以及 `OPT-010`（请求生命周期终局保障与并发配额确定性回收引擎）均已全部落地并完成全套测试套件回归验证。",
+            "网关已具备全自动自愈、推测式流式工具输出、会话粘滞平滑漂移、并发去重广播、断连配额回收、请求全生命周期终局保障、确定性计数记忆化、自适应步调控制与长效反爬规避能力，全流程稳定健壮。",
             "",
         ])
 

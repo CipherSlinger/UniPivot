@@ -119,6 +119,7 @@ from .singleflight import (
     broadcast_stream_wrapper,
     singleflight_manager,
     stream_follower_gen,
+    terminate_aborted_group,
 )
 
 __all__ = [
@@ -207,6 +208,7 @@ __all__ = [
     "singleflight_manager",
     "broadcast_stream_wrapper",
     "stream_follower_gen",
+    "terminate_aborted_group",
     "DisconnectGuard",
     "disconnect_guard",
     "guard_stream",

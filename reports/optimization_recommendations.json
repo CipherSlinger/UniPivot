@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 17:35:26",
+  "generated_at": "2026-10-13 18:13:34",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -136,6 +136,16 @@
       "priority": "P0",
       "description": "将客户端中途放弃流式响应的中止信号实时传播至上游异步生成器，显式 aclose() 上游流以瞬时释放 HTTP/2 连接槽位与上游并发配额，杜绝「客户端已走、上游仍在生成」的配额空耗；同时修复 SingleFlight Leader 断连后飞行组永不终结导致 Follower 永久挂起与内存无界泄漏的缺陷（陈旧飞行组回收与等待者唤醒）；并对确定性的 /v1/messages/count_tokens 计数结果实施有界 LRU 记忆化。",
       "expected_impact": "被放弃的生成不再空耗上游配额（对风控敏感节点尤为关键），杜绝悬挂连接与内存泄漏，count_tokens 重复调用零计算成本，并输出透明的 x-disconnect-guard 遥测指标。"
+    },
+    {
+      "id": "OPT-010",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "资源治理与配额保护",
+      "title": "请求生命周期终局保障与并发配额确定性回收引擎 (Request Lifecycle Finalization & Deterministic Quota Reclamation Engine)",
+      "priority": "P0",
+      "description": "针对非流式请求在首个上游响应阶段被客户端中断（CancelledError 属于 BaseException，既有 except Exception 分支永不执行）的场景，在三大协议（OpenAI Chat / Anthropic Messages / Responses）的 finally 中补齐飞行组终局兜底与并发配额回收：修复非流式 Leader 中断后 SingleFlight 飞行组永不终结、Follower 悬挂至 TIMEOUT(600s) 的缺陷；修复 Responses 端点缺失 finally 导致 load_balancer 并发槽位在中断后永久泄漏、进而使负载均衡器持续避让该 Provider 直至进程重启的缺陷。",
+      "expected_impact": "任何客户端中断都不再残留永不终结的飞行组或泄漏并发配额，Follower 零悬挂、并发槽位零泄漏，全协议请求生命周期确定性闭合。"
     }
   ],
   "system_health": "good"

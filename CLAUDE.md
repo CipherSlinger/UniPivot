@@ -54,7 +54,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_affinity.py && \
 .venv/bin/python tests/test_singleflight.py && \
 .venv/bin/python tests/test_disconnect.py && \
-.venv/bin/python tests/test_token_cache.py
+.venv/bin/python tests/test_token_cache.py && \
+.venv/bin/python tests/test_lifecycle.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -67,6 +68,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_singleflight.py # Deterministic SHA-256 fingerprinting, streaming broadcast fanout, and debounce coalescing
 .venv/bin/python tests/test_disconnect.py   # Client-disconnect propagation, upstream stream reclamation, and orphaned flight recovery
 .venv/bin/python tests/test_token_cache.py  # Deterministic token-count memoization, bounded LRU, and count_tokens endpoint integration
+.venv/bin/python tests/test_lifecycle.py    # Request lifecycle finalization, flight-group abort terminality, and load-balancer quota reclamation
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -174,5 +176,10 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 9. **Token Count Cache (`providers/token_counter_cache.py`)**:
    - Memoizes the deterministic `/v1/messages/count_tokens` result behind a bounded LRU, eliminating repeated O(n) estimation on long conversations.
 
-10. **Web Frontend (`static/index.html`)**:
-   - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
+10. **Request Lifecycle Finalization & Quota Reclamation (`providers/singleflight.py:terminate_aborted_group`)**:
+    - Guarantees the non-streaming SingleFlight leader path terminates its flight group on every exit, including client aborts (`CancelledError` is a `BaseException`, so `except Exception` never fires) — without it the group stays non-terminal forever, hanging every follower.
+    - Makes the `load_balancer` concurrency slot deterministically idempotent-released on abort; the Responses endpoint previously had no `finally`, so an aborted request leaked its slot permanently and the balancer would shed away from that provider until restart.
+    - See `tests/test_lifecycle.py`.
+
+11. **Web Frontend (`static/index.html`)**:
+    - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

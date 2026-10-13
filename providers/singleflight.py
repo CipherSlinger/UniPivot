@@ -312,6 +312,29 @@ async def broadcast_stream_wrapper(
                 group.done_event.set()
 
 
+def terminate_aborted_group(group: Optional[FlightGroup]) -> None:
+    """请求中断（客户端断连 CancelledError / 其它 BaseException）时的飞行组终局兜底。
+
+    非流式 Leader 在首个上游响应或聚合上游流期间被中断时，既有的
+    ``except ProviderError`` / ``except Exception`` 分支不会执行——因为
+    ``CancelledError`` 继承自 ``BaseException`` 而非 ``Exception``。若不在
+    ``finally`` 中补齐终局，飞行组将永远停留在 ``leader_done=False``，导致：
+
+    1. 已挂载的 Follower 在 ``done_event`` 上阻塞至超时（默认 TIMEOUT=600s），
+       期间客户端只能干等；
+    2. 该指纹对应的死组长期驻留 ``_flights``，使后续同指纹请求持续错误地
+       挂载到一个永不终结的组上。
+
+    本函数以独立任务补齐终局，**绝不 await**：调用点通常正处于任务取消状态，
+    任何 await 都会被立即二次取消。组已终局时为空操作（幂等）。
+    """
+    if group is None or group.leader_done:
+        return
+    from .disconnect_guard import reap_orphaned_flight
+
+    reap_orphaned_flight(group)
+
+
 async def stream_follower_gen(group: FlightGroup) -> AsyncGenerator[Any, None]:
     """为 Follower 客户端消费回放与实时广播队列。"""
     history_snapshot, queue, is_already_done = await group.add_subscriber()

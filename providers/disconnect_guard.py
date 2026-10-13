@@ -179,7 +179,18 @@ def reap_orphaned_flight(group: Any, now: Optional[float] = None) -> None:
     if finish is None:
         return
     try:
-        task = asyncio.ensure_future(finish(error=err))
+        asyncio.get_running_loop()
     except RuntimeError:
+        # 无运行中的事件循环：退化为同步标记终局，绝不让组停留在非终局状态
+        group.leader_done = True
+        group.error = err
+        group.done_event.set()
+        return
+    try:
+        task = asyncio.ensure_future(finish(error=err))
+    except BaseException:  # noqa: BLE001 - 调度失败也必须保证组终局
+        group.leader_done = True
+        group.error = err
+        group.done_event.set()
         return
     task.add_done_callback(lambda t: t.exception() if not t.cancelled() else None)
