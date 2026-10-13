@@ -3,7 +3,7 @@
 实现 [P0] OPT-007：
 1. 会话粘滞注册表 (Session Affinity Registry):
    - 基于 LRU 与 TTL (默认 30 分钟) 追踪多轮交互的会话归属。
-   - 保持后续轮次请求优��分配到已建立对话上下文的后端 Provider 及模型。
+   - 保持后续轮次请求优先分配到已建立对话上下文的后端 Provider 及模型。
 2. 跨模型透明状态迁移 (Cross-Model State Handoff):
    - 当原 Provider 触发风控拦截、节点熔断或临时冷却时，检测到粘滞断裂；
    - 自动清洗剥离上游异构 conversation_id（避免将 A 厂私有 ID 传给 B 厂引发报错）；

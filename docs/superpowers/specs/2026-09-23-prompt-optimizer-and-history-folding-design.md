@@ -19,7 +19,7 @@ UniPivot 作为多协议 AI 网关，为 Claude Code CLI、OpenAI Codex CLI、Ai
 ### 1.2 设计目标
 1. **分级自适应折叠 (Two-Phase Adaptive Folding)**:
    - **阶段一 (Phase 1: Tool & Code Block Truncation)**: 针对中间轮次的超长工具输出与巨型代码块，就地替换为保留元数据的折叠标记：`[已折叠历史执行结果: 原 {orig_len} 字符, 状态正常]`。
-   - **阶段二 (Phase 2: Conversation Convergence)**: 若阶段一折叠后仍超过上限，将老旧中间轮次收敛压缩为单一紧凑提示：`{"role": "user", "content": "[前序对话历史已由网关自适应折叠，保留核心结论与��下文]"}`。
+   - **阶段二 (Phase 2: Conversation Convergence)**: 若阶段一折叠后仍超过上限，将老旧中间轮次收敛压缩为单一紧凑提示：`{"role": "user", "content": "[前序对话历史已由网关自适应折叠，保留核心结论与上下文]"}`。
 2. **关键状态与语义严格保护 (Strict Invariants)**:
    - **头部保护**: 严格保留开头所有连续的 `system` 消息（CLI 规则与 Tool 定制 Prompt），以及首条 `user` 消息（初始任务核心诉求）。
    - **尾部保护**: 严格保留最近 `preserve_recent_turns`（默认 4 轮）的上下文完整性。
@@ -78,7 +78,7 @@ UniPivot 作为多协议 AI 网关，为 Claude Code CLI、OpenAI Codex CLI、Ai
 [ Head (Preserved) ]           [ Intermediate (Foldable) ]         [ Tail (Preserved) ]
 ┌────────────────────┐        ┌───────────────────────────┐       ┌────────────────────┐
 │ Index 0: system    │        │ Turn 2: assistant         │       │ Turn N-3: user     │
-│ Index 1: user (1st)│ ───��>  │ Turn 2: tool (oversized)  │ ────> │ Turn N-2: assistant│
+│ Index 1: user (1st)│ ─────>  │ Turn 2: tool (oversized)  │ ────> │ Turn N-2: assistant│
 └────────────────────┘        │ Turn 3: assistant         │       │ Turn N-1: tool     │
                               │ Turn 3: tool (oversized)  │       │ Turn N: user       │
                               └───────────────────────────┘       └────────────────────┘

@@ -94,7 +94,7 @@ class MockSuccessStreamProvider:
 
 
 class MockErrorProvider:
-    """���拟在握手或首包即刻抛出 ProviderError 的 Provider"""
+    """模拟在握手或首包即刻抛出 ProviderError 的 Provider"""
 
     def __init__(
         self,
@@ -252,7 +252,7 @@ def test_fallback_candidates():
         assert "deepseek" not in cand_keys
         assert set(cand_keys) == {"kimi", "qwen", "doubao", "glm"}
 
-        # 2. 验证低风险健康节点优先于��风险健康节点
+        # 2. 验证低风险健康节点优先于高风险健康节点
         # doubao 与 glm 风险为 LOW (排在前面)
         # kimi 与 qwen 风险为 HIGH (排在后面)
         assert candidates[0].risk_level == RiskLevel.LOW

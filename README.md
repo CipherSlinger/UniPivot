@@ -184,7 +184,7 @@ for chunk in response:
 ```
 ├── server.py               # 网关主程序（FastAPI 路由分发、生命周期管理）
 ├── login.py                # 凭证自动化捕获脚本（Playwright Chrome 驱动）
-├── session_store.py        # 原子化 POSIX 凭证读���与权限隔离（0o700/0o600）
+├── session_store.py        # 原子化 POSIX 凭证读取与权限隔离（0o700/0o600）
 ├── providers/              # 模型适配与转译核心包
 │   ├── base.py             # 消息展平、Token 估算、SSE 帧组装
 │   ├── failover.py         # 对等互备路由网格、动态冷却避让、三级能力环

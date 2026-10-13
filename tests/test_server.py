@@ -869,7 +869,7 @@ def test_unified_exception_handling_uncaught_500():
     srv._make_provider = lambda key: CrashProvider()
     client = TestClient(srv.app)
 
-    # 1. Anthropic 端点未��获异常 -> 500 / 502 api_error
+    # 1. Anthropic 端点未捕获异常 -> 500 / 502 api_error
     r_ant = client.post(
         "/v1/messages",
         json={"model": "claude-3-7-sonnet", "messages": [{"role": "user", "content": "hi"}]},

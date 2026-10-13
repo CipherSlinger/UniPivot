@@ -181,7 +181,7 @@ class HealingEngine:
                     )
                     return False
 
-                # 2. 发���或安装智能体环境
+                # 2. 发现或安装智能体环境
                 agent_info = await ensure_agent(auto_install=True)
                 if not agent_info:
                     logger.error("无法启动自愈：本地未找到 claude 或 codex，且自动安装未成功")

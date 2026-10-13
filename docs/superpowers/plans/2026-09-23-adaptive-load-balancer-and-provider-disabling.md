@@ -165,7 +165,7 @@ git commit -m "feat(diagnostics): expose real-time load balancer metrics and mar
 
 ---
 
-### Task 4: 端到端全套单测回归验证与优化报告��新
+### Task 4: 端到端全套单测回归验证与优化报告更新
 
 **Files:**
 - Modify: `reports/optimization_proposal.json`

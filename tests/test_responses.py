@@ -623,7 +623,7 @@ def main():
     test_tool_calling_xml_streaming()
     test_tool_calling_without_prefix_non_streaming()
     test_responses_stateless_session_cleanup()
-    print("[PASS] 全��� Responses API 单测通过！")
+    print("[PASS] 全部 Responses API 单测通过！")
 
 
 if __name__ == "__main__":

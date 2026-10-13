@@ -330,7 +330,7 @@ class DoubaoProvider:
                             err_type="auth_error",
                         )
                     if resp.status_code == 429:
-                        raise ProviderError("豆包网页端限流���429），请稍后再试", status=429)
+                        raise ProviderError("豆包网页端限流（429），请稍后再试", status=429)
 
                     # 检查是否为 JSON 报错页面（非 SSE 流）
                     content_type = resp.headers.get("content-type", "")

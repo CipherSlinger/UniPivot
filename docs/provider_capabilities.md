@@ -161,7 +161,7 @@ DeepSeek 网页端（[chat.deepseek.com](https://chat.deepseek.com)）秉承极�
 | 功能维度 | 详细特性 / 技能 | 通义千问 (Tongyi Qianwen) | DeepSeek (深度求索) | 豆包 (Doubao) |
 | :--- | :--- | :--- | :--- | :--- |
 | **1. 基础推理与思考** | 深度思考模式 (CoT) | 支持 (`Qwen3.7-Max` / `QwQ`)，展示思考链 | 原生支持 (`DeepSeek-R1`)，极高强度数学与代码推演 | 支持 (`need_deep_think: 1` / `3-Expert`) |
-| | 思维链流式输出 | 支持（独立消息块或内联标记） | 支持���`fragments[type=THOUGHT]`） | 支持（`thought_block`） |
+| | 思维链流式输出 | 支持（独立消息块或内联标记） | 支持（`fragments[type=THOUGHT]`） | 支持（`thought_block`） |
 | | 思考过程折叠/时间统计 | 支持（网页端显示思考用时与展开折叠） | 支持（网页端实时呈现思考耗时） | 支持（独立卡片与展开交互） |
 | **2. 联网与检索** | 基础联网搜索 | 支持（`deep_search: normal`，含角标引用） | 支持（`search_enabled: true`，含溯源卡片） | 支持（生态搜索聚合，含清晰原链） |
 | | 深度研究模式 (Deep Search) | 支持（多阶段子查询发散与重聚合） | 暂无专门多步深度 Agent 搜索 | 支持（深入研究长文调研报告） |
@@ -195,7 +195,7 @@ DeepSeek 网页端（[chat.deepseek.com](https://chat.deepseek.com)）秉承极�
 
 当前仓库已具备良好的模块化基础，已稳定支持的能力包括：
 1. **深度思考 (Thinking / Reasoning)**：
-   - 通义千问���支持路由到 `Qwen3.7-Max` 等强推理模型。
+   - 通义千问也支持路由到 `Qwen3.7-Max` 等强推理模型。
    - DeepSeek：将客户端 `thinking: true` 映射到网页端 `thinking_enabled: true`。
    - 豆包：将客户端 `thinking: true` 映射到网页端 `need_deep_think: 1` 或 `need_deep_think: 3`（Expert 模式）。
 2. **联网检索 (Web Search)**：

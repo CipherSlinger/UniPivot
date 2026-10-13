@@ -339,7 +339,7 @@ class QwenProvider:
                     f"通义千问上游请求失败: {e.response.status_code} {e.response.text[:300]}", status=502
                 )
             except httpx.HTTPError as e:
-                raise ProviderError(f"通义���问网络错误: {e}", status=502)
+                raise ProviderError(f"通义千问网络错误: {e}", status=502)
 
         yield "", {"conversation_id": conv_id}
 

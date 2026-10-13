@@ -89,7 +89,7 @@ TASK_3_TOOL_CALL = {
         '    "resolution_steps": ["步骤1", "步骤2"]\n'
         "  }\n"
         "}\n"
-        "注意：严禁输出任何 markdown 格式标记（如严禁带 ```json），严禁输出任何引���语或解释，首字符必须是 {，末字符必须是 }。"
+        "注意：严禁输出任何 markdown 格式标记（如严禁带 ```json），严禁输出任何引语或解释，首字符必须是 {，末字符必须是 }。"
     ),
     "expected_keys": ["tool", "arguments"],
     "expected_args_keys": ["file_path", "strategy", "confidence", "reason", "resolution_steps"],
