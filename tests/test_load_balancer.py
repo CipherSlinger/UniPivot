@@ -9,12 +9,17 @@
 6. AdaptiveLoadBalancer 全量运行状态导出 (get_load_stats)
 """
 
+import os
 import sys
 import time
 import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# [OPT-019] 隔离运行：本套件会构造真实 CooldownTracker（进而初始化风控台账与冷却存储），
+# 若不设置 TESTING，持久化写入会落到开发者真实 session/ 目录，污染真实避让状态。
+os.environ["TESTING"] = "1"
 
 from providers.failover import (
     CapabilityRing,
