@@ -47,6 +47,12 @@ from .base import (
     sse_frame,
 )
 from .deepseek import DeepSeekPow, DeepSeekProvider
+from .disconnect_guard import (
+    DisconnectGuard,
+    disconnect_guard,
+    guard_stream,
+    reap_orphaned_flight,
+)
 from .doubao import DoubaoProvider
 from .failover import (
     CapabilityRing,
@@ -201,4 +207,8 @@ __all__ = [
     "singleflight_manager",
     "broadcast_stream_wrapper",
     "stream_follower_gen",
+    "DisconnectGuard",
+    "disconnect_guard",
+    "guard_stream",
+    "reap_orphaned_flight",
 ]
