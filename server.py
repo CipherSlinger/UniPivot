@@ -101,6 +101,7 @@ from providers import (
 )
 from providers.base import _est_tokens, _id
 from providers import http_client
+from providers.disconnect_guard import disconnect_guard, guard_stream
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
 from providers.session_affinity import AffinityDecision, session_affinity_manager
@@ -110,6 +111,7 @@ from providers.singleflight import (
     singleflight_manager,
     stream_follower_gen,
 )
+from providers.token_counter_cache import compute_count_key, token_counter_cache
 from session_store import (
     MAX_AGE,
     resolve_deepseek,
@@ -592,6 +594,13 @@ def _make_singleflight_headers(decision: SingleFlightDecision) -> dict[str, str]
     return headers
 
 
+def _make_disconnect_headers() -> dict[str, str]:
+    """构造客户端断连传播与上游回收遥测响应头。"""
+    return {
+        "x-disconnect-guard": "disabled" if disconnect_guard.is_disabled() else "enabled",
+    }
+
+
 def _is_provider_healthy(pkey: str) -> bool:
     """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。"""
     disabled = os.getenv("DISABLED_PROVIDERS", "").split(",")
@@ -1027,6 +1036,8 @@ async def get_diagnostics():
         },
         "session_affinity": session_affinity_manager.get_diagnostics(),
         "singleflight": singleflight_manager.get_diagnostics(),
+        "disconnect_guard": disconnect_guard.get_diagnostics(),
+        "token_counter_cache": token_counter_cache.get_diagnostics(),
         "risk_avoidance": risk_avoidance,
     }
 
@@ -1334,6 +1345,7 @@ async def chat_completions(req: ChatCompletionRequest):
         stream_headers.update(risk_headers)
         stream_headers.update(affinity_headers)
         stream_headers.update(sf_headers)
+        stream_headers.update(_make_disconnect_headers())
 
         if flight_decision and not flight_decision.is_leader:
             return StreamingResponse(
@@ -1683,6 +1695,9 @@ async def chat_completions(req: ChatCompletionRequest):
         stream_body = gen()
         if flight_decision and flight_decision.is_leader:
             stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+        # 客户端断连传播：显式关闭上游流并即时回收上游并发配额
+        if not disconnect_guard.is_disabled():
+            stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
             stream_body,
@@ -1949,6 +1964,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         stream_headers.update(risk_headers)
         stream_headers.update(affinity_headers)
         stream_headers.update(sf_headers)
+        stream_headers.update(_make_disconnect_headers())
 
         if flight_decision and not flight_decision.is_leader:
             return StreamingResponse(
@@ -2190,6 +2206,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         stream_body = gen()
         if flight_decision and flight_decision.is_leader:
             stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+        # 客户端断连传播：显式关闭上游流并即时回收上游并发配额
+        if not disconnect_guard.is_disabled():
+            stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
             stream_body,
@@ -2375,11 +2394,24 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 @app.post("/v1/messages/count_tokens")
 @app.post("/messages/count_tokens")
 async def count_tokens(req: AnthropicCountTokensRequest):
+    # 确定性记忆化：相同 messages/system/tools 的 token 数恒定，避免重复 O(n) 估算
+    cache_key: Optional[str] = None
+    if not token_counter_cache.is_disabled():
+        cache_key = compute_count_key(req)
+        cached = token_counter_cache.get(cache_key)
+        if cached is not None:
+            return {"input_tokens": cached}
+
     gateway_messages = convert_anthropic_to_gateway_messages(
         req.messages, system=req.system, tools=req.tools
     )
     prompt = flatten_messages(gateway_messages)
-    return {"input_tokens": _est_tokens(prompt)}
+    input_tokens = _est_tokens(prompt)
+
+    if cache_key is not None:
+        token_counter_cache.put(cache_key, input_tokens)
+
+    return {"input_tokens": input_tokens}
 
 
 @app.post("/v1/responses")
@@ -2477,6 +2509,7 @@ async def responses_endpoint(req: ResponsesRequest):
     base_headers.update(risk_headers)
     base_headers.update(affinity_headers)
     base_headers.update(sf_headers)
+    base_headers.update(_make_disconnect_headers())
 
     if req.stream:
         stream_headers = {
@@ -2824,6 +2857,9 @@ async def responses_endpoint(req: ResponsesRequest):
         stream_body = gen()
         if flight_decision and flight_decision.is_leader:
             stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+        # 客户端断连传播：显式关闭上游流并即时回收上游并发配额
+        if not disconnect_guard.is_disabled():
+            stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
             stream_body,

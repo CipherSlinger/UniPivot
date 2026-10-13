@@ -21,7 +21,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
 os.environ["TESTING"] = "1"
+os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
+os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"
+os.environ["DOUBAO_AUTH_TOKEN"] = "fake_doubao"
+os.environ["KIMI_AUTH_TOKEN"] = "fake_kimi"
+os.environ["GLM_AUTH_TOKEN"] = "fake_glm"
 
+from fastapi.testclient import TestClient  # noqa: E402
+
+import server as srv  # noqa: E402
 from providers.disconnect_guard import DisconnectGuard, disconnect_guard, guard_stream  # noqa: E402
 from providers.singleflight import (  # noqa: E402
     FlightGroup,
@@ -29,6 +37,20 @@ from providers.singleflight import (  # noqa: E402
     broadcast_stream_wrapper,
     stream_follower_gen,
 )
+
+
+class DummyStreamProvider:
+    """最小流式假 Provider，用于端点级集成验证。"""
+
+    def __init__(self, key: str = "qwen"):
+        self.key = key
+
+    async def chat(self, *args, **kwargs):
+        for chunk in ["Hello", " ", "World", "!"]:
+            yield chunk, {"conversation_id": "conv_dummy_009"}
+
+    async def delete_conversation(self, *args, **kwargs):  # pragma: no cover - 兼容接口
+        return None
 
 
 def _reset_guard() -> None:
@@ -388,6 +410,71 @@ def test_disconnect_guard_disabled_env():
     print("test_disconnect_guard_disabled_env: PASSED")
 
 
+def test_streaming_endpoints_expose_disconnect_header():
+    """三个协议的流式响应都必须携带 x-disconnect-guard 遥测头。"""
+    orig_make_provider = srv._make_provider
+    srv._make_provider = lambda pkey, client=None: DummyStreamProvider(pkey)
+
+    try:
+        client = TestClient(srv.app)
+        cases = [
+            ("/v1/chat/completions", {"model": "qwen", "stream": True,
+                                      "messages": [{"role": "user", "content": "断连头测试"}]}),
+            ("/v1/messages", {"model": "claude-3-7-sonnet", "stream": True, "max_tokens": 64,
+                              "messages": [{"role": "user", "content": "断连头测试"}]}),
+            ("/v1/responses", {"model": "gpt-4o", "stream": True,
+                               "input": "断连头测试"}),
+        ]
+        for path, payload in cases:
+            headers = {"anthropic-version": "2023-06-01"} if "messages" in path else {}
+            r = client.post(path, json=payload, headers=headers)
+            assert r.status_code == 200, f"{path} -> {r.status_code} {r.text}"
+            assert r.headers.get("x-disconnect-guard") == "enabled", path
+    finally:
+        srv._make_provider = orig_make_provider
+
+    print("test_streaming_endpoints_expose_disconnect_header: PASSED")
+
+
+def test_guard_composition_propagates_to_upstream():
+    """组合包装（guard_stream 外套 broadcast_stream_wrapper）在断连时向上游传播并终局化飞行组。"""
+    _reset_guard()
+    closed = {"flag": False}
+
+    async def _run():
+        group = FlightGroup("c" * 64, debounce_ttl=0.0, stale_timeout=600.0)
+
+        async def upstream():
+            try:
+                for i in range(100):
+                    yield i
+                    await asyncio.sleep(0.01)
+            finally:
+                closed["flag"] = True
+
+        # 与服务端 server.py 一致的嵌套顺序：guard(broadcast(upstream))
+        body = broadcast_stream_wrapper(upstream(), group)
+        body = guard_stream(body, provider_key="qwen")
+
+        got = []
+        async for chunk in body:
+            got.append(chunk)
+            if len(got) >= 2:
+                break
+
+        assert got == [0, 1]
+        # 让 finally 中调度的 finish 任务得以执行
+        await asyncio.sleep(0.05)
+
+    asyncio.run(_run())
+
+    assert closed["flag"] is True, "断连必须穿透 broadcast 层传播到上游生成器"
+    stats = disconnect_guard.get_diagnostics()
+    assert stats["client_disconnects"] == 1
+    assert stats["reclaimed_streams"] >= 1
+    print("test_guard_composition_propagates_to_upstream: PASSED")
+
+
 def run_all():
     test_safe_aclose_closes_generator()
     test_safe_aclose_is_exception_safe()
@@ -401,6 +488,8 @@ def run_all():
     test_follower_idle_timeout_bounded()
     test_disconnect_guard_diagnostics()
     test_disconnect_guard_disabled_env()
+    test_streaming_endpoints_expose_disconnect_header()
+    test_guard_composition_propagates_to_upstream()
     print("\n✅ All disconnect propagation & upstream reclamation tests (OPT-009) passed!")
 
 

@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-09-24 21:45:37",
+  "generated_at": "2026-10-13 17:35:26",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -126,6 +126,16 @@
       "priority": "P0",
       "description": "基于跨协议确定性请求特征指纹 (SHA-256)，对高并发重复请求实现自动去重与合并；首个请求作为 Leader 发起上游调用并维护历史重放缓冲区，并发到达的 Follower 节点自动挂载并平滑重放历史帧与实时多路广播；彻底消除高频重复调用触发的上游 429 与 WAF 风暴，并输出透明的 x-singleflight-* 遥测指标。",
       "expected_impact": "高并发下重复请求上游调用量直降 80% 以上，杜绝并发引起的上游风控与频控拦截，跨协议安全隔离，平均响应延迟与网络带宽开销显著降低。"
+    },
+    {
+      "id": "OPT-009",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "资源治理与配额保护",
+      "title": "客户端断连传播与上游资源回收引擎 (Client Disconnect Propagation & Upstream Reclamation Engine)",
+      "priority": "P0",
+      "description": "将客户端中途放弃流式响应的中止信号实时传播至上游异步生成器，显式 aclose() 上游流以瞬时释放 HTTP/2 连接槽位与上游并发配额，杜绝「客户端已走、上游仍在生成」的配额空耗；同时修复 SingleFlight Leader 断连后飞行组永不终结导致 Follower 永久挂起与内存无界泄漏的缺陷（陈旧飞行组回收与等待者唤醒）；并对确定性的 /v1/messages/count_tokens 计数结果实施有界 LRU 记忆化。",
+      "expected_impact": "被放弃的生成不再空耗上游配额（对风控敏感节点尤为关键），杜绝悬挂连接与内存泄漏，count_tokens 重复调用零计算成本，并输出透明的 x-disconnect-guard 遥测指标。"
     }
   ],
   "system_health": "good"

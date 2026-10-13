@@ -52,7 +52,9 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_responses.py && \
 .venv/bin/python tests/test_tools.py && \
 .venv/bin/python tests/test_affinity.py && \
-.venv/bin/python tests/test_singleflight.py
+.venv/bin/python tests/test_singleflight.py && \
+.venv/bin/python tests/test_disconnect.py && \
+.venv/bin/python tests/test_token_cache.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -63,6 +65,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_tools.py       # Streaming tool calling, speculative streaming, and self-healing JSON engine
 .venv/bin/python tests/test_affinity.py    # Session affinity, cross-model state handoff, LRU/TTL, and telemetry headers
 .venv/bin/python tests/test_singleflight.py # Deterministic SHA-256 fingerprinting, streaming broadcast fanout, and debounce coalescing
+.venv/bin/python tests/test_disconnect.py   # Client-disconnect propagation, upstream stream reclamation, and orphaned flight recovery
+.venv/bin/python tests/test_token_cache.py  # Deterministic token-count memoization, bounded LRU, and count_tokens endpoint integration
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -162,5 +166,13 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
    - Leader/Follower flight groups with streaming multi-subscriber fanout and historical replay buffers.
    - Non-streaming response coalescing with `x-singleflight: leader | follower` telemetry headers and zero duplicate upstream calls.
 
-8. **Web Frontend (`static/index.html`)**:
+8. **Disconnect Guard & Upstream Reclamation (`providers/disconnect_guard.py`)**:
+   - Propagates client disconnects to the upstream async generator and explicitly closes it, releasing the HTTP/2 connection slot and upstream concurrency quota immediately instead of letting an abandoned stream drain quota.
+   - Guarantees a terminal state for the SingleFlight flight group on every exit path, including `CancelledError`, and reclaims flight groups whose leader vanished so followers can never hang.
+   - Emits `x-disconnect-guard` telemetry headers across all protocols.
+
+9. **Token Count Cache (`providers/token_counter_cache.py`)**:
+   - Memoizes the deterministic `/v1/messages/count_tokens` result behind a bounded LRU, eliminating repeated O(n) estimation on long conversations.
+
+10. **Web Frontend (`static/index.html`)**:
    - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
