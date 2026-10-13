@@ -113,6 +113,7 @@ from providers.singleflight import (
     terminate_aborted_group,
 )
 from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
+from providers.risk_correlation import get_risk_correlation, risk_correlation
 from providers.risk_dossier import get_risk_dossier, risk_dossier
 from providers.risk_ledger import risk_ledger
 from providers.conversation_gc import conversation_gc
@@ -1231,6 +1232,8 @@ async def get_diagnostics():
         },
         # [OPT-023] 仅暴露汇总（明细见 GET /v1/admin/risk），避免诊断接口膨胀
         "risk_dossier_summary": risk_dossier.build()["summary"],
+        # [OPT-024] 跨节点风控关联与系统性升级研判
+        "risk_correlation": risk_correlation.evaluate(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1345,6 +1348,18 @@ async def get_risk_dossier(provider: Optional[str] = None):
             {"generated_at": round(time.time(), 3), "provider": entry["provider"], "entry": entry}
         )
     return JSONResponse(risk_dossier.build())
+
+
+@app.get("/v1/admin/risk/correlation")
+@app.get("/admin/risk/correlation")
+async def get_risk_correlation_report():
+    """跨节点风控关联与系统性升级研判。
+
+    区分两种成因完全相反的拦截：单账号成因（该账号自身风控，避让 + 换节点有效）
+    与系统性成因（我们的客户端足迹被标记，换节点无效且会把剩余账号逐个送进封禁）。
+    后者只能通过整体降速与更换客户端身份特征应对。
+    """
+    return JSONResponse(risk_correlation.evaluate())
 
 
 # ---------------------------------------------------------------- 优化空间报告接口

@@ -50,6 +50,7 @@ from typing import (
 
 from .base import ProviderError
 from .quarantine import get_quarantine_store
+from .risk_correlation import get_risk_correlation
 from .risk_ledger import (
     SEVERITY_AUTH,
     SEVERITY_RATE_LIMIT,
@@ -93,6 +94,17 @@ def compute_pacing_multiplier(
             continue
     ceiling = max(1.0, float(max_multiplier))
     return float(min(max(1.0, 1.0 + 0.25 * weight), ceiling))
+
+
+def _global_risk_pacing_multiplier(now: Optional[float] = None) -> float:
+    """[OPT-024] 全局系统性风控压制倍率（多个不同账号被同时拦截时整体降速）。
+
+    无关联证据时恒为 1.0，对既有步调零影响；查询异常亦返回 1.0，绝不影响请求流程。
+    """
+    try:
+        return get_risk_correlation().cached_global_pacing_multiplier(now)
+    except Exception:  # noqa: BLE001
+        return 1.0
 
 
 def get_adaptive_pacing_multiplier(
@@ -680,6 +692,9 @@ class CooldownTracker:
         """计算节点下一次调用前应保持的最小间隔（秒，不含抖动时传入 jitter=0）。
 
         [OPT-022] 因子乘积：基础间隔 × 证据驱动放大倍率 × 观察期放大倍率。
+        [OPT-024] 再乘全局系统性压制倍率：当多个**不同**账号在同一窗口内被拦时，
+        根因在我们的客户端足迹而非各账号自身，此时逐节点避让无法治本，必须整体降速。
+        无关联证据时该倍率为 1.0，对既有步调零影响。
         抽成纯函数以便确定性测试，避免以计时断言验证步调。
         """
         meta = PROVIDER_RISK_SPECS.get(provider_key)
@@ -689,6 +704,7 @@ class CooldownTracker:
             meta.min_call_interval
             * get_adaptive_pacing_multiplier(provider_key)
             * self.probation_pacing_multiplier(provider_key)
+            * _global_risk_pacing_multiplier()
             + jitter
         )
 
@@ -783,7 +799,8 @@ class TrafficPacer:
                 meta = PROVIDER_RISK_SPECS.get(pk)
                 if meta:
                     # [OPT-014] 依据近期风控拦截证据自适应放大调用间隔
-                    mult = get_adaptive_pacing_multiplier(pk)
+                    # [OPT-024] 再乘全局系统性压制倍率（无关联证据时为 1.0）
+                    mult = get_adaptive_pacing_multiplier(pk) * _global_risk_pacing_multiplier()
                     async with self._lock:
                         now = time.time()
                         last = self._last_call_times.get(pk, 0.0)
@@ -818,9 +835,12 @@ class TrafficPacer:
                 "in_use": in_use,
                 "min_interval_s": meta.min_call_interval if meta else 0.1,
                 "effective_interval_s": round(
-                    (meta.min_call_interval if meta else 0.1) * get_adaptive_pacing_multiplier(pk), 4
+                    (meta.min_call_interval if meta else 0.1)
+                    * get_adaptive_pacing_multiplier(pk)
+                    * _global_risk_pacing_multiplier(), 4
                 ),
                 "pacing_multiplier": get_adaptive_pacing_multiplier(pk),
+                "global_risk_multiplier": _global_risk_pacing_multiplier(),
                 "jitter_s": list(meta.jitter_range) if meta else [0.01, 0.05],
                 "risk_level": meta.risk_level.value if meta else "medium",
             }

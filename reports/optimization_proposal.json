@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 20:54:36",
+  "generated_at": "2026-10-13 21:01:45",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -276,6 +276,16 @@
       "priority": "P1",
       "description": "风控台账的 recent_interceptions() 是滑动窗口（默认 24h），适合驱动实时避让，却无法回答运维最关心的问题——「这家到底被拦过几次、都是什么原因、能不能绕开、重登有没有用」。各家封禁窗口以天计，24h 窗口几乎必然在封禁解除前就把证据丢光，证据一旦滑出窗口即永久不可复盘。本次新增 providers/risk_dossier.py：(1) 以全量台账（受 GATEWAY_RISK_LEDGER_MAX_LINES 有界约束）聚合每节点累计拦截次数、首/末次时间、严重度分布与最近一次真实上游原文；(2) 把分散在四处的事实——封禁租约、软冷却、恢复观察期 (OPT-022)、证据驱动步调倍率 (OPT-014)——合成为单一姿态，命中即取最重者 quarantined > cooling > probation > watch > clear，并附是否可派发（仅硬封禁不可派发，软冷却保持 OPT-021 的最后一搏语义）；(3) 按严重度给出确定性规避结论：technically_bypassable 一律为否，auth 与 waf 可由 `python login.py <provider>` 重登恢复，ratelimit 瞬时自愈故重登无意义，账号级封禁**重登无效**（封禁作用在账号而非令牌），持有租约者一律按账号级封禁研判；(4) 给出与该节点姿态一致的、可执行的推荐动作。模块全程只读，不解除租约、不清冷却、不写台账。",
       "expected_impact": "把「记录每家风控拦截、研判能否绕开、不能绕开则如何避免」从人工经验固化为可查询的确定性结论：GET /v1/admin/risk 一览各家全量拦截历史、当前姿态、可派发性、实际步调倍率与规避策略矩阵，/v1/diagnostics 暴露汇总；封禁历史不再因 24h 窗口滑过而丢失，跨「天」级封禁窗口的复盘成为可能；明确回答「重新登录能否恢复」——令牌失效与人机验证可恢复，账号级封禁不可且重登只会延长封禁，杜绝误导性操作；只读设计保证查询诊断路径绝不会扰动避让语义，GATEWAY_DISABLE_RISK_DOSSIER=1 可关闭。"
+    },
+    {
+      "id": "OPT-024",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控根因研判与全局治理",
+      "title": "跨节点风控关联与系统性升级研判 (Cross-Provider Risk Correlation)",
+      "priority": "P0",
+      "description": "OPT-011~OPT-023 的全部避让逻辑都以单个 Provider 账号为单位：该账号被拦就冷却它、封禁它、观察它。但风控拦截存在第二种成因——我们自己的客户端足迹（请求头指纹、UA、设备参数、出口 IP、时间分布）被平台标记，此时各账号被拦并非彼此独立而是同一根因的多个表现。两种成因需要**完全相反**的应对：单账号成因下换节点继续打是正确的；系统性成因下换节点毫无用处——新节点会以同样足迹被立即拦下，继续轮换只会逐个把剩余账号也送进封禁，是此时最危险的操作。而单账号视角永远看不到这一层，它把每次拦截都解释为「这家风控严」，于是一个接一个消耗掉全部五个账号。本次新增 providers/risk_correlation.py：以风控台账为唯一输入（只读），关联性以**去重节点数**而非拦截次数衡量——同一账号被拦百次仍是单账号问题，多个不同账号在同一突发子窗口内被集中拦截才几乎不可能彼此独立；用双指针滑动窗口（O(n)）计算 GATEWAY_RISK_CORRELATION_BURST_WINDOW（默认 120s）内的去重节点峰值，分级为 none < localized < widespread < systemic（突发去重数达阈值即判 systemic，强信号优先；时间分散则判 widespread 仅轻量压制并提示人工确认）。systemic 时对**所有**节点统一放大调用间隔（默认 ×2.0），作为第四个因子作用于 CooldownTracker.compute_pacing_interval 与 TrafficPacer，与 OPT-014 单节点证据倍率、OPT-022 观察期倍率相乘而非替换。每一级显式声明 rotate_node_helps 与 per_account_avoidance_helps，使「换节点是否有用」成为可查询的确定性结论。",
+      "expected_impact": "补上整个风控体系唯一的**根因层**盲区：此前只能逐个账号避让，无法回答「为什么短时间内多个账号接连被拦」。现在可确定性区分单账号事件与系统性事件，并在系统性事件上自动整体降速（并明确告知继续轮换节点只会逐个葬送剩余账号），从「一个接一个失去账号」转为「第一时间止损并更换客户端身份特征」。倍率带 TTL 缓存（默认 15s）以适配高频步调路径，无关联证据时恒为 1.0、台账不可用亦降级为 1.0，对既有行为零回归；研判全程只读。GET /v1/admin/risk/correlation 与 /v1/diagnostics 提供完整可观测性，GATEWAY_DISABLE_RISK_CORRELATION=1 可关闭。"
     }
   ],
   "system_health": "good"

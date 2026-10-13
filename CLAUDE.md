@@ -66,7 +66,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_quarantine.py && \
 .venv/bin/python tests/test_quarantine_hardstop.py && \
 .venv/bin/python tests/test_probation.py && \
-.venv/bin/python tests/test_risk_dossier.py
+.venv/bin/python tests/test_risk_dossier.py && \
+.venv/bin/python tests/test_risk_correlation.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -90,6 +91,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_quarantine_hardstop.py # Quarantine hard-stop at the dispatch boundary (quarantined nodes are never dispatched, even as failover fallbacks)
 .venv/bin/python tests/test_probation.py    # Post-avoidance recovery probation (serialized canary handshakes + widened pacing after a ban lifts)
 .venv/bin/python tests/test_risk_dossier.py # All-time interception dossier, posture derivation, and bypass/re-login avoidance verdicts
+.venv/bin/python tests/test_risk_correlation.py # Cross-provider risk correlation: systemic escalation detection and the global pacing governor
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -246,5 +248,12 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - **Avoidance verdict per severity** (`AVOIDANCE_MATRIX`): each tier answers `technically_bypassable` (never true — no client-side action evades a risk control), `recoverable_by_relogin`, `auto_recovers`, typical span, and a concrete strategy. `auth` (expired token/session) and `waf` (captcha/RGV587) *do* recover via `python login.py <provider>`; `ratelimit` is transient and self-healing, so re-login is pointless; an account-level ban (`ban`) is **not** recoverable by re-login — the ban binds the account, not the token — and the only correct strategy is zero-touch waiting for the platform to lift it. Providers holding a lease are always judged as `ban` regardless of what the ledger says.
     - **Read-only**: querying the dossier never mutates risk state (no lease cleared, no cooldown reset, no ledger append), so it is safe to expose on diagnostic paths. `GATEWAY_DISABLE_RISK_DOSSIER=1` marks it disabled. Telemetry: `risk_dossier_summary` on `/v1/diagnostics`, full detail (plus `?provider=<key>` for a single node) on `GET /v1/admin/risk`. See `tests/test_risk_dossier.py`.
 
-21. **Web Frontend (`static/index.html`)**:
+21. **Cross-Provider Risk Correlation (`providers/risk_correlation.py`)**:
+    - **[OPT-024] The blind spot of per-account reasoning**: every avoidance mechanism so far (OPT-011..OPT-023) is scoped to a *single* provider account — that account was intercepted, so cool it, quarantine it, watch it. But there is a second cause of interception: **our own client footprint** (header fingerprint, UA, device params, egress IP, request timing) being flagged by the platform. The accounts are then not intercepted independently — they are multiple symptoms of one root cause. The two causes demand **opposite** responses: for a single-account cause "switch to another node and keep going" is correct; for a systemic cause it is useless and actively harmful, because the new node gets flagged on the same footprint and you simply burn the remaining accounts one by one. Per-account reasoning can never see this layer — it explains each interception as "this provider's risk control is strict" and hands over all five accounts in sequence.
+    - **Correlation is measured in *distinct providers*, not interception counts**: one account intercepted a hundred times is still a single-account problem. The detector scans the ledger (read-only) over `GATEWAY_RISK_CORRELATION_WINDOW` (default 900s) and computes the largest number of distinct providers intercepted inside any `GATEWAY_RISK_CORRELATION_BURST_WINDOW` sub-window (default 120s), using a two-pointer sliding window so it stays O(n).
+    - **Grading, strongest signal first**: `systemic` when the burst holds `GATEWAY_RISK_CORRELATION_SYSTEMIC_MIN` (default 3) distinct providers — several different accounts hit within minutes is essentially impossible from independent causes; else `widespread` when `GATEWAY_RISK_CORRELATION_WIDESPREAD_MIN` (default 3) distinct providers appear in the window but not as a burst; else `localized`; else `none`.
+    - **Global pacing governor**: `systemic` multiplies every node's interval by `GATEWAY_RISK_CORRELATION_SYSTEMIC_FACTOR` (default 2.0), `widespread` by `GATEWAY_RISK_CORRELATION_WIDESPREAD_FACTOR` (default 1.25). This composes as a fourth factor in `CooldownTracker.compute_pacing_interval` and in `TrafficPacer`, so it multiplies with the OPT-014 evidence factor and the OPT-022 probation factor rather than replacing either. The multiplier is TTL-cached (`GATEWAY_RISK_CORRELATION_CACHE_TTL`, default 15s) because the pacing path is hot, and defaults to **1.0** whenever there is no correlation evidence — zero regression.
+    - Each grade carries a playbook stating explicitly whether `rotate_node_helps` and `per_account_avoidance_helps`. Telemetry: `risk_correlation` on `/v1/diagnostics`, full report at `GET /v1/admin/risk/correlation`. `GATEWAY_DISABLE_RISK_CORRELATION=1` disables. See `tests/test_risk_correlation.py`.
+
+22. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

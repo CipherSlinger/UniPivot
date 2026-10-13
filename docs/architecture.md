@@ -229,6 +229,20 @@ PROVIDER_RISK_SPECS = {
 - **跨重启生效**：episode 结束时间随风控台账持久化（`episode_ends`），重启即绕过观察期的路径被堵死。
 - **开关与遥测**：`GATEWAY_DISABLE_PROBATION=1` 关闭；响应头 `x-risk-probation: 1`，`/v1/diagnostics` 暴露 `probation.active` 与 `probation.stats`。
 
+#### 13. 跨节点风控关联与系统性升级研判 (`providers/risk_correlation.py`)
+
+- **问题（单账号视角的盲区）**：OPT-011~OPT-023 的全部避让逻辑都以「单个 Provider 账号」为单位——该账号被拦，就冷却它、封禁它、观察它。但风控拦截存在第二种成因：**我们自己的客户端足迹**（请求头指纹、UA、设备参数、出口 IP、时间分布）被平台标记。此时各账号被拦并非彼此独立，而是同一根因的多个表现。
+- **两种成因需要完全相反的应对**：
+  - **单账号成因**：「换一个节点继续打」是**正确**的——其他账号不受影响。
+  - **系统性成因**：换节点**毫无用处**——新节点会以同样的足迹被立即拦下，继续轮换只会逐个把剩余账号也送进封禁，是此时**最危险**的操作。
+  - 单账号视角永远看不到这一层：它把每个账号的拦截都解释为「这家风控严」，于是一个接一个地消耗掉全部五个账号。
+- **关联性以去重节点数衡量**（核心设计）：同一账号被拦 100 次仍是单账号问题；**多个不同账号**在同一个突发子窗口内被集中拦截，才几乎不可能由各自独立的原因导致。以双指针滑动窗口计算窗口内任意 `GATEWAY_RISK_CORRELATION_BURST_WINDOW`（默认 120s）子窗口的去重节点峰值，复杂度 O(n)。
+- **分级（强信号优先）**：突发内去重节点数 ≥ `GATEWAY_RISK_CORRELATION_SYSTEMIC_MIN`（默认 3）→ `systemic`；否则窗口内（`GATEWAY_RISK_CORRELATION_WINDOW`，默认 900s）去重节点数 ≥ `GATEWAY_RISK_CORRELATION_WIDESPREAD_MIN`（默认 3）→ `widespread`；否则 ≥1 → `localized`；无 → `none`。时间集中与时间分散的区别在于前者几乎必然是共享足迹，后者可能是各自独立的原因，因此只轻量放大并提示人工确认。
+- **全局步调治理**：`systemic` 对所有节点统一乘以 `GATEWAY_RISK_CORRELATION_SYSTEMIC_FACTOR`（默认 2.0），`widespread` 乘以 `GATEWAY_RISK_CORRELATION_WIDESPREAD_FACTOR`（默认 1.25）。该倍率作为**第四个因子**作用于 `CooldownTracker.compute_pacing_interval()`（基础 × 证据 × 观察期 × 全局）与 `TrafficPacer`，与 OPT-014、OPT-022 相乘而非替换。因步调路径调用频繁，倍率带 TTL 缓存（`GATEWAY_RISK_CORRELATION_CACHE_TTL`，默认 15s）。
+- **零回归**：无关联证据时倍率恒为 **1.0**；台账不可用亦降级为 1.0，绝不影响请求流程。研判全程只读，不写台账。
+- **策略矩阵**：每一级都显式声明 `rotate_node_helps` 与 `per_account_avoidance_helps`，使「换节点是否有用」成为可查询的确定性结论而非经验判断。
+- **接口与开关**：`GET /v1/admin/risk/correlation` 返回完整研判，`/v1/diagnostics` 暴露 `risk_correlation`。`GATEWAY_DISABLE_RISK_CORRELATION=1` 关闭。
+
 #### 12. 风控拦截全量档案与规避策略研判 (`providers/risk_dossier.py`)
 
 - **问题**：`RiskLedger.recent_interceptions()` 是**滑动窗口**（默认 24h），适合驱动实时避让，却不适合回答运维最关心的问题——「这家到底被拦过几次、都是什么原因、能不能绕开、重登有没有用」。各家封禁窗口以**天**计，24h 窗口几乎必然在封禁解除前就把证据丢光，而证据一旦滑出窗口就再也无法复盘。
@@ -311,6 +325,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── conversation_gc.py      # 远端临时会话删除的持久化重试队列（跨重启防泄漏、有界重试）
 │   ├── quarantine.py           # 运维长期封禁租约：跨重启持久化、只延长不缩短、折入全局冷却门控
 │   ├── risk_dossier.py         # 风控全量档案与姿态研判：拦截历史可审计、规避策略与重登有效性结论
+│   ├── risk_correlation.py     # 跨节点风控关联：系统性升级研判与全局步调治理
 │   ├── session_affinity.py     # 会话亲和与跨模型状态移交引擎（LRU/TTL、异构上游会话 ID 剥离）
 │   ├── singleflight.py         # 单飞去重与流式扇出引擎（SHA-256 指纹、Leader/Follower 广播）
 │   ├── token_counter_cache.py  # Token 计量结果缓存
@@ -389,6 +404,7 @@ PROVIDER_RISK_SPECS = {
 │   └── test_quarantine_hardstop.py # 封禁租约的派发硬阻断：零触碰、快速失败与软冷却语义区分测试
 │   └── test_probation.py       # 避让解除后的恢复观察期：串行探路闸门、步调放大、毕业与跨重启持久化测试
 │   └── test_risk_dossier.py    # 风控全量档案：窗口外证据保留、姿态 fail-closed、只读性与重登恢复结论测试
+│   └── test_risk_correlation.py # 跨节点风控关联：去重节点语义、系统性分级、全局步调压制与只读性测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -419,6 +435,7 @@ PROVIDER_RISK_SPECS = {
    - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
    - 自动冷却存在**时长上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁可持续数天；因此长于冷却上限的封禁**必须**通过运维长期租约表达：`providers/quarantine.py`（`GATEWAY_QUARANTINE` 环境变量或 `POST /v1/admin/quarantine`），租约经 `CooldownTracker.get_remaining_cooldown()` 折入全局冷却读数，使**所有**既有门控自动遵循。租约只延长不缩短，误操作不可能提前放行封禁节点；解除人工租约**不得**连带清除真实风控产生的自动冷却。
    - **硬封禁必须在派发路径上阻断，而不仅是被门控避让**：折入冷却读数只影响「主动发起的旁路请求」（探针/刷新/回收/自愈），**不覆盖**正常业务派发。因此 `execute_chat` 必须在派发前校验 `is_quarantined`，`get_fallback_candidates` 必须**排除**（而非仅沉底）封禁节点，负载均衡不得把任何请求分流到封禁节点。环内全部封禁时必须**快速失败（503 quarantined）且零上游调用**，严禁以「环内只剩它」为由破例触碰。
+   - **必须区分「单账号成因」与「系统性成因」，严禁把后者当作前者处理**：多账号被拦的成因有二——各账号自身风控（按账号避让 + 换节点有效），或我们自己的客户端足迹（请求头指纹/UA/设备参数/出口 IP/时间分布）被平台标记（避让与换节点**均无效**，换节点只会以同样足迹把剩余账号逐个送进封禁）。关联性必须以**去重节点数**而非拦截次数衡量：同一账号被拦百次仍是单账号问题，而多个不同账号在同一突发窗口内被集中拦截则几乎不可能彼此独立。判定为系统性时，必须整体放大全局调用步调并明确提示「换节点无效」；任何面向运维的输出都不得暗示继续轮换节点。
    - **风控拦截必须留下可审计的全量档案，且规避结论不得含糊**：滑动窗口只服务实时避让，封禁历史以「天」计，窗口滑过即不可复盘。因此每家节点的拦截历史、严重度分布与最近一次上游原文必须可从全量台账聚合查询（`GET /v1/admin/risk`）。规避研判必须给出确定性结论而非模棱两可的建议：账号级封禁**不可绕开、重登无效**，只能零误触等待平台解封，严禁在任何面向用户或运维的文案中暗示「重登可解封」；人机验证与令牌失效才可由重登恢复。档案查询必须**只读**，严禁因查询而解除租约或清除冷却。
    - **避让解除后必须经过恢复观察期，严禁解封即满速**：避让只保证「不触碰」，不保证「不再被打进封禁」。多日避让期间被压制的需求会在解封瞬间同时释放，复现当初触发封禁的流量特征。因此任一避让 episode 结束（冷却到期、租约到期或被解除）后，该节点必须先进入恢复观察期：串行放行单个探路握手（并发峰值恒为 1）并放大步调间隔，累计若干次**连续成功**后才毕业恢复常规并发。观察期状态必须随风控台账持久化，严禁通过重启绕过。普通 5xx/超时（上游故障，非账号被标记）不得触发观察期。
 
@@ -447,7 +464,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_quarantine.py && \
 .venv/bin/python tests/test_quarantine_hardstop.py && \
 .venv/bin/python tests/test_probation.py && \
-.venv/bin/python tests/test_risk_dossier.py
+.venv/bin/python tests/test_risk_dossier.py && \
+.venv/bin/python tests/test_risk_correlation.py
 ```
 
 ### 测试矩阵要求：
