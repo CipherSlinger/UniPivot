@@ -113,6 +113,7 @@ from providers.singleflight import (
     terminate_aborted_group,
 )
 from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
+from providers.risk_dossier import get_risk_dossier, risk_dossier
 from providers.risk_ledger import risk_ledger
 from providers.conversation_gc import conversation_gc
 from providers.token_counter_cache import compute_count_key, token_counter_cache
@@ -142,6 +143,10 @@ task_dispatcher = TaskDispatcher(port=PORT)
 
 # 全局五大模型对等互备路由调度器
 failover_router = FailoverRouter()
+
+# [OPT-023] 将冷却读数接入风控档案研判器：姿态派生需要同时读取
+# 软冷却、封禁租约（经冷却转换）与恢复观察期，均由该 tracker 提供。
+risk_dossier.set_cooldown_tracker(failover_router.cooldown_tracker)
 
 # [OPT-012] 将风控冷却状态接入健康探针门控：处于避让冷却期的节点，
 # 周期探针跳过真实网络调用，杜绝持续触碰已被上游风控封禁的节点。
@@ -1224,6 +1229,8 @@ async def get_diagnostics():
             "active": failover_router.cooldown_tracker.get_probation_states(),
             "stats": failover_router.cooldown_tracker.get_probation_stats(),
         },
+        # [OPT-023] 仅暴露汇总（明细见 GET /v1/admin/risk），避免诊断接口膨胀
+        "risk_dossier_summary": risk_dossier.build()["summary"],
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1318,6 +1325,26 @@ async def clear_quarantine(provider: Optional[str] = None):
     return JSONResponse(
         {"status": "ok", "cleared": count, "active": quarantine_store.list_active()}
     )
+
+
+# ---------------------------------------------------------------- 风控档案接口
+@app.get("/v1/admin/risk")
+@app.get("/admin/risk")
+async def get_risk_dossier(provider: Optional[str] = None):
+    """风控拦截全量档案与规避策略研判。
+
+    逐家给出：全量（非 24h 窗口）拦截统计与严重度分布、最近一次上游原文、
+    当前姿态（封禁 / 冷却 / 观察期 / 监视 / 正常）、是否可派发、步调实际倍率，
+    以及**该家风控能否绕开、能否靠重登恢复、应当如何避免**的确定性结论。
+
+    传 `?provider=qwen` 则只返回该节点的档案条目。
+    """
+    if provider:
+        entry = risk_dossier.provider_entry(provider)
+        return JSONResponse(
+            {"generated_at": round(time.time(), 3), "provider": entry["provider"], "entry": entry}
+        )
+    return JSONResponse(risk_dossier.build())
 
 
 # ---------------------------------------------------------------- 优化空间报告接口

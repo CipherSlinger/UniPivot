@@ -229,6 +229,19 @@ PROVIDER_RISK_SPECS = {
 - **跨重启生效**：episode 结束时间随风控台账持久化（`episode_ends`），重启即绕过观察期的路径被堵死。
 - **开关与遥测**：`GATEWAY_DISABLE_PROBATION=1` 关闭；响应头 `x-risk-probation: 1`，`/v1/diagnostics` 暴露 `probation.active` 与 `probation.stats`。
 
+#### 12. 风控拦截全量档案与规避策略研判 (`providers/risk_dossier.py`)
+
+- **问题**：`RiskLedger.recent_interceptions()` 是**滑动窗口**（默认 24h），适合驱动实时避让，却不适合回答运维最关心的问题——「这家到底被拦过几次、都是什么原因、能不能绕开、重登有没有用」。各家封禁窗口以**天**计，24h 窗口几乎必然在封禁解除前就把证据丢光，而证据一旦滑出窗口就再也无法复盘。
+- **全量档案**：以**全量台账**（受 `GATEWAY_RISK_LEDGER_MAX_LINES` 有界约束）聚合每个节点的累计拦截次数、首/末次时间、严重度分布，以及**最近一次的真实上游原文**，使封禁历史可审计、可复盘。
+- **姿态合成（fail-closed）**：把分散在四处的事实——封禁租约、软冷却、恢复观察期 (OPT-022)、证据驱动的步调倍率 (OPT-014)——合成为**单一姿态**，命中即取最重者：`quarantined` > `cooling` > `probation` > `watch` > `clear`，并附「是否可派发」。运维读一个字段即可判断节点此刻的真实处境。仅硬封禁不可派发；软冷却保持可派发，与 OPT-021 的「最后一搏」语义一致。
+- **规避研判（直接回答「能否绕开」）**：按严重度给出确定性结论——`technically_bypassable`（一律为否：任何客户端手段都无法绕开平台侧风控）、`recoverable_by_relogin`、`auto_recovers`、典型持续时长与具体策略。
+  - `auth`（令牌/会话失效）与 `waf`（人机验证 RGV587）→ **重登可恢复**（`python login.py <provider>`）；
+  - `ratelimit` → 瞬时自动恢复，重登无意义；
+  - `ban`（账号级封禁）→ **重登无效**：封禁作用在账号本身而非令牌，换令牌/换会话/换指纹均不可能解除，任何尝试只会延长封禁，唯一策略是零误触等待平台自然解封。
+  - 持有租约的节点**一律**按 `ban` 研判，不受台账严重度影响。
+- **只读性**：查询档案**绝不**改动任何风控状态（不解除租约、不清冷却、不写台账），因此可安全暴露在诊断路径上。
+- **接口与开关**：`GET /v1/admin/risk`（支持 `?provider=qwen` 单节点视图）返回完整档案与策略矩阵；`/v1/diagnostics` 仅暴露 `risk_dossier_summary` 汇总，避免诊断接口膨胀。`GATEWAY_DISABLE_RISK_DOSSIER=1` 标记为关闭。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -297,6 +310,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── risk_ledger.py          # 风控拦截持久化台账：严重度分级、JSONL 审计、冷却状态跨重启恢复
 │   ├── conversation_gc.py      # 远端临时会话删除的持久化重试队列（跨重启防泄漏、有界重试）
 │   ├── quarantine.py           # 运维长期封禁租约：跨重启持久化、只延长不缩短、折入全局冷却门控
+│   ├── risk_dossier.py         # 风控全量档案与姿态研判：拦截历史可审计、规避策略与重登有效性结论
 │   ├── session_affinity.py     # 会话亲和与跨模型状态移交引擎（LRU/TTL、异构上游会话 ID 剥离）
 │   ├── singleflight.py         # 单飞去重与流式扇出引擎（SHA-256 指纹、Leader/Follower 广播）
 │   ├── token_counter_cache.py  # Token 计量结果缓存
@@ -374,6 +388,7 @@ PROVIDER_RISK_SPECS = {
 │   └── test_quarantine.py      # 运维长期封禁租约：解析、落盘恢复、只延长与全门控遵循测试
 │   └── test_quarantine_hardstop.py # 封禁租约的派发硬阻断：零触碰、快速失败与软冷却语义区分测试
 │   └── test_probation.py       # 避让解除后的恢复观察期：串行探路闸门、步调放大、毕业与跨重启持久化测试
+│   └── test_risk_dossier.py    # 风控全量档案：窗口外证据保留、姿态 fail-closed、只读性与重登恢复结论测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -404,6 +419,7 @@ PROVIDER_RISK_SPECS = {
    - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
    - 自动冷却存在**时长上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁可持续数天；因此长于冷却上限的封禁**必须**通过运维长期租约表达：`providers/quarantine.py`（`GATEWAY_QUARANTINE` 环境变量或 `POST /v1/admin/quarantine`），租约经 `CooldownTracker.get_remaining_cooldown()` 折入全局冷却读数，使**所有**既有门控自动遵循。租约只延长不缩短，误操作不可能提前放行封禁节点；解除人工租约**不得**连带清除真实风控产生的自动冷却。
    - **硬封禁必须在派发路径上阻断，而不仅是被门控避让**：折入冷却读数只影响「主动发起的旁路请求」（探针/刷新/回收/自愈），**不覆盖**正常业务派发。因此 `execute_chat` 必须在派发前校验 `is_quarantined`，`get_fallback_candidates` 必须**排除**（而非仅沉底）封禁节点，负载均衡不得把任何请求分流到封禁节点。环内全部封禁时必须**快速失败（503 quarantined）且零上游调用**，严禁以「环内只剩它」为由破例触碰。
+   - **风控拦截必须留下可审计的全量档案，且规避结论不得含糊**：滑动窗口只服务实时避让，封禁历史以「天」计，窗口滑过即不可复盘。因此每家节点的拦截历史、严重度分布与最近一次上游原文必须可从全量台账聚合查询（`GET /v1/admin/risk`）。规避研判必须给出确定性结论而非模棱两可的建议：账号级封禁**不可绕开、重登无效**，只能零误触等待平台解封，严禁在任何面向用户或运维的文案中暗示「重登可解封」；人机验证与令牌失效才可由重登恢复。档案查询必须**只读**，严禁因查询而解除租约或清除冷却。
    - **避让解除后必须经过恢复观察期，严禁解封即满速**：避让只保证「不触碰」，不保证「不再被打进封禁」。多日避让期间被压制的需求会在解封瞬间同时释放，复现当初触发封禁的流量特征。因此任一避让 episode 结束（冷却到期、租约到期或被解除）后，该节点必须先进入恢复观察期：串行放行单个探路握手（并发峰值恒为 1）并放大步调间隔，累计若干次**连续成功**后才毕业恢复常规并发。观察期状态必须随风控台账持久化，严禁通过重启绕过。普通 5xx/超时（上游故障，非账号被标记）不得触发观察期。
 
 ---
@@ -430,7 +446,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_conversation_gc.py && \
 .venv/bin/python tests/test_quarantine.py && \
 .venv/bin/python tests/test_quarantine_hardstop.py && \
-.venv/bin/python tests/test_probation.py
+.venv/bin/python tests/test_probation.py && \
+.venv/bin/python tests/test_risk_dossier.py
 ```
 
 ### 测试矩阵要求：

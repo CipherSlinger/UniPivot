@@ -65,7 +65,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_conversation_gc.py && \
 .venv/bin/python tests/test_quarantine.py && \
 .venv/bin/python tests/test_quarantine_hardstop.py && \
-.venv/bin/python tests/test_probation.py
+.venv/bin/python tests/test_probation.py && \
+.venv/bin/python tests/test_risk_dossier.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -88,6 +89,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_quarantine.py   # Operator long-duration quarantine leases (folded into every cooldown gate + admin API)
 .venv/bin/python tests/test_quarantine_hardstop.py # Quarantine hard-stop at the dispatch boundary (quarantined nodes are never dispatched, even as failover fallbacks)
 .venv/bin/python tests/test_probation.py    # Post-avoidance recovery probation (serialized canary handshakes + widened pacing after a ban lifts)
+.venv/bin/python tests/test_risk_dossier.py # All-time interception dossier, posture derivation, and bypass/re-login avoidance verdicts
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -238,5 +240,11 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - The serialization gate covers *handshake to first chunk* only, not the whole streaming response, and is acquired **before** the concurrency semaphore so requests cannot occupy concurrency slots while queued behind the gate. Because plain 5xx/timeouts are upstream faults rather than account flagging, they never enter probation — no thundering herd to protect against, hence zero regression for existing paths.
     - `GATEWAY_PROBATION_PACING_FACTOR` is applied inside `CooldownTracker.compute_pacing_interval()` (pure, order-correct: base × evidence multiplier × probation multiplier) so it composes with the OPT-014 adaptive multiplier instead of replacing it. Probation state is persisted (`episode_ends`) and survives restarts, since a restart would otherwise be a one-step bypass. `GATEWAY_DISABLE_PROBATION=1` turns it off entirely. Telemetry: `x-risk-probation: 1` header plus `probation.active` / `probation.stats` on `/v1/diagnostics`. See `tests/test_probation.py`.
 
-20. **Web Frontend (`static/index.html`)**:
+20. **Risk-Control Dossier & Avoidance Verdict (`providers/risk_dossier.py`)**:
+    - **[OPT-023] All-time interception record + the "can it be bypassed?" answer**: `recent_interceptions()` is a *sliding window* (24h default), which is right for driving real-time avoidance but wrong for answering the operational question "how many times has this provider been intercepted, for what reasons, can it be worked around, does re-login help?". A per-provider ban window is measured in *days*, so the 24h window has almost always discarded the evidence before the ban lifts. The dossier aggregates the **whole** (bounded) ledger: total count, first/last timestamps, severity breakdown, and the last real upstream message verbatim.
+    - **Posture derivation, fail-closed**: the facts are scattered across four places — quarantine lease, soft cooldown, recovery probation (OPT-022) and the OPT-014 evidence-driven pacing multiplier. They collapse into one posture, heaviest-wins: `quarantined` > `cooling` > `probation` > `watch` > `clear`, each with a `dispatchable` flag. Only a hard lease is non-dispatchable; a soft cooldown stays dispatchable, preserving the last-resort availability semantics of OPT-021.
+    - **Avoidance verdict per severity** (`AVOIDANCE_MATRIX`): each tier answers `technically_bypassable` (never true — no client-side action evades a risk control), `recoverable_by_relogin`, `auto_recovers`, typical span, and a concrete strategy. `auth` (expired token/session) and `waf` (captcha/RGV587) *do* recover via `python login.py <provider>`; `ratelimit` is transient and self-healing, so re-login is pointless; an account-level ban (`ban`) is **not** recoverable by re-login — the ban binds the account, not the token — and the only correct strategy is zero-touch waiting for the platform to lift it. Providers holding a lease are always judged as `ban` regardless of what the ledger says.
+    - **Read-only**: querying the dossier never mutates risk state (no lease cleared, no cooldown reset, no ledger append), so it is safe to expose on diagnostic paths. `GATEWAY_DISABLE_RISK_DOSSIER=1` marks it disabled. Telemetry: `risk_dossier_summary` on `/v1/diagnostics`, full detail (plus `?provider=<key>` for a single node) on `GET /v1/admin/risk`. See `tests/test_risk_dossier.py`.
+
+21. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
