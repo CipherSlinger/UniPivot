@@ -481,6 +481,9 @@ _ERR_TYPE_MAP = {
     "model_not_found": "not_found_error",
     "not_found_error": "not_found_error",
     "invalid_request_error": "invalid_request_error",
+    # [OPT-021] 节点处于运维封禁租约、本次拒绝派发：Anthropic 枚举中最贴近的语义是
+    # 「服务当前无法承接该请求，请稍后重试或改用其他模型」，即 overloaded_error。
+    "quarantined": "overloaded_error",
 }
 
 

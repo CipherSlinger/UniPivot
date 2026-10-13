@@ -206,6 +206,16 @@ PROVIDER_RISK_SPECS = {
 - **配置与运维**：`GATEWAY_QUARANTINE="deepseek:72h,glm:30m,kimi:2026-10-20T00:00:00"` 启动即生效（支持 `s/m/h/d` 后缀与 ISO-8601 绝对时间）；`GET/POST/DELETE /v1/admin/quarantine` 供运行期查看、设定与解除；`GATEWAY_DISABLE_QUARANTINE=1` 关闭；`GATEWAY_QUARANTINE_DIR` 覆盖落盘位置。
 - **遥测**：`/health` 暴露生效中的租约（`quarantine`），`/v1/diagnostics` 暴露完整租约诊断（生效数、明细、统计）。解除人工租约**不会**连带清除真实风控产生的自动冷却。
 
+#### 10. 封禁租约的派发硬阻断 (`providers/failover.py:is_quarantined` / `execute_chat`)
+
+- **问题（实证）**：OPT-020 把租约折入**冷却读数**，因而门控（探针/刷新/会话回收/自愈选举）全部避让；但**派发路径**并未门控——`get_fallback_candidates` 仅把冷却节点**沉底而非排除**，`execute_chat` 更是无条件派发主选节点。实测证明：处于 72h 封禁租约的 `deepseek` 与 `doubao` 在故障转移中**仍被派发真实上游请求**，且该通道随失败次数放大——这是整条风控体系中最宽的隐蔽触碰通道。
+- **语义区分（关键设计）**：软冷却与硬封禁必须分开处理。
+  - **软冷却**：由自动风控触发、时长有界（30s~`GATEWAY_AUTH_COOLDOWN_MAX`），是可自愈的短暂退避——环内全部冷却时允许「最后一搏」，以保可用性。
+  - **硬封禁**：运维长期租约，表达「该账号已被平台封禁」，持续以天计，任何触碰都不可能有正常返回，只会延长封禁——**任何情况下都不派发**。
+- **三道闸口**：① 负载均衡对封禁主选执行同环分流（且绝不分流到封禁节点）；② `get_fallback_candidates` 彻底排除封禁节点；③ `execute_chat` 在派发前逐轮硬校验，命中即改派或失败。
+- **快速失败**：环内全部封禁时返回 `503 / err_type="quarantined"`，**零上游调用**，并在错误信息中给出解除指引（`POST /v1/admin/quarantine`）；Anthropic 协议映射为 `overloaded_error`。
+- **开关**：`GATEWAY_DISABLE_QUARANTINE_HARD_STOP=1` 退回「仅降级」语义。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -349,6 +359,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── test_graceful_drain.py  # 在途请求优雅停机排空测试
 │   ├── test_conversation_gc.py # 临时会话删除持久化队列与有界重试测试
 │   └── test_quarantine.py      # 运维长期封禁租约：解析、落盘恢复、只延长与全门控遵循测试
+│   └── test_quarantine_hardstop.py # 封禁租约的派发硬阻断：零触碰、快速失败与软冷却语义区分测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -378,6 +389,7 @@ PROVIDER_RISK_SPECS = {
    - 临时会话删除同样必须遵守冷却门控：处于避让冷却期的节点暂缓删除其临时会话（记录保留在持久化队列且不消耗重试次数），冷却解除后补做，杜绝「会话回收」成为封禁窗口的又一条隐蔽触碰通道。
    - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
    - 自动冷却存在**时长上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁可持续数天；因此长于冷却上限的封禁**必须**通过运维长期租约表达：`providers/quarantine.py`（`GATEWAY_QUARANTINE` 环境变量或 `POST /v1/admin/quarantine`），租约经 `CooldownTracker.get_remaining_cooldown()` 折入全局冷却读数，使**所有**既有门控自动遵循。租约只延长不缩短，误操作不可能提前放行封禁节点；解除人工租约**不得**连带清除真实风控产生的自动冷却。
+   - **硬封禁必须在派发路径上阻断，而不仅是被门控避让**：折入冷却读数只影响「主动发起的旁路请求」（探针/刷新/回收/自愈），**不覆盖**正常业务派发。因此 `execute_chat` 必须在派发前校验 `is_quarantined`，`get_fallback_candidates` 必须**排除**（而非仅沉底）封禁节点，负载均衡不得把任何请求分流到封禁节点。环内全部封禁时必须**快速失败（503 quarantined）且零上游调用**，严禁以「环内只剩它」为由破例触碰。
 
 ---
 
@@ -401,7 +413,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_adaptive_pacing.py && \
 .venv/bin/python tests/test_graceful_drain.py && \
 .venv/bin/python tests/test_conversation_gc.py && \
-.venv/bin/python tests/test_quarantine.py
+.venv/bin/python tests/test_quarantine.py && \
+.venv/bin/python tests/test_quarantine_hardstop.py
 ```
 
 ### 测试矩阵要求：

@@ -383,6 +383,23 @@ class CooldownTracker:
             lease = 0.0
         return max(remaining, lease)
 
+    def is_quarantined(self, provider_key: str) -> bool:
+        """[OPT-021] 检查节点是否处于**运维长期封禁租约**（硬阻断）。
+
+        与 `is_in_cooldown`（软冷却，仅降级排序）语义不同：
+        - 软冷却由自动风控触发、时长有界（30s~24h），是可自愈的短暂退避，
+          环内全部节点都冷却时「最后一搏」仍可尝试，以免可用性回退；
+        - 运维封禁租约表达的是「该账号已被平台封禁」，持续时间以天计，
+          任何触碰都不会有正常返回，只会延长封禁。因此必须**硬阻断**：
+          既不可作为主选派发，也不可作为故障转移的后备候选，只能快速失败。
+        """
+        if os.getenv("GATEWAY_DISABLE_QUARANTINE_HARD_STOP", "").strip().lower() in ("1", "true", "yes"):
+            return False
+        try:
+            return self.quarantine.remaining(provider_key) > 0.0
+        except Exception:  # noqa: BLE001 - 查询失败时按未封禁处理，绝不误伤正常节点
+            return False
+
     def get_all_cooldowns(self) -> Dict[str, float]:
         """获取所有当前处于冷却���态的节点及剩余冷却时间（秒）"""
         now = time.time()
@@ -682,14 +699,20 @@ class FailoverRouter:
         primary_provider: str,
         primary_model: str,
         excluded_providers: Optional[Set[str]] = None,
+        include_quarantined: bool = False,
     ) -> List[FailoverCandidate]:
         """根据当前主选节点生成同等能力环内的有序候选节点列表。
 
         排序策略：
         1. 排除当前排除集（已尝试失败过的 Provider 以及被主动禁用的 Provider）
-        2. 健康节点排在冷却避让中节点之前
-        3. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
-        4. 同等风险下，按历史失败次数升序排列
+        2. [OPT-021] 排除处于运维长期封禁租约的节点（硬阻断，除非显式放行）
+        3. 健康节点排在冷却避让中节点之前
+        4. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
+        5. 同等风险下，按历史失败次数升序排列
+
+        注意软冷却节点**仍保留在候选中**（仅被沉底）：短时自动冷却属于可自愈退避，
+        环内全部冷却时允许最后一搏以保可用性；而运维封禁租约意味着账号级封禁，
+        触碰不会有正常返回，必须彻底排除。
         """
         ring = classify_capability_ring(primary_provider, primary_model)
         ring_members = RING_DEFINITIONS.get(ring, [])
@@ -700,6 +723,10 @@ class FailoverRouter:
         # 遍历环中所有成员
         for p_key, w_model in ring_members:
             if p_key in excluded or self.cooldown_tracker.is_disabled(p_key):
+                continue
+
+            # [OPT-021] 被封禁租约锁定的账号绝不作为后备候选
+            if not include_quarantined and self.cooldown_tracker.is_quarantined(p_key):
                 continue
 
             meta = PROVIDER_RISK_SPECS.get(p_key)
@@ -756,6 +783,42 @@ class FailoverRouter:
 
         while True:
             tried_providers.add(curr_provider_key)
+
+            # [OPT-021] 硬阻断：运维封禁租约节点在任何情况下都不得被派发真实请求。
+            # 这是整条冷却门控体系的最后一道闸口 —— 即便调用方显式指定了被封禁的
+            # 模型别名，也必须立即改派或快速失败，绝不能因为「环内只剩它」而破例触碰。
+            if self.cooldown_tracker.is_quarantined(curr_provider_key):
+                remaining = self.cooldown_tracker.quarantine.remaining(curr_provider_key)
+                logger.error(
+                    "[封禁硬阻断] 节点 [%s] 处于运维封禁租约 (剩余 %.1f 小时)，拒绝派发上游请求",
+                    curr_provider_key,
+                    remaining / 3600.0,
+                )
+                candidates = self.get_fallback_candidates(
+                    primary_provider_key,
+                    primary_wire_model,
+                    excluded_providers=tried_providers,
+                )
+                if not candidates:
+                    raise ProviderError(
+                        f"目标节点 [{curr_provider_key}:{curr_wire_model}] 处于运维封禁租约"
+                        f"（剩余 {remaining / 3600.0:.1f} 小时），且能力环 [{ring.value}] 内"
+                        f"已无未被封禁的可用节点。为避免延长上游封禁，本次请求已拒绝派发 —— "
+                        f"请使用 POST /v1/admin/quarantine 解除租约，或改用其他厂商模型。",
+                        status=503,
+                        err_type="quarantined",
+                    )
+                next_cand = candidates[0]
+                logger.warning(
+                    "[封禁硬阻断] 改派: [%s] -> [%s] (模型: %s)",
+                    curr_provider_key,
+                    next_cand.provider_key,
+                    next_cand.wire_model,
+                )
+                curr_provider_key = next_cand.provider_key
+                curr_wire_model = next_cand.wire_model
+                continue
+
             sem = self.cooldown_tracker.get_semaphore(curr_provider_key)
 
             try:

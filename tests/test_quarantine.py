@@ -250,11 +250,18 @@ def test_existing_gates_honour_lease():
         picked = pick_healer_model(monitor, "qwen")
         assert picked != "deepseek-chat", "被封禁租约的节点绝不能被选为自愈引擎"
 
-        # 4) 路由选点：候选排序将其沉底并标记 in_cooldown
+        # 4) 路由选点：[OPT-021] 封禁节点被彻底排除出后备候选（硬阻断），
+        #    冷却读数仍准确（供审计视图与门控使用）
         cands = srv.failover_router.get_fallback_candidates("glm", "glm-4-plus")
-        cd_cands = [c for c in cands if c.in_cooldown]
+        assert "deepseek" not in [c.provider_key for c in cands], (
+            "封禁租约节点绝不得出现在路由后备候选中"
+        )
+        audit = srv.failover_router.get_fallback_candidates(
+            "glm", "glm-4-plus", include_quarantined=True
+        )
+        cd_cands = [c for c in audit if c.in_cooldown]
         assert any(c.provider_key == "deepseek" for c in cd_cands), (
-            "租约节点必须在路由候选中被标记冷却"
+            "审计视图中封禁节点必须仍被标记为冷却"
         )
     finally:
         store.clear_all_for_tests()

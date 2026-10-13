@@ -367,8 +367,10 @@ class AdaptiveLoadBalancer:
         """
         ring = classify_capability_ring(primary_provider, primary_model)
 
-        # ------------------------------------------------ 0. 初选提供方主动禁用拦截 (Disabled Provider Redirection)
-        if self.cooldown_tracker.is_disabled(primary_provider):
+        # ------------------------------------------------ 0. 初选提供方主动禁用 / 封禁租约拦截
+        # (Disabled Provider Redirection)
+        quarantined = self.cooldown_tracker.is_quarantined(primary_provider)
+        if self.cooldown_tracker.is_disabled(primary_provider) or quarantined:
             same_ring_candidates = [
                 (pk, wm)
                 for pk, wm in self.ring_definitions.get(ring, [])
@@ -384,7 +386,10 @@ class AdaptiveLoadBalancer:
                 self.get_metrics(primary_provider).record_shed(as_source=True)
                 self.get_metrics(alt_pk).record_shed(as_source=False)
                 reason = (
-                    f"主节点 [{primary_provider}] 已被禁用 (DISABLED_PROVIDERS)，"
+                    f"主节点 [{primary_provider}] 处于运维封禁租约，"
+                    f"同环打散分流至健康备用节点 [{alt_pk}:{alt_model}]"
+                    if quarantined
+                    else f"主节点 [{primary_provider}] 已被禁用 (DISABLED_PROVIDERS)，"
                     f"同环打散分流至健康备用节点 [{alt_pk}:{alt_model}]"
                 )
                 logger.info(f"[负载均衡] 被禁同环分流: {primary_provider}:{primary_model} -> {alt_pk}:{alt_model}")
@@ -431,7 +436,12 @@ class AdaptiveLoadBalancer:
                 original_provider=primary_provider,
                 original_model=primary_model,
                 ring=ring,
-                reason=f"主节点 [{primary_provider}] 已被禁用且无可用备用节点",
+                reason=(
+                    f"主节点 [{primary_provider}] 处于运维封禁租约且无可用备用节点，"
+                    f"交由对等互备网格执行硬阻断（拒绝派发）"
+                    if quarantined
+                    else f"主节点 [{primary_provider}] 已被禁用且无可用备用节点"
+                ),
             )
 
         # ------------------------------------------------ 1. 轻量请求自适应降级 (Query Complexity Degradation)
