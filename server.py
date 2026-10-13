@@ -141,6 +141,10 @@ task_dispatcher = TaskDispatcher(port=PORT)
 # 全局五大模型对等互备路由调度器
 failover_router = FailoverRouter()
 
+# [OPT-012] 将风控冷却状态接入健康探针门控：处于避让冷却期的节点，
+# 周期探针跳过真实网络调用，杜绝持续触碰已被上游风控封禁的节点。
+health_monitor.set_cooldown_probe_gate(failover_router.cooldown_tracker.get_remaining_cooldown)
+
 # 全局自适应流量整形器（并发与反爬步调控制）
 traffic_pacer = get_traffic_pacer()
 traffic_pacer.cooldown_tracker = failover_router.cooldown_tracker
@@ -862,6 +866,8 @@ async def get_diagnostics():
             raw_status = "disabled"
         elif not configured or raw_status == "offline":
             h_status = "unhealthy"
+        elif raw_status == "cooling":
+            h_status = "cooling"
         elif raw_status == "recovering" or consec_fails >= 2:
             h_status = "failing"
         elif raw_status == "degraded" or consec_fails == 1:
@@ -925,6 +931,7 @@ async def get_diagnostics():
         "last_check_timestamp": float(last_check_ts),
         "last_check": float(last_check_ts),
         "check_count": int(getattr(health_monitor, "check_count", 0)),
+        "cooldown_probe_skips": health_monitor.get_probe_skip_stats(),
         "current_healing_task": current_healing_task,
         "running_tasks": running_tasks,
         "active_count": len(running_tasks),

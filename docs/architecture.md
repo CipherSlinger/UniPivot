@@ -164,6 +164,12 @@ PROVIDER_RISK_SPECS = {
 - **严重度分级**：`auth > ratelimit > waf` 三级。认证失效仅在连续 ≥3 次后按 2 的幂次升级为长效冷却（`GATEWAY_AUTH_COOLDOWN_BASE` × 2ⁿ，封顶 `GATEWAY_AUTH_COOLDOWN_MAX=86400s`），首次失败仍维持既有短冷却，避免误锁刚完成重登的健康节点。
 - **遥测**：`GET /v1/diagnostics` 暴露 `risk_ledger` 段，`GET /health` 输出 24h 汇总；`GATEWAY_DISABLE_RISK_LEDGER=1` 可无损退化为纯内存冷却。
 
+#### 6. 风控感知健康探针门控 (`healing/monitor.py`)
+
+- **冷却即静默**：`HealthMonitor` 每次周期探针前先查询 `CooldownTracker` 剩余冷却；处于避让冷却期的节点直接标记为 `cooling` 并**跳过真实网络探针**，杜绝「每 300s 一次探针持续触碰已封禁节点」而人为延长封禁窗口。
+- **风控与故障解耦**：冷却期探针既不累计 `consecutive_failures` 也不触发自愈，避免把风控封禁误判为节点故障而派发无效热修复风暴。
+- **遥测**：`/v1/diagnostics` 的 `healing_status.cooldown_probe_skips` 输出各节点被门控跳过的探针计数；`GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1` 可无损回退。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -309,6 +315,7 @@ PROVIDER_RISK_SPECS = {
    - 遇到人机验证（RGV587 / 验证码）时，立即对该 Provider 施加冷却，自动切流至备用节点，并在日志中明确提示用户执行 `python login.py <provider>` 进行人机滑块解锁。
    - 冷却避让必须跨进程重启持续生效：所有冷却截止时间与连续失败计数经 `providers/risk_ledger.py` 原子落盘，重启后自动恢复，严禁通过重启「抹除」避让状态而重新触碰已封禁节点。
    - 账号级风控封禁无法通过技术手段绕开：唯一正确策略是识别、退避并在封禁窗口内零误触，等待平台自然解封；重登仅能恢复「令牌/会话失效」一类，对账号级封禁无效。
+   - 健康探针同样必须遵守冷却门控：处于避让冷却期的节点禁止发起任何真实上游探针（含自愈复检），杜绝「周期探针」成为持续触碰已封禁节点的隐蔽通道。
 
 ---
 

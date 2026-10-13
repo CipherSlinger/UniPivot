@@ -56,7 +56,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_disconnect.py && \
 .venv/bin/python tests/test_token_cache.py && \
 .venv/bin/python tests/test_lifecycle.py && \
-.venv/bin/python tests/test_risk_ledger.py
+.venv/bin/python tests/test_risk_ledger.py && \
+.venv/bin/python tests/test_probe_gate.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -71,6 +72,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_token_cache.py  # Deterministic token-count memoization, bounded LRU, and count_tokens endpoint integration
 .venv/bin/python tests/test_lifecycle.py    # Request lifecycle finalization, flight-group abort terminality, and load-balancer quota reclamation
 .venv/bin/python tests/test_risk_ledger.py  # Risk-control severity tiers, durable cross-restart cooldowns, and the JSONL interception ledger
+.venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating (banned nodes are never re-probed)
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -189,5 +191,9 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - Severity tiers `auth > ratelimit > waf`: repeated (≥3) auth failures escalate to a long cooldown (`GATEWAY_AUTH_COOLDOWN_BASE` × 2ⁿ, capped by `GATEWAY_AUTH_COOLDOWN_MAX`), while a first auth failure keeps the short legacy cooldown so a re-login never locks a healthy node for an hour.
     - Exposes `risk_ledger` diagnostics via `/v1/diagnostics` and a 24h summary via `/health`; `GATEWAY_DISABLE_RISK_LEDGER=1` degrades to pure in-memory cooldowns. See `tests/test_risk_ledger.py`.
 
-12. **Web Frontend (`static/index.html`)**:
+12. **Cooldown-Aware Health Probe Gate (`healing/monitor.py`)**:
+    - `HealthMonitor` consults `CooldownTracker` before every probe: a node in a risk-avoidance cooldown is marked `cooling` and the real network probe is skipped entirely. Without this the 300s audit loop re-poked an upstream-banned node every interval, lengthening the ban window — exactly the failure mode the durable ledger guards against, one layer up.
+    - Cooling probes neither increment `consecutive_failures` nor trigger self-healing, so a risk ban is never misread as a node fault; `GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1` disables the gate and `/v1/diagnostics` exposes `healing_status.cooldown_probe_skips`. See `tests/test_probe_gate.py`.
+
+13. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

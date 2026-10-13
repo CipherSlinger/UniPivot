@@ -1,7 +1,7 @@
 """健康探测与定时审计器 (healing/monitor.py)。
 
 维护所有 Provider 的健康状态：
-- status: "healthy" | "degraded" | "recovering" | "offline"
+- status: "healthy" | "degraded" | "recovering" | "offline" | "cooling"
 - last_check: float
 - last_error: Optional[str]
 - consecutive_failures: int
@@ -11,6 +11,9 @@
 - 启动时后台初始探测（不阻塞主服务启动）。
 - 定时周期探测（默认 300 秒，通过 HEAL_CHECK_INTERVAL 配置）。
 - 发现失效时触发自愈引擎。
+- 风控冷却门控 [P0] OPT-012：若节点正处于风控避让冷却期（CooldownTracker），
+  则跳过真实网络探针——否则每 300 秒一次的探针会持续触碰已被上游风控封禁的
+  节点，人为延长封禁窗口。冷却期内既不探测也不计失败、不触发自愈。
 """
 
 from __future__ import annotations
@@ -32,11 +35,13 @@ logger = logging.getLogger("healing.monitor")
 
 @dataclass
 class ProviderHealth:
-    status: str = "healthy"  # "healthy" | "degraded" | "recovering" | "offline"
+    status: str = "healthy"  # "healthy" | "degraded" | "recovering" | "offline" | "cooling"
     last_check: float = 0.0
     last_error: Optional[str] = None
     consecutive_failures: int = 0
     configured: bool = False
+    cooldown_remaining: float = 0.0  # 风控避让剩余冷却秒数 (0 表示不在避让期)
+
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -74,6 +79,9 @@ class HealthMonitor:
         self._healer_trigger: Optional[Callable[[str, Optional[str]], Any]] = None
         self._loop_task: Optional[asyncio.Task] = None
         self._running = False
+        # [OPT-012] 风控冷却门控：返回节点剩余冷却秒数的回调 (>0 表示处于避让期)
+        self._cooldown_probe_gate: Optional[Callable[[str], float]] = None
+        self._probe_skip_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
         self._check_locks: Dict[str, asyncio.Lock] = {
             name: asyncio.Lock() for name in self._states
         }
@@ -102,6 +110,33 @@ class HealthMonitor:
     def set_healer_trigger(self, trigger: Callable[[str, Optional[str]], Any]) -> None:
         """设置当探测失效时触发自愈的回调函数。"""
         self._healer_trigger = trigger
+
+    def set_cooldown_probe_gate(self, gate: Callable[[str], float]) -> None:
+        """[OPT-012] 注册风控冷却查询回调：入参 provider 名，返回剩余冷却秒数。
+
+        返回 > 0 时表示该节点正处风控避让期，周期探针必须跳过真实网络调用，
+        以免持续触碰已被上游封禁的节点而延长封禁窗口。
+        """
+        self._cooldown_probe_gate = gate
+
+    def _probe_cooldown_remaining(self, name: str) -> float:
+        """查询节点剩余风控冷却秒数（未注册回调或已关闭门控时返回 0）。"""
+        if os.getenv("GATEWAY_DISABLE_PROBE_COOLDOWN_GATE", "").strip().lower() in ("1", "true", "yes"):
+            return 0.0
+        gate = self._cooldown_probe_gate
+        if gate is None:
+            return 0.0
+        try:
+            return max(0.0, float(gate(name)))
+        except Exception:  # noqa: BLE001 - 门控查询失败绝不阻断探测流程
+            return 0.0
+
+    def get_probe_skip_stats(self) -> Dict[str, Any]:
+        """[OPT-012] 返回被冷却门控跳过的探针统计。"""
+        return {
+            "total": int(self._probe_skip_stats.get("total", 0)),
+            "per_provider": dict(self._probe_skip_stats.get("per_provider", {})),
+        }
 
     def get_status(self, name: str) -> Optional[Dict[str, Any]]:
         if self.is_disabled(name):
@@ -232,8 +267,31 @@ class HealthMonitor:
                 logger.info("Provider %s 正在自愈修复中，跳过普通周期探测", name)
                 return True, None
 
+            # [OPT-012] 风控冷却门控：避让冷却期内绝不发起真实探针，
+            # 既不触碰已封禁节点（避免延长封禁窗口），也不计入失败或触发自愈。
+            cooldown_remaining = self._probe_cooldown_remaining(name)
+            if cooldown_remaining > 0:
+                st = self._states[name]
+                st.status = "cooling"
+                st.last_check = time.time()
+                st.cooldown_remaining = round(cooldown_remaining, 1)
+                st.last_error = (
+                    f"风控避让冷却中 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针以规避上游封禁"
+                )
+                self._probe_skip_stats["total"] += 1
+                per = self._probe_skip_stats["per_provider"]
+                per[name] = per.get(name, 0) + 1
+                logger.warning(
+                    "[探针冷却门控] 节点 [%s] 处于风控避让冷却期 (剩余 %.0fs)，本轮跳过真实探针，"
+                    "避免加剧上游封禁",
+                    name,
+                    cooldown_remaining,
+                )
+                return False, st.last_error
+
             self.check_count += 1
             self.last_check_timestamp = time.time()
+            self._states[name].cooldown_remaining = 0.0
 
             resolver = self._provider_resolvers.get(name)
             if resolver:

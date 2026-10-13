@@ -3105,7 +3105,11 @@ function setProviderBadge(name, isReady, label, info) {
 
   const status = info ? info.status : (isReady ? "healthy" : "offline");
 
-  if (info && info.in_cooldown) {
+  if (info && info.status === "cooling") {
+    pill.className = "status-pill recovering";
+    const rem = info.remaining_cooldown || info.remaining_cooldown_seconds || 0;
+    pill.title = `${label}：风控避让冷却中，已跳过健康探针 (剩余 ${rem}s)`;
+  } else if (info && info.in_cooldown) {
     pill.className = "status-pill recovering";
     const rem = info.remaining_cooldown || info.remaining_cooldown_seconds || 0;
     pill.title = `${label}：已熔断避让 (剩余冷却 ${rem}s)`;

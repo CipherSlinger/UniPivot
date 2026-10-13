@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 18:29:26",
+  "generated_at": "2026-10-13 18:43:52",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -156,6 +156,16 @@
       "priority": "P0",
       "description": "将各 Provider 的冷却截止时间与连续失败计数以 POSIX 原子写（os.replace + os.fsync，目录 0o700 / 文件 0o600）持久化落盘，进程重启后自动恢复避让状态，杜绝「重启即重置避让、立刻再次触碰已被上游风控封禁的节点」导致封禁窗口被高频重试无限延长的风险；对每一次风控 / WAF 人机验证 / 认证失效拦截以 JSONL 追加落盘，形成可审计、可跨重启检索的长期风控画像，超限自动裁剪；引入 auth > ratelimit > waf 三级严重度分级，认证失效仅在连续 ≥3 次后按 2 的幂次升级为长效冷却（受 GATEWAY_AUTH_COOLDOWN_MAX 封顶），首次失败仍维持既有短冷却以避免误锁刚完成重登的健康节点。",
       "expected_impact": "冷却避让跨进程重启持续生效，被风控封禁节点在恢复窗口内零误触，封禁窗口不再被人为延长；全量拦截事件可审计可回溯，风控画像一目了然；GATEWAY_DISABLE_RISK_LEDGER=1 可无损退化为纯内存冷却，零行为回退风险。"
+    },
+    {
+      "id": "OPT-012",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控治理与避让",
+      "title": "风控感知健康探针门控 (Cooldown-Aware Health Probe Gate)",
+      "priority": "P0",
+      "description": "健康监控的周期探针（默认 300s）此前无差别发起真实上游调用，导致已被上游风控封禁的节点被每隔数分钟持续触碰，人为延长封禁窗口——这与 OPT-011 的持久化避让目标在同一条链路上相互抵消。本次将 CooldownTracker 冷却状态接入 HealthMonitor 探针门控：处于避让冷却期的节点标记为 cooling 并跳过真实网络探针，既不触碰已封禁节点，也不累计失败计数、不触发自愈（避免把风控封禁误判为节点故障而派发无效热修复）。",
+      "expected_impact": "被风控封禁节点在整个冷却窗口内零探针触碰，封禁恢复不再被人为延长；风控封禁与真实节点故障彻底解耦，杜绝无效自愈风暴；GATEWAY_DISABLE_PROBE_COOLDOWN_GATE=1 可无损回退，/v1/diagnostics 暴露 cooldown_probe_skips 审计指标。"
     }
   ],
   "system_health": "good"
