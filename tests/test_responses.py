@@ -30,6 +30,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # [OPT-019] 隔离运行：风控冷却台账 / 会话回收队列在 TESTING=1 下写入临时目录，
 # 杜绝测试运行污染开发者真实 session/ 目录，并消除用例间的持久化状态串扰。
 os.environ["TESTING"] = "1"
+# [OPT-025] 本套件用 mock Provider 刻意模拟「同一请求沿能力环依次 401」以验证错误转换与
+# 故障转移元数据，而这恰好是 OPT-025「全环凭证失效」的判定条件本身。此处关闭该检测器，
+# 使本套件继续聚焦其设计目标（逐节点 401 -> 客户端错误转换）。整环 401 -> 503
+# credential_outage 的新语义由 tests/test_credential_watch.py 专测。
+os.environ["GATEWAY_DISABLE_CREDENTIAL_WATCH"] = "1"
 os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
 os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
 os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"

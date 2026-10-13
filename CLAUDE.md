@@ -67,7 +67,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_quarantine_hardstop.py && \
 .venv/bin/python tests/test_probation.py && \
 .venv/bin/python tests/test_risk_dossier.py && \
-.venv/bin/python tests/test_risk_correlation.py
+.venv/bin/python tests/test_risk_correlation.py && \
+.venv/bin/python tests/test_credential_watch.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -92,6 +93,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_probation.py    # Post-avoidance recovery probation (serialized canary handshakes + widened pacing after a ban lifts)
 .venv/bin/python tests/test_risk_dossier.py # All-time interception dossier, posture derivation, and bypass/re-login avoidance verdicts
 .venv/bin/python tests/test_risk_correlation.py # Cross-provider risk correlation: systemic escalation detection and the global pacing governor
+.venv/bin/python tests/test_credential_watch.py # Whole-ring credential outage: distinct-node threshold, TTL probe, zero-upstream-call fast-fail
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -255,5 +257,12 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - **Global pacing governor**: `systemic` multiplies every node's interval by `GATEWAY_RISK_CORRELATION_SYSTEMIC_FACTOR` (default 2.0), `widespread` by `GATEWAY_RISK_CORRELATION_WIDESPREAD_FACTOR` (default 1.25). This composes as a fourth factor in `CooldownTracker.compute_pacing_interval` and in `TrafficPacer`, so it multiplies with the OPT-014 evidence factor and the OPT-022 probation factor rather than replacing either. The multiplier is TTL-cached (`GATEWAY_RISK_CORRELATION_CACHE_TTL`, default 15s) because the pacing path is hot, and defaults to **1.0** whenever there is no correlation evidence — zero regression.
     - Each grade carries a playbook stating explicitly whether `rotate_node_helps` and `per_account_avoidance_helps`. Telemetry: `risk_correlation` on `/v1/diagnostics`, full report at `GET /v1/admin/risk/correlation`. `GATEWAY_DISABLE_RISK_CORRELATION=1` disables. See `tests/test_risk_correlation.py`.
 
-22. **Web Frontend (`static/index.html`)**:
+22. **Whole-Ring Credential Outage & Fast-Fail (`providers/credential_watch.py`)**:
+    - **[OPT-025] Live evidence — the outage was misdiagnosed as a WAF ban**: the risk ledger recorded 335 interceptions over 80 minutes, of which **312 were `auth` (401), not `waf`**, with all five providers returning 401 in the *same second*, repeating every ~7 minutes. Five independent token expiries in the same second is not a coincidence: the real sequence is **one client request failing over through all five nodes, every node rejecting on an expired credential**, so a single request emits five auth records in one second. The ring has zero serving capacity — failover cannot possibly succeed.
+    - **The storm is itself the risk trigger**: with no usable credentials the gateway still walked all five nodes for every client request. 335 failed requests carrying invalid credentials in 80 minutes is exactly the *automated credential attempts* signature upstream WAFs score on — the storm was itself inflating the risk score, plausibly contributing to the bans. So the correct behaviour is not "retry harder" but **stop immediately**, which is precisely what a per-node cooldown cannot express: each node cooling independently still lets the whole ring be walked.
+    - **Semantics distinct from everything else**: a soft cooldown is per-node, time-capped and self-healing; a quarantine lease (OPT-020/021) is per-node, operator-declared and measured in days. A credential outage is **ring-wide**, needs no operator declaration, and recovers the instant credentials are renewed — it is not "this node has a problem" but "we have no usable credentials", so the remedy is re-login, not avoidance. Detection is by **distinct providers** (as in OPT-024, not by failure count): `GATEWAY_CREDENTIAL_OUTAGE_MIN_PROVIDERS` (default 3) different providers auth-failing within `GATEWAY_CREDENTIAL_OUTAGE_WINDOW` (default 300s) trips it.
+    - **Fast-fail at the dispatch boundary**: checked at the top of `execute_chat`'s dispatch loop — *before* the OPT-021 quarantine branch and before any provider is even instantiated — so the request is refused with `503 / err_type="credential_outage"` and **zero upstream calls** (`authentication_error` in the Anthropic protocol, the closest enum, since Anthropic has no credential-outage type). The message names the dead providers and tells the operator to run `.venv/bin/python login.py all`.
+    - **Never wedges**: the state carries a TTL (`GATEWAY_CREDENTIAL_OUTAGE_TTL`, default 120s) after which exactly one request is let through as a probe; if the ring is still 401ing, the very first failure re-arms it. Probing therefore degrades from "once per client request" to "once per TTL" — the storm is flattened with no possibility of the state deadlocking into permanent refusal. A single success (`record_success` → `note_success`) drops that provider from the failed set, so capacity returning below the threshold **immediately resumes dispatch** (fail-open). `GATEWAY_DISABLE_CREDENTIAL_WATCH=1` disables it (and `GATEWAY_DISABLE_RISK_LEDGER=1` co-disables, matching the quarantine convention so pure in-memory cooldown suites are unaffected). Telemetry: `credential_outage` on `/v1/diagnostics`, `GET/DELETE /v1/admin/credential-outage` to inspect the state and to lift it immediately after re-login. See `tests/test_credential_watch.py`.
+
+23. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

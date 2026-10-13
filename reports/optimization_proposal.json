@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 21:01:45",
+  "generated_at": "2026-10-13 21:26:29",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -286,6 +286,16 @@
       "priority": "P0",
       "description": "OPT-011~OPT-023 的全部避让逻辑都以单个 Provider 账号为单位：该账号被拦就冷却它、封禁它、观察它。但风控拦截存在第二种成因——我们自己的客户端足迹（请求头指纹、UA、设备参数、出口 IP、时间分布）被平台标记，此时各账号被拦并非彼此独立而是同一根因的多个表现。两种成因需要**完全相反**的应对：单账号成因下换节点继续打是正确的；系统性成因下换节点毫无用处——新节点会以同样足迹被立即拦下，继续轮换只会逐个把剩余账号也送进封禁，是此时最危险的操作。而单账号视角永远看不到这一层，它把每次拦截都解释为「这家风控严」，于是一个接一个消耗掉全部五个账号。本次新增 providers/risk_correlation.py：以风控台账为唯一输入（只读），关联性以**去重节点数**而非拦截次数衡量——同一账号被拦百次仍是单账号问题，多个不同账号在同一突发子窗口内被集中拦截才几乎不可能彼此独立；用双指针滑动窗口（O(n)）计算 GATEWAY_RISK_CORRELATION_BURST_WINDOW（默认 120s）内的去重节点峰值，分级为 none < localized < widespread < systemic（突发去重数达阈值即判 systemic，强信号优先；时间分散则判 widespread 仅轻量压制并提示人工确认）。systemic 时对**所有**节点统一放大调用间隔（默认 ×2.0），作为第四个因子作用于 CooldownTracker.compute_pacing_interval 与 TrafficPacer，与 OPT-014 单节点证据倍率、OPT-022 观察期倍率相乘而非替换。每一级显式声明 rotate_node_helps 与 per_account_avoidance_helps，使「换节点是否有用」成为可查询的确定性结论。",
       "expected_impact": "补上整个风控体系唯一的**根因层**盲区：此前只能逐个账号避让，无法回答「为什么短时间内多个账号接连被拦」。现在可确定性区分单账号事件与系统性事件，并在系统性事件上自动整体降速（并明确告知继续轮换节点只会逐个葬送剩余账号），从「一个接一个失去账号」转为「第一时间止损并更换客户端身份特征」。倍率带 TTL 缓存（默认 15s）以适配高频步调路径，无关联证据时恒为 1.0、台账不可用亦降级为 1.0，对既有行为零回归；研判全程只读。GET /v1/admin/risk/correlation 与 /v1/diagnostics 提供完整可观测性，GATEWAY_DISABLE_RISK_CORRELATION=1 可关闭。"
+    },
+    {
+      "id": "OPT-025",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "凭证可用性与风控风暴治理",
+      "title": "全环凭证失效检测与快速失败 (Whole-Ring Credential Outage Fast-Fail)",
+      "priority": "P0",
+      "description": "真实台账证据纠正了此前的误判：session/risk_ledger.jsonl 显示 80 分钟内五个节点被记录 335 次拦截，其中 auth 类占 312 次，waf 类极少——这次故障不是风控封禁而是整环凭证失效；更关键的是五个节点在**同一秒**内同时返回 401（19:36:11、19:44:22…），每约 7 分钟重复一次。五个节点在同一秒各自独立过期概率上不可能，真实过程是**一个客户端请求沿能力环依次故障转移、五个节点全部以 401 拒绝**，单个请求即在 1 秒内产生 5 条 auth 记录，整环容量为零、故障转移不可能成功。危害不止于浪费：环内无可用凭证时网关仍会为每个客户端请求打满五个节点，80 分钟 335 次带无效凭证的失败请求恰好是上游 WAF 眼中「自动化凭证尝试」的流量特征——**风暴本身就是风控触发器**，很可能正是账号被封的成因之一。而这是单节点冷却**无法表达**的：每个节点各自冷却，整环仍会被完整走一遍。本次新增 providers/credential_watch.py：判定依据为**去重节点数**（同 OPT-024 而非失败次数），GATEWAY_CREDENTIAL_OUTAGE_MIN_PROVIDERS（默认 3）个不同节点在 GATEWAY_CREDENTIAL_OUTAGE_WINDOW（默认 300s）内相继认证失败即进入失效态；检查点位于 execute_chat 派发循环最前（在 OPT-021 封禁硬阻断之前、且在任何 Provider 实例化之前），请求以 503 / err_type=credential_outage 被拒绝且**零上游调用**（Anthropic 映射为 authentication_error），错误文案点名失效节点并给出重登指引。语义与既有机制严格区分：软冷却=单节点/有时长上限/自动解除，封禁租约=单节点/运维声明/以天计，凭证失效=**整环**/无需声明/凭证更新即刻恢复——处置方式是重登而非避让。此外状态带 TTL（默认 120s）自动失效以保证**永不卡死**：到期放行恰好一次探路，仍 401 则首次失败即重建；探测频率由「每个客户端请求一次」退化为「每 TTL 一次」；任一节点成功即摘除，容量回到阈值以上立刻恢复派发（fail-open）。",
+      "expected_impact": "把一次被误判为「风控封禁」的真实故障（整环凭证失效）固化为可检测、可止血、可自愈的机制：失效期间请求快速失败且零上游调用，从源头掐断「无效凭证风暴」这一自身制造的风控触发源；同时给出明确且唯一正确的运维动作（.venv/bin/python login.py all），并在重登成功后由 DELETE /v1/admin/credential-outage 立即解除或由 TTL/成功调用自动解除。TTL 探路与单次成功即恢复派发保证了可用性下限（绝不因状态卡死而永久拒绝服务），GATEWAY_DISABLE_CREDENTIAL_WATCH=1 可关闭，/v1/diagnostics 暴露 credential_outage 完整可观测。"
     }
   ],
   "system_health": "good"

@@ -49,6 +49,7 @@ from typing import (
 )
 
 from .base import ProviderError
+from .credential_watch import get_credential_watch
 from .quarantine import get_quarantine_store
 from .risk_correlation import get_risk_correlation
 from .risk_ledger import (
@@ -329,6 +330,8 @@ class CooldownTracker:
         self.risk_ledger = get_risk_ledger()
         # [OPT-020] 运维人工长期封禁租约：折入冷却读数，使所有门控自动遵循
         self.quarantine = get_quarantine_store()
+        # [OPT-025] 全环凭证失效检测：整环 401 时快速失败，杜绝"无效凭证风暴"
+        self.credential_watch = get_credential_watch()
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
         self._episode_ends: Dict[str, float] = {}
@@ -650,6 +653,15 @@ class CooldownTracker:
             # 如果已有更长的冷却期，保留较长者
             self._cooldowns[provider_key] = max(self._cooldowns.get(provider_key, 0.0), end_time)
 
+            # [OPT-025] 认证失效还需上报全环检测器：若多个**不同**节点在同一窗口内
+            # 相继 401，说明整环凭证已失效，故障转移不可能成功——必须快速失败而非
+            # 逐个打满五个节点（那正是上游眼中的「自动化凭证尝试」流量特征本身）。
+            if severity == SEVERITY_AUTH or is_auth_error:
+                try:
+                    self.credential_watch.note_auth_failure(provider_key)
+                except Exception:  # noqa: BLE001 - 检测器异常绝不影响冷却主流程
+                    pass
+
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
             if is_risk or is_waf_or_rate or is_auth_error:
@@ -684,6 +696,11 @@ class CooldownTracker:
         async with self._lock:
             # [OPT-022] 观察期内的成功计入毕业进度（须在清除 episode 之前判定）
             self._note_probation_success(provider_key)
+            # [OPT-025] 该节点已能用有效凭证成功调用 -> 从全环失效集合中摘除
+            try:
+                self.credential_watch.note_success(provider_key)
+            except Exception:  # noqa: BLE001
+                pass
             self._failure_counts[provider_key] = 0
             self._cooldowns.pop(provider_key, None)
             self._persist_state()
@@ -1003,6 +1020,32 @@ class FailoverRouter:
 
         while True:
             tried_providers.add(curr_provider_key)
+
+            # [OPT-025] 全环凭证失效快速失败：当多个不同节点在同一窗口内相继 401，
+            # 说明我们没有可用凭证，故障转移不可能成功。此时继续逐个打满五个节点，
+            # 恰恰是上游 WAF 眼中的「自动化凭证尝试」流量特征——风暴本身就是风控触发器。
+            # 故立即拒绝派发（零上游调用），并给出重登指引；TTL 后自动放行探路。
+            try:
+                outage = self.cooldown_tracker.credential_watch.is_outage_active()
+            except Exception:  # noqa: BLE001
+                outage = False
+            if outage:
+                failed = self.cooldown_tracker.credential_watch.active_failures()
+                self.cooldown_tracker.credential_watch.note_fast_fail()
+                logger.error(
+                    "[凭证失效快速失败] 整环凭证失效 (%s)，拒绝派发以避免无效凭证风暴",
+                    ",".join(failed) or "-",
+                )
+                raise ProviderError(
+                    "全部/多数上游节点的认证凭证已失效 ("
+                    + (", ".join(failed) if failed else "unknown")
+                    + ")，故障转移不可能成功。为避免持续制造无效凭证请求（上游会将其视为"
+                    "自动化凭证尝试并可能加剧风控），本次请求已拒绝派发并且未产生任何上游调用。"
+                    "请执行 `.venv/bin/python login.py all` 重新登录全部厂商。"
+                    "解除后也可用 DELETE /v1/admin/credential-outage 立即清除该状态。",
+                    status=503,
+                    err_type="credential_outage",
+                )
 
             # [OPT-021] 硬阻断：运维封禁租约节点在任何情况下都不得被派发真实请求。
             # 这是整条冷却门控体系的最后一道闸口 —— 即便调用方显式指定了被封禁的

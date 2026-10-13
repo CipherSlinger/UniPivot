@@ -112,6 +112,7 @@ from providers.singleflight import (
     stream_follower_gen,
     terminate_aborted_group,
 )
+from providers.credential_watch import credential_watch, get_credential_watch
 from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
 from providers.risk_correlation import get_risk_correlation, risk_correlation
 from providers.risk_dossier import get_risk_dossier, risk_dossier
@@ -1234,6 +1235,8 @@ async def get_diagnostics():
         "risk_dossier_summary": risk_dossier.build()["summary"],
         # [OPT-024] 跨节点风控关联与系统性升级研判
         "risk_correlation": risk_correlation.evaluate(),
+        # [OPT-025] 全环凭证失效检测（整环 401 时快速失败，避免无效凭证风暴）
+        "credential_outage": credential_watch.get_diagnostics(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1360,6 +1363,28 @@ async def get_risk_correlation_report():
     后者只能通过整体降速与更换客户端身份特征应对。
     """
     return JSONResponse(risk_correlation.evaluate())
+
+# [OPT-025] 整环凭证失效检测：查询 / 手动解除。
+# 与「冷却」(单节点、自动) 和「封禁租约」(单节点、运维声明) 不同，本状态是**整环**的
+# 「我们没有可用凭证了」，处置方式是重新登录而非避让；重新登录成功后可用 DELETE 立即解除。
+@app.get("/v1/admin/credential-outage")
+@app.get("/admin/credential-outage")
+async def get_credential_outage(provider: Optional[str] = None):
+    return JSONResponse(get_credential_watch().get_diagnostics())
+
+
+@app.delete("/v1/admin/credential-outage")
+@app.delete("/admin/credential-outage")
+async def clear_credential_outage(reason: Optional[str] = None):
+    watch = get_credential_watch()
+    before = watch.get_diagnostics()
+    watch.clear(reason or "manual")
+    return JSONResponse({
+        "status": "ok",
+        "was_active": before["outage_active"],
+        "cleared_providers": before["failed_providers"],
+        "outage": watch.get_diagnostics(),
+    })
 
 
 # ---------------------------------------------------------------- 优化空间报告接口

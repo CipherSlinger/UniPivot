@@ -484,6 +484,10 @@ _ERR_TYPE_MAP = {
     # [OPT-021] 节点处于运维封禁租约、本次拒绝派发：Anthropic 枚举中最贴近的语义是
     # 「服务当前无法承接该请求，请稍后重试或改用其他模型」，即 overloaded_error。
     "quarantined": "overloaded_error",
+    # [OPT-025] 整环凭证失效、请求被快速失败拒绝：Anthropic 枚举中没有「凭证故障」这一类，
+    # 语义最贴近的是 authentication_error（本网关确实无法用当前凭证完成认证），
+    # 故归入该枚举，便于客户端识别为「需重新认证/联系运维」而非「上游过载」。
+    "credential_outage": "authentication_error",
 }
 
 
