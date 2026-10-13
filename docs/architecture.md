@@ -182,6 +182,13 @@ PROVIDER_RISK_SPECS = {
 - **冷却即暂缓**：启动时的静默令牌刷新先查询 `CooldownTracker`，处于风控避让冷却期的节点**暂缓刷新**——对已被上游封禁的账号发起登录/刷新请求同样会被风控记录并加剧封禁。
 - **有界延迟补刷**：被暂缓的节点交由后台线程在冷却解除后补做刷新（每 `GATEWAY_REFRESH_DEFER_POLL`(默认 300s) 检查一次，最多等待 `GATEWAY_REFRESH_DEFER_MAX_WAIT`(默认 24h)），超时放弃本轮，**绝不无限阻塞**，避免「跳过即永久放弃」的功能回退。
 
+#### 8. 远端临时会话删除的持久化重试队列 (`providers/conversation_gc.py`)
+
+- **远端防膨胀**：无痕调用（调用方未提供 `conversation_id`）会在上游网页端留下临时会话，网关在响应结束后删除之。历史实现仅 `asyncio.create_task(provider.delete_conversation(cid))` 即发即忘：删除失败或进程重启即永久丢失该动作，用户侧边栏持续堆积临时会话。
+- **持久化队列**：待删除会话以 POSIX 原子写（`os.replace` + `os.fsync`，目录 `0o700` / 文件 `0o600`）落盘，进程重启后自动恢复，并由启动排空 + 周期后台 drain 重试。
+- **有界重试**：失败累计尝试次数，达到 `GATEWAY_CONVERSATION_GC_MAX_ATTEMPTS`（默认 5）后放弃并记日志，杜绝无界重试与队列无界增长。
+- **遥测**：`GET /v1/diagnostics` 暴露 `conversation_gc` 段（待删除数、成功/失败/重试/放弃计数）；`GATEWAY_DISABLE_CONVERSATION_GC=1` 可无损退化为历史即发即忘行为。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -247,6 +254,17 @@ PROVIDER_RISK_SPECS = {
 │   ├── http_client.py          # 全局 HTTP/2 共享连接池单例维护与优雅关闭
 │   ├── anthropic_compat.py     # Anthropic Messages API 协议双向映射与 Tool Call 解析器
 │   ├── responses_compat.py     # OpenAI Responses API (/v1/responses) 协议转译器
+│   ├── risk_ledger.py          # 风控拦截持久化台账：严重度分级、JSONL 审计、冷却状态跨重启恢复
+│   ├── conversation_gc.py      # 远端临时会话删除的持久化重试队列（跨重启防泄漏、有界重试）
+│   ├── session_affinity.py     # 会话亲和与跨模型状态移交引擎（LRU/TTL、异构上游会话 ID 剥离）
+│   ├── singleflight.py         # 单飞去重与流式扇出引擎（SHA-256 指纹、Leader/Follower 广播）
+│   ├── token_counter_cache.py  # Token 计量结果缓存
+│   ├── disconnect_guard.py     # 客户端断连守护：上游请求随之取消，杜绝无效负载
+│   ├── tool_streamer.py        # 流式工具调用推测解析与 JSON 自愈修复
+│   ├── prompt_optimizer.py     # 提示词折叠优化与遥测头
+│   ├── json_repair.py          # 截断/畸形 JSON 的自愈修复解析器
+│   ├── prompt_cache.py         # 提示词前缀缓存
+│   ├── load_balancer.py        # 自适应负载均衡器（结合冷却状态选择节点）
 │   ├── qwen/                   # 通义千问国内版逆向适配模块
 │   │   ├── __init__.py
 │   │   └── provider.py         # v2 API 封装、RGV587 WAF 人机识别、无痕会话管理
@@ -302,7 +320,16 @@ PROVIDER_RISK_SPECS = {
 │   ├── test_server.py          # 服务端路由、OpenAI/Anthropic 协议转译与错误格式测试
 │   ├── test_session.py         # 凭证原子存取、权限掩码、环境变量覆盖优先级测试
 │   ├── test_healing.py         # 自愈监控状态机、Prompt 生成、任务调度与单测验证
-│   └── test_responses.py       # OpenAI Responses 协议兼容性、事件流与 ToolCall 测试
+│   ├── test_responses.py       # OpenAI Responses 协议兼容性、事件流与 ToolCall 测试
+│   ├── test_tools.py           # 流式工具调用、推测流式与 JSON 自愈引擎测试
+│   ├── test_affinity.py        # 会话亲和、跨模型状态移交、LRU/TTL 与遥测头测试
+│   ├── test_singleflight.py    # 单飞指纹、流式广播扇出与去抖合并测试
+│   ├── test_risk_ledger.py     # 风控台账严重度分级、原子落盘与跨重启冷却恢复测试
+│   ├── test_probe_gate.py      # 冷却感知健康探针门控测试
+│   ├── test_refresh_gate.py    # 冷却感知令牌刷新门控与有界延迟补刷测试
+│   ├── test_adaptive_pacing.py # 证据驱动自适应步调放大测试
+│   ├── test_graceful_drain.py  # 在途请求优雅停机排空测试
+│   └── test_conversation_gc.py # 临时会话删除持久化队列与有界重试测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -320,7 +347,7 @@ PROVIDER_RISK_SPECS = {
 2. **会话生命周期与远端防膨胀规范**：
    - 当调用方未提供 `conversation_id` 时，网关视其为单次无状态调用。
    - 对于支持无痕模式的厂商（如通义千问），请求体默认注入 `temporary: true`。
-   - 流式响应完成后，必须通过 `asyncio.create_task(provider.delete_conversation(cid))` 在后台异步删除会话，避免在用户网页端侧边栏堆积大量临时会话。
+   - 流式响应完成后，必须通过 `conversation_gc.schedule(provider, provider_key, cid)` 在后台异步删除会话，避免在用户网页端侧边栏堆积大量临时会话。**严禁**回退为裸 `asyncio.create_task(provider.delete_conversation(cid))`：删除失败或进程重启会永久丢失该删除动作，导致临时会话在上游侧边栏无界堆积。删除动作必须进入 `providers/conversation_gc.py` 的持久化队列，跨重启存活并由后台有界重试。
 
 3. **网络与风控避让规范**：
    - 严禁高并发连续向同一 Provider 刷请求。调用必须受 `CooldownTracker` 信号量与调用间歇（Pacing）约束。
@@ -342,7 +369,16 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_server.py && \
 .venv/bin/python tests/test_session.py && \
 .venv/bin/python tests/test_healing.py && \
-.venv/bin/python tests/test_responses.py
+.venv/bin/python tests/test_responses.py && \
+.venv/bin/python tests/test_tools.py && \
+.venv/bin/python tests/test_affinity.py && \
+.venv/bin/python tests/test_singleflight.py && \
+.venv/bin/python tests/test_risk_ledger.py && \
+.venv/bin/python tests/test_probe_gate.py && \
+.venv/bin/python tests/test_refresh_gate.py && \
+.venv/bin/python tests/test_adaptive_pacing.py && \
+.venv/bin/python tests/test_graceful_drain.py && \
+.venv/bin/python tests/test_conversation_gc.py
 ```
 
 ### 测试矩阵要求：

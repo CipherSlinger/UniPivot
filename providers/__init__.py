@@ -105,6 +105,11 @@ from .json_repair import (
     repair_truncated_json,
     safe_loads_with_repair,
 )
+from .conversation_gc import (
+    ConversationGC,
+    conversation_gc,
+    get_conversation_gc,
+)
 from .risk_ledger import (
     SEVERITY_AUTH,
     SEVERITY_RATE_LIMIT,
@@ -231,6 +236,9 @@ __all__ = [
     "SEVERITY_RATE_LIMIT",
     "SEVERITY_WAF",
     "SEVERITY_AUTH",
+    "ConversationGC",
+    "conversation_gc",
+    "get_conversation_gc",
     "DisconnectGuard",
     "disconnect_guard",
     "guard_stream",

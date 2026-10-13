@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 19:05:08",
+  "generated_at": "2026-10-13 19:17:12",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -196,6 +196,16 @@
       "priority": "P1",
       "description": "进程重启（SIGTERM）时既有实现直接停止健康探针并关闭 HTTP 连接池，会腰斩正在传输的流式响应；对客户端而言这是一次失败的会话，触发重试后将成倍放大上游请求量与风控压力。本次引入纯 ASGI 在途请求计数中间件（精确覆盖流式响应全程），并在 lifespan 关停阶段先有界等待在途请求自然收尾（默认最多 30s），再释放连接池，使重启不再腰斩半传输的响应。",
       "expected_impact": "重启/滚动升级期间在途流式响应平滑收尾，客户端零失败重试，杜绝因腰斩导致的重复上游调用与风控放大；有界等待防止停机被长连接无限拖住；inflight_requests 经 /health 与 /v1/diagnostics 暴露，停机可观测。"
+    },
+    {
+      "id": "OPT-016",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "高可用与生命周期",
+      "title": "远端临时会话删除的持久化重试队列 (Durable Conversation Deletion Queue)",
+      "priority": "P1",
+      "description": "无痕调用（调用方未提供 conversation_id）会在上游网页端留下临时会话，网关需在响应结束后删除之。历史实现仅 asyncio.create_task(provider.delete_conversation(cid)) 即发即忘：删除失败或被进程重启打断即永久丢失该动作，导致用户侧边栏持续堆积临时会话。本次引入 providers/conversation_gc.py，将待删除会话以 POSIX 原子写落盘形成跨重启存活的队列，启动时排空 + 周期后台 drain 重试，达到最大尝试次数后放弃并记日志。",
+      "expected_impact": "临时会话删除不再因单次失败或重启而丢失，远端侧边栏不再无界堆积；有界重试杜绝无界重试与队列无界增长；关闭开关 GATEWAY_DISABLE_CONVERSATION_GC=1 可无损退化为历史行为，conversation_gc 段经 /v1/diagnostics 暴露可审计。"
     }
   ],
   "system_health": "good"

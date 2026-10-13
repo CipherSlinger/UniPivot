@@ -60,8 +60,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_probe_gate.py && \
 .venv/bin/python tests/test_refresh_gate.py && \
 .venv/bin/python tests/test_adaptive_pacing.py && \
-.venv/bin/python tests/test_graceful_drain.py
-
+.venv/bin/python tests/test_graceful_drain.py && \
+.venv/bin/python tests/test_conversation_gc.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -79,6 +79,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_refresh_gate.py # Cooldown-aware token refresh gating with bounded deferred retry
 .venv/bin/python tests/test_adaptive_pacing.py # Evidence-driven pacing multiplier from the risk ledger
 .venv/bin/python tests/test_graceful_drain.py # In-flight request drain on shutdown (streaming-safe) and inflight telemetry
+.venv/bin/python tests/test_conversation_gc.py # Durable retry queue for remote temporary-conversation deletion (survives restarts)
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -210,5 +211,8 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 15. **Graceful Shutdown Drain (`server.py:_drain_inflight_requests`)**:
     - A pure-ASGI `InflightTrackerMiddleware` counts in-flight requests across the *entire* response (its `await self.app(...)` only returns after a streaming body finishes, unlike `BaseHTTPMiddleware`). On shutdown the lifespan finally-block waits — bounded by `GATEWAY_SHUTDOWN_DRAIN_TIMEOUT` (default 30s) — for that count to reach zero before stopping the health monitor and closing the HTTP client, so a restart no longer severs a half-sent stream (which would make clients retry and re-load upstream). `inflight_requests` is exposed on `/health` and `/v1/diagnostics`. See `tests/test_graceful_drain.py`.
 
-16. **Web Frontend (`static/index.html`)**:
+16. **Durable Conversation Deletion Queue (`providers/conversation_gc.py`)**:
+    - Anonymous calls (no client `conversation_id`) leave a temporary session in the user's upstream web sidebar, so the gateway deletes it afterwards. The old `asyncio.create_task(provider.delete_conversation(cid))` was fire-and-forget: a failed delete or a process restart silently leaked the session forever. `ConversationGC` now enqueues each deletion in a POSIX-atomic JSON queue (dir `0o700`, file `0o600`) that survives restarts, retries via a background drain (bounded by `GATEWAY_CONVERSATION_GC_MAX_ATTEMPTS`, default 5, then drops with a warning), and drains once at startup to clean up the previous process's leftovers. `GATEWAY_DISABLE_CONVERSATION_GC=1` degrades to the legacy fire-and-forget behavior. Exposed as `conversation_gc` in `/v1/diagnostics`. See `tests/test_conversation_gc.py`.
+
+17. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

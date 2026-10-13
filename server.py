@@ -113,6 +113,7 @@ from providers.singleflight import (
     terminate_aborted_group,
 )
 from providers.risk_ledger import risk_ledger
+from providers.conversation_gc import conversation_gc
 from providers.token_counter_cache import compute_count_key, token_counter_cache
 from session_store import (
     MAX_AGE,
@@ -590,6 +591,14 @@ async def lifespan(_app: FastAPI):
     await get_http_client(TIMEOUT)
     if os.getenv("TESTING") != "1":
         health_monitor.start(initial_delay=2.0)
+    # [OPT-016] 启动即补做上一进程遗留的临时会话删除，避免重启导致远端会话泄漏
+    conv_gc_task: Optional[asyncio.Task] = None
+    if os.getenv("TESTING") != "1" and not conversation_gc.is_disabled():
+        try:
+            await conversation_gc.drain_once()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[会话回收] 启动排空失败 (已忽略): {type(exc).__name__}: {exc}")
+        conv_gc_task = asyncio.create_task(_conversation_gc_loop())
     try:
         yield
     finally:
@@ -600,6 +609,12 @@ async def lifespan(_app: FastAPI):
         except ValueError:
             drain_timeout = 30.0
         await _drain_inflight_requests(drain_timeout)
+        if conv_gc_task is not None:
+            conv_gc_task.cancel()
+            try:
+                await conv_gc_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
         health_monitor.stop()
         await close_http_client()
 
@@ -660,6 +675,30 @@ async def _drain_inflight_requests(timeout: float) -> bool:
 
 
 app.add_middleware(InflightTrackerMiddleware)
+
+
+# ---------------------------------------------------------------- [OPT-016] 远端临时会话回收
+
+async def _conversation_gc_loop() -> None:
+    """后台周期排空会话删除队列（有界重试，失败保留至下轮）。"""
+    try:
+        interval = float(os.getenv("GATEWAY_CONVERSATION_GC_RETRY_INTERVAL", "120"))
+    except ValueError:
+        interval = 120.0
+    interval = max(5.0, interval)
+    while True:
+        try:
+            await asyncio.sleep(interval)
+            result = await conversation_gc.drain_once()
+            if result.get("attempted"):
+                print(
+                    f"[会话回收] 重试 {result['attempted']} 个待删除会话，成功 {result['succeeded']} 个。"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - 后台循环必须永不退出
+            print(f"[会话回收] 周期排空异常 (已忽略): {type(exc).__name__}: {exc}")
+
 
 def _make_thinking_headers(
     thinking_duration_ms: Optional[float] = None,
@@ -1172,6 +1211,7 @@ async def get_diagnostics():
         "disconnect_guard": disconnect_guard.get_diagnostics(),
         "token_counter_cache": token_counter_cache.get_diagnostics(),
         "risk_ledger": risk_ledger.get_diagnostics(),
+        "conversation_gc": conversation_gc.get_diagnostics(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1375,6 +1415,9 @@ for _p_name, (_resolver, _err_msg, _factory) in PROVIDER_SPECS.items():
         resolver=_resolver,
         factory=lambda name=_p_name: _make_provider(name),
     )
+
+# 会话回收队列复用 provider 构造器（后台重试时重建节点实例）
+conversation_gc.set_resolver(_make_provider)
 
 
 @app.post("/v1/chat/completions")
@@ -1608,7 +1651,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
-                        asyncio.create_task(active_provider.delete_conversation(conversation_id))
+                        conversation_gc.schedule(active_provider, dispatched_provider, conversation_id)
                     success = True
                 except ProviderError as e:
                     is_rate_limit = (e.status == 429)
@@ -1807,7 +1850,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
-                    asyncio.create_task(active_provider.delete_conversation(conversation_id))
+                    conversation_gc.schedule(active_provider, dispatched_provider, conversation_id)
                 success = True
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
@@ -1933,7 +1976,7 @@ async def chat_completions(req: ChatCompletionRequest):
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
-        asyncio.create_task(active_provider.delete_conversation(conversation_id))
+        conversation_gc.schedule(active_provider, dispatched_provider, conversation_id)
 
     prompt = prompt_text
     full_output = "".join(chunks)
@@ -2208,7 +2251,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         )
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-                        asyncio.create_task(active_provider.delete_conversation(conv_id))
+                        conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                     success = True
                     return
 
@@ -2321,7 +2364,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     )
 
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-                    asyncio.create_task(active_provider.delete_conversation(conv_id))
+                    conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                 success = True
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
@@ -2457,7 +2500,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-        asyncio.create_task(active_provider.delete_conversation(conv_id))
+        conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
 
     full_output = "".join(chunks)
     full_thinking = "".join(thinking_chunks)
@@ -2845,7 +2888,7 @@ async def responses_endpoint(req: ResponsesRequest):
                         )
 
                     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-                        asyncio.create_task(active_provider.delete_conversation(conv_id))
+                        conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                     success = True
                     return
 
@@ -3004,7 +3047,7 @@ async def responses_endpoint(req: ResponsesRequest):
                     )
 
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-                    asyncio.create_task(active_provider.delete_conversation(conv_id))
+                    conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                 success = True
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
@@ -3085,7 +3128,7 @@ async def responses_endpoint(req: ResponsesRequest):
         )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-        asyncio.create_task(active_provider.delete_conversation(conv_id))
+        conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
 
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
