@@ -593,6 +593,13 @@ async def lifespan(_app: FastAPI):
     try:
         yield
     finally:
+        # [OPT-015] 优雅停机：先等待在途请求（含流式）自然收尾，再释放连接池，
+        # 避免重启时腰斩正在传输的响应（客户端重试会额外放大上游负载与风控压力）。
+        try:
+            drain_timeout = float(os.getenv("GATEWAY_SHUTDOWN_DRAIN_TIMEOUT", "30"))
+        except ValueError:
+            drain_timeout = 30.0
+        await _drain_inflight_requests(drain_timeout)
         health_monitor.stop()
         await close_http_client()
 
@@ -605,6 +612,54 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------- [OPT-015] 在途请求优雅停机排空
+
+_inflight_requests = 0
+
+
+class InflightTrackerMiddleware:
+    """纯 ASGI 中间件：精确统计在途请求数（含流式响应全程）。
+
+    相比 BaseHTTPMiddleware，纯 ASGI 中间件会 await 整个应用调用，
+    因此流式响应只有在全部帧发送完毕后才会释放计数，
+    从而保证停机排空能真正等到长连接流式响应收尾。
+    """
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        global _inflight_requests
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        _inflight_requests += 1
+        try:
+            await self.app(scope, receive, send)
+        finally:
+            _inflight_requests -= 1
+            if _inflight_requests < 0:
+                _inflight_requests = 0
+
+
+async def _drain_inflight_requests(timeout: float) -> bool:
+    """等待在途请求排空，最多等待 timeout 秒。返回是否已完全排空。"""
+    if _inflight_requests <= 0:
+        return True
+    print(f"[网关] 优雅停机：等待 {_inflight_requests} 个在途请求收尾（最多 {timeout:.0f}s）…")
+    deadline = time.time() + max(0.0, timeout)
+    while _inflight_requests > 0 and time.time() < deadline:
+        await asyncio.sleep(min(0.1, max(0.005, deadline - time.time())))
+    if _inflight_requests > 0:
+        print(f"[网关] 优雅停机：仍有 {_inflight_requests} 个在途请求未收尾，已达等待上限，强制关闭。")
+        return False
+    print("[网关] 优雅停机：在途请求已全部收尾。")
+    return True
+
+
+app.add_middleware(InflightTrackerMiddleware)
 
 def _make_thinking_headers(
     thinking_duration_ms: Optional[float] = None,
@@ -821,6 +876,7 @@ async def health():
     return {
         "status": "ok",
         "disabled_providers": sorted(list(disabled_set)),
+        "inflight_requests": _inflight_requests,
         "risk_ledger": {
             "enabled": not risk_ledger.is_disabled(),
             "recent_24h_total": risk_recent["total"],
@@ -1116,6 +1172,7 @@ async def get_diagnostics():
         "disconnect_guard": disconnect_guard.get_diagnostics(),
         "token_counter_cache": token_counter_cache.get_diagnostics(),
         "risk_ledger": risk_ledger.get_diagnostics(),
+        "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
 

@@ -109,6 +109,12 @@
 
 ### 2.2 核心调度与高可用韧性层
 
+#### 0. 在途请求优雅停机排空 (`server.py:InflightTrackerMiddleware`)
+
+- **纯 ASGI 计数**：`InflightTrackerMiddleware` 精确统计在途请求数，因其 `await self.app(...)` 仅在响应体（含流式）全部发送完毕后才返回，故流式全程计数保持不降。
+- **关停排空**：`lifespan` 关停阶段先有界等待在途请求收尾（`GATEWAY_SHUTDOWN_DRAIN_TIMEOUT`，默认 30s），再停止健康探针与释放连接池，杜绝重启腰斩半传输的流式响应（客户端重试会成倍放大上游负载与风控压力）。
+- **遥测**：`inflight_requests` 经 `/health` 与 `/v1/diagnostics` 暴露。
+
 为应对逆向工程固有的上游网络不稳定、WAF 人机滑块风控、429 频率受限等挑战，系统在调度层实现了多重韧性屏障：
 
 #### 1. 全连通对等能力互备环 (`providers/failover.py`)

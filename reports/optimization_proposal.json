@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 18:57:17",
+  "generated_at": "2026-10-13 19:05:08",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -186,6 +186,16 @@
       "priority": "P1",
       "description": "在「风控封禁无法绕开、只能避免」的约束下，被动冷却（事后避让）不足以防患于未然——网关需要在触发拦截前主动降速。本次将风控台账证据接入流量整形器：依据各节点近 6h 的拦截严重度分布（waf > auth > ratelimit 加权）动态放大其上游调用间隔（每单位权重线性放慢 25%，封顶 2.5x），刚触发过验证码或 429 的节点被自动「降速避让」，直至证据窗口自然衰减回归基线。证据查询带 60s TTL 缓存，杜绝每请求读取台账的开销。",
       "expected_impact": "高频调用节点在风控高压期自动降速，从「事后避让」升级为「事前预防」，显著降低触发验证码/封禁的概率；证据窗口衰减后自动回归基线，不牺牲长期吞吐；GATEWAY_DISABLE_ADAPTIVE_PACING=1 可无损回退，/v1/diagnostics 的 traffic_pacing 段暴露 pacing_multiplier 与 effective_interval_s。"
+    },
+    {
+      "id": "OPT-015",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "高可用与生命周期",
+      "title": "在途请求优雅停机排空引擎 (Graceful In-Flight Request Drain)",
+      "priority": "P1",
+      "description": "进程重启（SIGTERM）时既有实现直接停止健康探针并关闭 HTTP 连接池，会腰斩正在传输的流式响应；对客户端而言这是一次失败的会话，触发重试后将成倍放大上游请求量与风控压力。本次引入纯 ASGI 在途请求计数中间件（精确覆盖流式响应全程），并在 lifespan 关停阶段先有界等待在途请求自然收尾（默认最多 30s），再释放连接池，使重启不再腰斩半传输的响应。",
+      "expected_impact": "重启/滚动升级期间在途流式响应平滑收尾，客户端零失败重试，杜绝因腰斩导致的重复上游调用与风控放大；有界等待防止停机被长连接无限拖住；inflight_requests 经 /health 与 /v1/diagnostics 暴露，停机可观测。"
     }
   ],
   "system_health": "good"

@@ -59,7 +59,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_risk_ledger.py && \
 .venv/bin/python tests/test_probe_gate.py && \
 .venv/bin/python tests/test_refresh_gate.py && \
-.venv/bin/python tests/test_adaptive_pacing.py
+.venv/bin/python tests/test_adaptive_pacing.py && \
+.venv/bin/python tests/test_graceful_drain.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -77,6 +78,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating (banned nodes are never re-probed)
 .venv/bin/python tests/test_refresh_gate.py # Cooldown-aware token refresh gating with bounded deferred retry
 .venv/bin/python tests/test_adaptive_pacing.py # Evidence-driven pacing multiplier from the risk ledger
+.venv/bin/python tests/test_graceful_drain.py # In-flight request drain on shutdown (streaming-safe) and inflight telemetry
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -205,5 +207,8 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 14. **Evidence-Driven Adaptive Pacing (`providers/failover.py:compute_pacing_multiplier`)**:
     - The traffic pacer widens each provider's call interval proportionally to its recent risk-control interceptions (weighted `waf > auth > ratelimit`), so a node that just tripped a captcha or 429 is called more slowly until its 6h evidence window drains. This is the "avoidance" half of the ban problem: when a ban cannot be bypassed, slow down before it happens. Cached per provider (`GATEWAY_PACING_EVIDENCE_TTL`, default 60s); `GATEWAY_DISABLE_ADAPTIVE_PACING=1` reverts to the fixed interval. See `tests/test_adaptive_pacing.py`.
 
-15. **Web Frontend (`static/index.html`)**:
+15. **Graceful Shutdown Drain (`server.py:_drain_inflight_requests`)**:
+    - A pure-ASGI `InflightTrackerMiddleware` counts in-flight requests across the *entire* response (its `await self.app(...)` only returns after a streaming body finishes, unlike `BaseHTTPMiddleware`). On shutdown the lifespan finally-block waits — bounded by `GATEWAY_SHUTDOWN_DRAIN_TIMEOUT` (default 30s) — for that count to reach zero before stopping the health monitor and closing the HTTP client, so a restart no longer severs a half-sent stream (which would make clients retry and re-load upstream). `inflight_requests` is exposed on `/health` and `/v1/diagnostics`. See `tests/test_graceful_drain.py`.
+
+16. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
