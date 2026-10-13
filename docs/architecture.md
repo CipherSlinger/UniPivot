@@ -216,6 +216,19 @@ PROVIDER_RISK_SPECS = {
 - **快速失败**：环内全部封禁时返回 `503 / err_type="quarantined"`，**零上游调用**，并在错误信息中给出解除指引（`POST /v1/admin/quarantine`）；Anthropic 协议映射为 `overloaded_error`。
 - **开关**：`GATEWAY_DISABLE_QUARANTINE_HARD_STOP=1` 退回「仅降级」语义。
 
+#### 11. 避让解除后的恢复观察期 (`providers/failover.py:is_in_probation` / `compute_pacing_interval`)
+
+- **问题**：避让解决的是「不要再触碰被封禁的节点」，但没有解决「不要再把账号打进封禁」。一次多日的封禁解除时，数天来被冷却压制的需求会在同一瞬间释放——这正是当初触发封禁的流量特征，会让账号**立即二次封禁**。避让做得越好，积压越集中，解封瞬间的洪峰越危险。
+- **观察期（金丝雀放行）**：避让 episode 结束后的首次派发（风控冷却到期、或封禁租约自然到期/被运维显式解除）使该节点进入**恢复观察期**（`GATEWAY_PROBATION_WINDOW`，默认 300s）。窗口内：
+  - **串行探路**：同一时刻至多 **1 个握手**在途，把并发洪峰压成逐个试探；
+  - **步调放大**：调用间隔乘以 `GATEWAY_PROBATION_PACING_FACTOR`（默认 2.0）。
+- **毕业**：累计 `GATEWAY_PROBATION_MIN_SUCCESSES`（默认 3）次**连续成功**即毕业，恢复常规并发与步调；窗口自然结束亦退出观察期。
+- **闸门只覆盖握手到首包**，不占用整段流式输出；且**在并发信号量之前**获取，避免多个请求先占住并发槽位再排队等闸门（否则观察期形同虚设）。
+- **组合而非替换**：放大倍率作用在 `compute_pacing_interval()` 内，与 OPT-014 的证据驱动放大倍率**相乘**（`基础间隔 × 证据倍率 × 观察期倍率`），并抽成纯函数以便确定性测试。
+- **零回归**：普通 5xx/超时属上游故障而非账号被标记，解封瞬间不存在惊群风险，**不触发**观察期。
+- **跨重启生效**：episode 结束时间随风控台账持久化（`episode_ends`），重启即绕过观察期的路径被堵死。
+- **开关与遥测**：`GATEWAY_DISABLE_PROBATION=1` 关闭；响应头 `x-risk-probation: 1`，`/v1/diagnostics` 暴露 `probation.active` 与 `probation.stats`。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -277,7 +290,7 @@ PROVIDER_RISK_SPECS = {
 ├── providers/                  # 提供方核心实现与协议转译包
 │   ├── __init__.py             # 统一导出各 Provider 类与公共工具函数
 │   ├── base.py                 # 基础抽象类、消息展平、Token 估算、SSE 帧构建、ProviderError
-│   ├── failover.py             # 对等互备路由网格：三级能力环、风控元数据、动态冷却、故障转移
+│   ├── failover.py             # 对等互备路由网格：三级能力环、风控元数据、动态冷却、故障转移、封禁硬阻断、恢复观察期
 │   ├── http_client.py          # 全局 HTTP/2 共享连接池单例维护与优雅关闭
 │   ├── anthropic_compat.py     # Anthropic Messages API 协议双向映射与 Tool Call 解析器
 │   ├── responses_compat.py     # OpenAI Responses API (/v1/responses) 协议转译器
@@ -360,6 +373,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── test_conversation_gc.py # 临时会话删除持久化队列与有界重试测试
 │   └── test_quarantine.py      # 运维长期封禁租约：解析、落盘恢复、只延长与全门控遵循测试
 │   └── test_quarantine_hardstop.py # 封禁租约的派发硬阻断：零触碰、快速失败与软冷却语义区分测试
+│   └── test_probation.py       # 避让解除后的恢复观察期：串行探路闸门、步调放大、毕业与跨重启持久化测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -390,6 +404,7 @@ PROVIDER_RISK_SPECS = {
    - 自愈大脑选举同样必须遵守冷却门控：驱动修复的模型别名最终会经本网关转发为一次真实上游调用，冷却期节点一律不得作为修复引擎；若已无可用候选，必须安全推迟自愈而非强行触碰封禁节点。节点状态在**读取时**叠加实时冷却（而非依赖已被探针覆盖的落盘状态），杜绝「重启后未探针的冷却节点被误判为 healthy」。
    - 自动冷却存在**时长上限**（认证类封顶 `GATEWAY_AUTH_COOLDOWN_MAX`，默认 24h），而账号级封禁可持续数天；因此长于冷却上限的封禁**必须**通过运维长期租约表达：`providers/quarantine.py`（`GATEWAY_QUARANTINE` 环境变量或 `POST /v1/admin/quarantine`），租约经 `CooldownTracker.get_remaining_cooldown()` 折入全局冷却读数，使**所有**既有门控自动遵循。租约只延长不缩短，误操作不可能提前放行封禁节点；解除人工租约**不得**连带清除真实风控产生的自动冷却。
    - **硬封禁必须在派发路径上阻断，而不仅是被门控避让**：折入冷却读数只影响「主动发起的旁路请求」（探针/刷新/回收/自愈），**不覆盖**正常业务派发。因此 `execute_chat` 必须在派发前校验 `is_quarantined`，`get_fallback_candidates` 必须**排除**（而非仅沉底）封禁节点，负载均衡不得把任何请求分流到封禁节点。环内全部封禁时必须**快速失败（503 quarantined）且零上游调用**，严禁以「环内只剩它」为由破例触碰。
+   - **避让解除后必须经过恢复观察期，严禁解封即满速**：避让只保证「不触碰」，不保证「不再被打进封禁」。多日避让期间被压制的需求会在解封瞬间同时释放，复现当初触发封禁的流量特征。因此任一避让 episode 结束（冷却到期、租约到期或被解除）后，该节点必须先进入恢复观察期：串行放行单个探路握手（并发峰值恒为 1）并放大步调间隔，累计若干次**连续成功**后才毕业恢复常规并发。观察期状态必须随风控台账持久化，严禁通过重启绕过。普通 5xx/超时（上游故障，非账号被标记）不得触发观察期。
 
 ---
 
@@ -414,7 +429,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_graceful_drain.py && \
 .venv/bin/python tests/test_conversation_gc.py && \
 .venv/bin/python tests/test_quarantine.py && \
-.venv/bin/python tests/test_quarantine_hardstop.py
+.venv/bin/python tests/test_quarantine_hardstop.py && \
+.venv/bin/python tests/test_probation.py
 ```
 
 ### 测试矩阵要求：

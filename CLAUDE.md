@@ -64,7 +64,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_graceful_drain.py && \
 .venv/bin/python tests/test_conversation_gc.py && \
 .venv/bin/python tests/test_quarantine.py && \
-.venv/bin/python tests/test_quarantine_hardstop.py
+.venv/bin/python tests/test_quarantine_hardstop.py && \
+.venv/bin/python tests/test_probation.py
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -86,6 +87,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_conversation_gc.py # Durable retry queue for remote temporary-conversation deletion (survives restarts)
 .venv/bin/python tests/test_quarantine.py   # Operator long-duration quarantine leases (folded into every cooldown gate + admin API)
 .venv/bin/python tests/test_quarantine_hardstop.py # Quarantine hard-stop at the dispatch boundary (quarantined nodes are never dispatched, even as failover fallbacks)
+.venv/bin/python tests/test_probation.py    # Post-avoidance recovery probation (serialized canary handshakes + widened pacing after a ban lifts)
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -231,5 +233,10 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - Configuration and admin surface: `GATEWAY_QUARANTINE="deepseek:72h,glm:30m,kimi:2026-10-20T00:00:00"` applies at startup (durations `s/m/h/d` or ISO-8601), `GET/POST/DELETE /v1/admin/quarantine` views/sets/clears at runtime, `GATEWAY_DISABLE_QUARANTINE=1` turns the store off, and `GATEWAY_QUARANTINE_DIR` overrides the location. Exposed as `quarantine` on `/health` (active leases) and `/v1/diagnostics`. See `tests/test_quarantine.py`.
     - **[OPT-021] Hard-stop at the dispatch boundary**: folding the lease into the *cooldown reading* gated probes, refresh, conversation GC and healer election — but **not** the dispatch path. `get_fallback_candidates` only *demoted* cooling nodes, and `execute_chat` dispatched the primary unconditionally, so a node under a 72h lease was still sent real upstream requests on every failover (empirically confirmed for both DeepSeek and Doubao). Quarantine is now a **hard block with semantics distinct from soft cooldown**: a soft cooldown (automatic, capped at `GATEWAY_AUTH_COOLDOWN_MAX`) stays demote-only so a ring where everything is briefly cooling can still make a last-resort attempt — availability is preserved; an operator lease (account-level ban, measured in days) is never dispatched at all, at any point. A quarantined primary is redirected, quarantined nodes are excluded from the candidate set, and if the whole ring is quarantined the request **fails closed** with `503 / err_type="quarantined"`, zero upstream calls, and a message telling the operator how to lift the lease (`overloaded_error` in the Anthropic protocol). `GATEWAY_DISABLE_QUARANTINE_HARD_STOP=1` reverts to demote-only. See `tests/test_quarantine_hardstop.py`.
 
-19. **Web Frontend (`static/index.html`)**:
+19. **Post-Avoidance Recovery Probation (`providers/failover.py`)**:
+    - **[OPT-022] Canary re-entry after an avoidance episode**: avoidance solves *not touching* a banned node but not *not re-triggering* the ban. When a multi-day ban lifts, the demand that was suppressed for days releases at once — the same burst signature that caused the original ban, immediately re-banning the account. On the first dispatch after an avoidance episode ends (risk cooldown expiry, or a quarantine lease expiring or being cleared), the node enters a **probation window** (`GATEWAY_PROBATION_WINDOW`, default 300s) during which at most **one handshake is in flight** and the pacing interval is multiplied (`GATEWAY_PROBATION_PACING_FACTOR`, default 2.0×). It graduates after `GATEWAY_PROBATION_MIN_SUCCESSES` (default 3) consecutive successes, or leaves the window when it lapses.
+    - The serialization gate covers *handshake to first chunk* only, not the whole streaming response, and is acquired **before** the concurrency semaphore so requests cannot occupy concurrency slots while queued behind the gate. Because plain 5xx/timeouts are upstream faults rather than account flagging, they never enter probation — no thundering herd to protect against, hence zero regression for existing paths.
+    - `GATEWAY_PROBATION_PACING_FACTOR` is applied inside `CooldownTracker.compute_pacing_interval()` (pure, order-correct: base × evidence multiplier × probation multiplier) so it composes with the OPT-014 adaptive multiplier instead of replacing it. Probation state is persisted (`episode_ends`) and survives restarts, since a restart would otherwise be a one-step bypass. `GATEWAY_DISABLE_PROBATION=1` turns it off entirely. Telemetry: `x-risk-probation: 1` header plus `probation.active` / `probation.stats` on `/v1/diagnostics`. See `tests/test_probation.py`.
+
+20. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

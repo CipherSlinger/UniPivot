@@ -181,6 +181,9 @@ def _make_risk_headers(
         rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(primary_provider)
     if rem_cd > 0:
         headers["x-risk-cooldown-active"] = str(round(rem_cd, 2))
+    # [OPT-022] 避让解除后的恢复观察期：以串行 + 放大步调试探，避免解封惊群
+    if failover_router.cooldown_tracker.is_in_probation(provider_key):
+        headers["x-risk-probation"] = "1"
     return headers
 
 # ---------------------------------------------------------------- 模型表
@@ -1001,7 +1004,7 @@ async def get_rd_task(task_id: str):
 @app.get("/v1/diagnostics")
 @app.get("/diagnostics")
 async def get_diagnostics():
-    """实时���统状态、多提供方健康与度量诊断接口。"""
+    """实时系统状态、多提供方健康与度量诊断接口。"""
     all_statuses = health_monitor.get_all_statuses()
     disabled_set = failover_router.cooldown_tracker.disabled_providers | {
         p.strip().lower() for p in os.getenv("DISABLED_PROVIDERS", "").split(",") if p.strip()
@@ -1217,6 +1220,10 @@ async def get_diagnostics():
         "risk_ledger": risk_ledger.get_diagnostics(),
         "quarantine": quarantine_store.get_diagnostics(),
         "conversation_gc": conversation_gc.get_diagnostics(),
+        "probation": {
+            "active": failover_router.cooldown_tracker.get_probation_states(),
+            "stats": failover_router.cooldown_tracker.get_probation_stats(),
+        },
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }

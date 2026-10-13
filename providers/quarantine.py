@@ -33,7 +33,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 logger = logging.getLogger("gateway.quarantine")
 
@@ -83,6 +83,10 @@ class QuarantineStore:
         self._lock = threading.RLock()
         self._leases: Dict[str, float] = {}
         self._reasons: Dict[str, str] = {}
+        # [OPT-022] provider -> 最近一次租约解除（显式清除或自然到期）的时间戳。
+        # 供 CooldownTracker 在封禁解除后启动「恢复观察期」，避免解封瞬间的并发洪峰
+        # 立刻把账号二次打进封禁。仅保留近期记录，避免无界增长。
+        self._releases: Dict[str, float] = {}
         self._stats = {"set": 0, "cleared": 0, "expired": 0, "persist_failures": 0}
         self._load()
         self._apply_env()
@@ -124,6 +128,7 @@ class QuarantineStore:
                     pk: {"until": round(until, 3), "reason": self._reasons.get(pk, "")}
                     for pk, until in self._leases.items()
                 },
+                "releases": {pk: round(ts, 3) for pk, ts in self._releases.items()},
                 "saved_at": round(time.time(), 3),
             }
         try:
@@ -180,6 +185,13 @@ class QuarantineStore:
                     key = str(pk).lower()
                     self._leases[key] = float(until)
                     self._reasons[key] = str(entry.get("reason", ""))
+                # [OPT-022] 恢复租约解除时间（供解封后的恢复观察期判定）
+                releases = data.get("releases")
+                if isinstance(releases, dict):
+                    cutoff = now - self._release_retention()
+                    for pk, ts in releases.items():
+                        if isinstance(ts, (int, float)) and float(ts) > cutoff:
+                            self._releases[str(pk).lower()] = float(ts)
                 if self._leases:
                     logger.warning(
                         "[封禁租约] 已从磁盘恢复 %d 个运维封禁租约: %s",
@@ -219,6 +231,41 @@ class QuarantineStore:
             self._persist()
 
     # ------------------------------------------------------------ 租约操作
+
+    def _release_retention(self) -> float:
+        """租约解除记录的保留时长（秒），供解封后的恢复观察期使用。"""
+        try:
+            return max(60.0, float(os.getenv("GATEWAY_QUARANTINE_RELEASE_TTL", "86400")))
+        except ValueError:
+            return 86400.0
+
+    def _note_release(self, provider: str, ts: Optional[float] = None) -> None:
+        """记录租约解除时刻（须持锁调用）。"""
+        key = (provider or "").strip().lower()
+        if not key:
+            return
+        self._releases[key] = time.time() if ts is None else ts
+
+    def last_released_at(self, provider: str) -> Optional[float]:
+        """返回该节点最近一次封禁租约解除的时间戳（无记录或已过保留期则 None）。
+
+        [OPT-022] CooldownTracker 据此在封禁解除后启动「恢复观察期」：
+        解封瞬间以串行 + 放大步调试探，避免并发洪峰把刚恢复的账号二次打进封禁。
+        查询路径只做只读判定，不写盘（避免读放大）。
+        """
+        key = (provider or "").strip().lower()
+        if not key:
+            return None
+        # 先触发一次惰性到期清理：确保「租约刚刚自然到期」也能被本方法单独观测到，
+        # 而不依赖调用方恰好先查过 remaining()。
+        if key in self._leases:
+            self.remaining(key)
+        ts = self._releases.get(key)
+        if ts is None:
+            return None
+        if time.time() - ts > self._release_retention():
+            return None
+        return ts
 
     def set_lease(
         self,
@@ -260,17 +307,26 @@ class QuarantineStore:
         with self._lock:
             if provider is None:
                 count = len(self._leases)
+                # [OPT-022] 全部解除同样逐节点记录解除时刻（供恢复观察期）
+                self._note_release_all(list(self._leases.keys()))
                 self._leases.clear()
                 self._reasons.clear()
             else:
                 key = provider.strip().lower()
                 count = 1 if self._leases.pop(key, None) is not None else 0
                 self._reasons.pop(key, None)
+                if count:
+                    self._note_release(key)
             self._stats["cleared"] += count
         if count:
             logger.warning("[封禁租约] 已解除 %d 个封禁租约 (provider=%s)", count, provider or "ALL")
             self._persist()
         return count
+
+    def _note_release_all(self, providers: List[str]) -> None:
+        """批量记录解除时刻（须持锁调用）。"""
+        for pk in providers:
+            self._note_release(pk)
 
     def remaining(self, provider: str, now: Optional[float] = None) -> float:
         """返回节点剩余租约秒数（无租约或已到期返回 0.0）。"""
@@ -283,9 +339,11 @@ class QuarantineStore:
             if until is None:
                 return 0.0
             if until <= current:
-                # 惰性清理：到期即移除（不落盘，避免读路径产生写放大）
+                # 惰性清理：到期即移除（不落盘，避免读路径产生写放大）。
+                # [OPT-022] 同时记录解除时刻，供解封后的恢复观察期判定。
                 self._leases.pop(key, None)
                 self._reasons.pop(key, None)
+                self._note_release(key, until)
                 self._stats["expired"] += 1
                 return 0.0
             return until - current
@@ -323,6 +381,7 @@ class QuarantineStore:
         with self._lock:
             self._leases.clear()
             self._reasons.clear()
+            self._releases.clear()
             self._stats = {"set": 0, "cleared": 0, "expired": 0, "persist_failures": 0}
             try:
                 self.path.unlink(missing_ok=True)

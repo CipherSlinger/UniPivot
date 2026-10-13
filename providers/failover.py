@@ -27,6 +27,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -316,6 +317,19 @@ class CooldownTracker:
         self.risk_ledger = get_risk_ledger()
         # [OPT-020] 运维人工长期封禁租约：折入冷却读数，使所有门控自动遵循
         self.quarantine = get_quarantine_store()
+        # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
+        # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
+        self._episode_ends: Dict[str, float] = {}
+        # provider -> 观察期内已连续成功次数（达标即提前毕业）
+        self._probation_successes: Dict[str, int] = {}
+        # provider -> 观察期串行闸门（仅放行单个握手，避免惊群）
+        self._probation_locks: Dict[str, asyncio.Lock] = {}
+        self._probation_stats: Dict[str, Any] = {
+            "entered": 0,
+            "graduated": 0,
+            "canary_serialized": 0,
+            "canary_successes": 0,
+        }
         self._restore_persisted_state()
 
     def _restore_persisted_state(self) -> None:
@@ -339,6 +353,14 @@ class CooldownTracker:
             for pk, n in failures.items():
                 if isinstance(n, int) and n > 0:
                     self._failure_counts[str(pk)] = n
+        # [OPT-022] 恢复 episode 结束时间：据此可在解封瞬间重新启用观察期，
+        # 使「避让期间重启」不会绕过惊群保护。仅保留观察期窗口内仍有意义的记录。
+        episode_ends = state.get("episode_ends") or {}
+        if isinstance(episode_ends, dict):
+            window = self._probation_window()
+            for pk, end in episode_ends.items():
+                if isinstance(end, (int, float)) and now < float(end) + window:
+                    self._episode_ends[str(pk)] = float(end)
         if restored_cd:
             logger.warning(
                 "[风控避让] 已从磁盘恢复 %d 个节点的跨重启冷却状态: %s",
@@ -353,6 +375,9 @@ class CooldownTracker:
                 {
                     "cooldowns": {k: v for k, v in self._cooldowns.items()},
                     "failure_counts": {k: v for k, v in self._failure_counts.items()},
+                    # [OPT-022] 观察期判定依赖 episode 结束时间，须随冷却一并持久化，
+                    # 否则「避让期间重启」会丢失观察期，导致解封瞬间直接放行并发洪峰。
+                    "episode_ends": {k: v for k, v in self._episode_ends.items()},
                 }
             )
         except Exception:  # noqa: BLE001
@@ -400,8 +425,149 @@ class CooldownTracker:
         except Exception:  # noqa: BLE001 - 查询失败时按未封禁处理，绝不误伤正常节点
             return False
 
+    # -------------------------------------------------------- [OPT-022] 恢复观察期
+
+    def _probation_window(self) -> float:
+        try:
+            return max(0.0, float(os.getenv("GATEWAY_PROBATION_WINDOW", "300")))
+        except ValueError:
+            return 300.0
+
+    def _probation_min_successes(self) -> int:
+        try:
+            return max(1, int(os.getenv("GATEWAY_PROBATION_MIN_SUCCESSES", "3")))
+        except ValueError:
+            return 3
+
+    def _probation_pacing_factor(self) -> float:
+        try:
+            return max(1.0, float(os.getenv("GATEWAY_PROBATION_PACING_FACTOR", "2.0")))
+        except ValueError:
+            return 2.0
+
+    def is_probation_disabled(self) -> bool:
+        return os.getenv("GATEWAY_DISABLE_PROBATION", "").strip().lower() in ("1", "true", "yes")
+
+    def _last_release_ts(self, provider_key: str, now: float) -> Optional[float]:
+        """返回节点最近一次「避让解除」的时间戳（未解除过或无记录则 None）。
+
+        两个来源取较晚者：
+        1. 冷却 episode 的预计结束时间（`record_failure` 时即已排定）；
+        2. 运维封禁租约的解除/到期时间（`QuarantineStore` 记录）。
+        两者都只在该时刻**已经过去**时才参与判定（否则说明仍在避让中）。
+        """
+        candidates: List[float] = []
+        episode_end = self._episode_ends.get(provider_key)
+        if episode_end is not None and episode_end <= now:
+            candidates.append(episode_end)
+        try:
+            released = self.quarantine.last_released_at(provider_key)
+        except Exception:  # noqa: BLE001
+            released = None
+        if isinstance(released, (int, float)) and released <= now:
+            candidates.append(float(released))
+        return max(candidates) if candidates else None
+
+    def is_in_probation(self, provider_key: str) -> bool:
+        """[OPT-022] 节点是否处于「避让解除后的恢复观察期」。
+
+        动机：一次多日的账号级封禁解除后，网关侧往往已积压了大量需求，且此前被
+        冷却压制的并发会在同一瞬间释放——若放任其以正常并发（max_concurrency）
+        涌入刚刚解封的账号，正是当初触发封禁的流量特征，极易被立刻二次封禁。
+
+        因此避让一旦解除，节点先进入观察期：串行放行单个「探路」请求（握手阶段
+        独占），并以放大的步调间隔发送；累计达到 `GATEWAY_PROBATION_MIN_SUCCESSES`
+        次连续成功（或观察期 `GATEWAY_PROBATION_WINDOW` 秒自然结束）后毕业，恢复
+        常规并发与步调。`GATEWAY_DISABLE_PROBATION=1` 可关闭。
+        """
+        if self.is_probation_disabled():
+            return False
+        provider_key = (provider_key or "").strip().lower()
+        if not provider_key:
+            return False
+        now = time.time()
+        # 仍在避让中（冷却或封禁）不属观察期，避免语义混淆
+        if self.get_remaining_cooldown(provider_key) > 0.0:
+            return False
+        last_release = self._last_release_ts(provider_key, now)
+        if last_release is None:
+            return False
+        if now >= last_release + self._probation_window():
+            return False
+        return self._probation_successes.get(provider_key, 0) < self._probation_min_successes()
+
+    def probation_lock(self, provider_key: str) -> Optional[asyncio.Lock]:
+        """观察期内返回串行闸门（握手阶段独占），否则返回 None。
+
+        闸门仅在观察期生效，用于把「解封瞬间的并发洪峰」压成逐个探路，
+        毕业或观察期结束即自动失效，不影响正常并发。
+        """
+        if not self.is_in_probation(provider_key):
+            return None
+        lock = self._probation_locks.get(provider_key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._probation_locks[provider_key] = lock
+        self._probation_stats["canary_serialized"] += 1
+        return lock
+
+    def probation_pacing_multiplier(self, provider_key: str) -> float:
+        """观察期内放大调用间隔的倍率（非观察期恒为 1.0）。"""
+        return self._probation_pacing_factor() if self.is_in_probation(provider_key) else 1.0
+
+    def _enter_probation(self, provider_key: str, episode_end: float) -> None:
+        """记录冷却 episode 的预计结束时间，并重置观察期成功计数。
+
+        必须在 `record_failure` 中调用（持锁），这样即便进程在避让期间重启，
+        观察期判定依然可基于持久化的 episode 结束时间推导出来。
+        """
+        self._episode_ends[provider_key] = episode_end
+        self._probation_successes[provider_key] = 0
+        self._probation_stats["entered"] += 1
+
+    def _note_probation_success(self, provider_key: str) -> None:
+        """观察期内记录一次成功；达标即毕业（提前结束观察期）。"""
+        if self.is_probation_disabled():
+            return
+        now = time.time()
+        if self._last_release_ts(provider_key, now) is None:
+            return
+        if provider_key not in self._episode_ends:
+            return
+        if now >= self._episode_ends[provider_key] + self._probation_window():
+            return
+        self._probation_successes[provider_key] = self._probation_successes.get(provider_key, 0) + 1
+        self._probation_stats["canary_successes"] += 1
+        if self._probation_successes[provider_key] >= self._probation_min_successes():
+            self._probation_stats["graduated"] += 1
+            logger.info(
+                "[恢复观察期] 节点 [%s] 已连续成功 %d 次，观察期提前毕业，恢复常规并发与步调",
+                provider_key,
+                self._probation_successes[provider_key],
+            )
+
+    def get_probation_states(self, now: Optional[float] = None) -> Dict[str, Dict[str, Any]]:
+        """列出当前处于观察期的节点（供 /v1/diagnostics 审计）。"""
+        now = time.time() if now is None else now
+        result: Dict[str, Dict[str, Any]] = {}
+        for pk in list(self._episode_ends.keys()):
+            if not self.is_in_probation(pk):
+                continue
+            last_release = self._last_release_ts(pk, now)
+            result[pk] = {
+                "successes": self._probation_successes.get(pk, 0),
+                "required_successes": self._probation_min_successes(),
+                "remaining_seconds": round(
+                    max(0.0, (last_release or now) + self._probation_window() - now), 1
+                ),
+            }
+        return result
+
+    def get_probation_stats(self) -> Dict[str, Any]:
+        return dict(self._probation_stats)
+
     def get_all_cooldowns(self) -> Dict[str, float]:
-        """获取所有当前处于冷却���态的节点及剩余冷却时间（秒）"""
+        """获取所有当前处于冷却状态的节点及剩余冷却时间（秒）"""
         now = time.time()
         res = {}
         for pk, end_time in list(self._cooldowns.items()):
@@ -472,6 +638,11 @@ class CooldownTracker:
             # 如果已有更长的冷却期，保留较长者
             self._cooldowns[provider_key] = max(self._cooldowns.get(provider_key, 0.0), end_time)
 
+            # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
+            # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
+            if is_risk or is_waf_or_rate or is_auth_error:
+                self._enter_probation(provider_key, self._cooldowns[provider_key])
+
             # 台账记录：仅记录真正的拦截事件（风控 / 频控 / 认证失效），
             # 普通 5xx 与超时不入账，避免污染风控画像。
             if is_risk or is_waf_or_rate or is_auth_error:
@@ -499,9 +670,27 @@ class CooldownTracker:
     async def record_success(self, provider_key: str) -> None:
         """调用成功，重置失败计数并清除冷却状态"""
         async with self._lock:
+            # [OPT-022] 观察期内的成功计入毕业进度（须在清除 episode 之前判定）
+            self._note_probation_success(provider_key)
             self._failure_counts[provider_key] = 0
             self._cooldowns.pop(provider_key, None)
             self._persist_state()
+
+    def compute_pacing_interval(self, provider_key: str, jitter: float = 0.0) -> float:
+        """计算节点下一次调用前应保持的最小间隔（秒，不含抖动时传入 jitter=0）。
+
+        [OPT-022] 因子乘积：基础间隔 × 证据驱动放大倍率 × 观察期放大倍率。
+        抽成纯函数以便确定性测试，避免以计时断言验证步调。
+        """
+        meta = PROVIDER_RISK_SPECS.get(provider_key)
+        if not meta:
+            return 0.0
+        return (
+            meta.min_call_interval
+            * get_adaptive_pacing_multiplier(provider_key)
+            * self.probation_pacing_multiplier(provider_key)
+            + jitter
+        )
 
     async def apply_pacing_and_acquire(self, provider_key: str) -> None:
         """自适应调用步调（Pacing & Jitter）及并发获取"""
@@ -519,7 +708,8 @@ class CooldownTracker:
         elapsed = now - last_time
 
         jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
-        target_interval = meta.min_call_interval * get_adaptive_pacing_multiplier(provider_key) + jitter
+        # [OPT-022] 观察期内放大调用间隔：避免解封瞬间以常规速率涌入而立即二次触发风控
+        target_interval = self.compute_pacing_interval(provider_key, jitter)
 
         if elapsed < target_interval:
             wait_time = target_interval - elapsed
@@ -540,6 +730,16 @@ class CooldownTracker:
         self._cooldowns.clear()
         self._failure_counts.clear()
         self._last_call_time.clear()
+        # [OPT-022] 观察期状态一并重置，确保用例之间零串扰
+        self._episode_ends.clear()
+        self._probation_successes.clear()
+        self._probation_locks.clear()
+        self._probation_stats = {
+            "entered": 0,
+            "graduated": 0,
+            "canary_serialized": 0,
+            "canary_successes": 0,
+        }
         disabled_str = os.getenv("DISABLED_PROVIDERS", "")
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()
@@ -826,7 +1026,14 @@ class FailoverRouter:
                 await self.cooldown_tracker.apply_pacing_and_acquire(curr_provider_key)
 
                 # 2. 实例化 Provider
-                async with sem:
+                # [OPT-022] 观察期内先取串行闸门：把「解封瞬间的并发洪峰」压成逐个
+                # 探路请求（闸门只覆盖握手到首包，不占用整段流式输出），且必须在
+                # 信号量之前获取，避免多个请求先占住并发槽位再排队等闸门。
+                probation_lock = self.cooldown_tracker.probation_lock(curr_provider_key)
+                async with contextlib.AsyncExitStack() as stack:
+                    if probation_lock is not None:
+                        await stack.enter_async_context(probation_lock)
+                    await stack.enter_async_context(sem)
                     provider = provider_factory(curr_provider_key)
 
                     # 3. 试探性获取首包 (确保在流交给外部客户端前捕获初始化错误与上游 4xx/5xx)

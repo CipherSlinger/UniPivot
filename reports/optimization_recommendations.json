@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 20:17:22",
+  "generated_at": "2026-10-13 20:42:23",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -256,6 +256,16 @@
       "priority": "P0",
       "description": "OPT-020 把封禁租约折入冷却读数，因而探针/刷新/会话回收/自愈选举等**门控**全部避让；但**派发路径**并未被门控：get_fallback_candidates 仅把冷却节点沉底而非排除，execute_chat 更是无条件派发主选节点。实证复现——处于 72h 封禁租约的 deepseek 与 doubao 故障转移中**仍被派发真实上游请求**（探针输出 TOUCHED=['qwen','glm','kimi','doubao','deepseek']），且该通道随失败次数放大，是整条风控体系中最宽的隐蔽触碰通道。本次引入软冷却与硬封禁的语义区分：软冷却（自动触发、时长有界）保持仅降级以保可用性；硬封禁（运维长期租约、账号级）在任何情况下都不派发。三道闸口——负载均衡同环分流且绝不分流到封禁节点、候选集彻底排除封禁节点、execute_chat 派发前逐轮硬校验；环内全部封禁时快速失败 503/err_type=quarantined 且零上游调用，错误信息给出解除指引，Anthropic 协议映射为 overloaded_error。",
       "expected_impact": "封堵整条风控体系中影响面最广的隐蔽触碰通道：封禁节点在任何请求、任何故障转移轮次中均零触碰，杜绝因业务流量而持续延长账号封禁；环内全部封禁时明确快速失败而非静默触碰，运维据错误信息与 /v1/diagnostics 即可定位并解除租约；软冷却的最后一搏可用性语义完整保留，GATEWAY_DISABLE_QUARANTINE_HARD_STOP=1 可回退。"
+    },
+    {
+      "id": "OPT-022",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控避让与恢复安全",
+      "title": "避让解除后的恢复观察期 (Post-Avoidance Recovery Probation)",
+      "priority": "P0",
+      "description": "OPT-020/OPT-021 解决了「不要再触碰被封禁的节点」，但没有解决「不要把账号重新打进封禁」。一次多日的封禁解除时，数天来被冷却压制的需求会在同一瞬间释放——这正是当初触发封禁的流量特征，会让账号立即二次封禁；且避让越彻底，积压越集中，解封瞬间的洪峰越危险。本次为避让 episode 结束后的节点引入**恢复观察期**：窗口内（GATEWAY_PROBATION_WINDOW，默认 300s）最多 1 个握手在途（串行探路，并发峰值恒为 1），且调用间隔乘以 GATEWAY_PROBATION_PACING_FACTOR（默认 2.0），累计 GATEWAY_PROBATION_MIN_SUCCESSES（默认 3）次连续成功后毕业恢复常规并发与步调。触发源覆盖风控冷却到期、封禁租约自然到期与运维显式解除三种 episode 终止方式。闸门仅覆盖握手到首包（不占用整段流式输出），且必须在并发信号量**之前**获取，否则请求会先占住并发槽位再排队等闸门，观察期形同虚设。放大倍率作为纯函数折入 compute_pacing_interval()，与 OPT-014 的证据驱动倍率**相乘**而非替换。普通 5xx/超时属上游故障而非账号被标记，不触发观察期（零回归）。episode 结束时间随风控台账持久化，重启不得绕过。",
+      "expected_impact": "消除「解封即二次封禁」这一避让体系的最终反噬：解封瞬间的并发洪峰被压成逐个探路握手，先把账号以极低压力试探性激活，确认稳定后再逐步放开，从根本上避免账号陷入「解封—被打—再封」的循环；观察期内步调放大与 OPT-014 证据倍率叠加生效，形成双重保守；毕业机制保证性能可完全恢复，不产生永久降级；x-risk-probation 响应头与 /v1/diagnostics 的 probation 段提供完整可观测性，GATEWAY_DISABLE_PROBATION=1 可整体关闭。"
     }
   ],
   "system_health": "good"
