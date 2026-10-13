@@ -141,6 +141,7 @@ PROVIDER_RISK_SPECS = {
 ```
 
 - **Pacing & Jitter**：在发出请求前，自动平滑计算调用间隙并施加正态随机抖动，破坏固定调用频率指纹。
+- **证据驱动自适应放大 [OPT-014]**：调用间隔依据该节点近期风控拦截证据自适应放大——`waf`（人机验证）> `auth` > `ratelimit` 加权，每单位权重线性放慢 25%，封顶 `GATEWAY_PACING_MAX_MULTIPLIER`(默认 2.5x)。刚触发过验证码/429 的节点会被主动「降速避让」，直至其 6h 证据窗口自然衰减。证据查询带 60s TTL 缓存，`GATEWAY_DISABLE_ADAPTIVE_PACING=1` 可退化为固定间隔。
 - **并发控制**：每个 Provider 配备独立的 `asyncio.Semaphore`，防止瞬时并发冲垮逆向会话。
 - **动态冷却退避**：一旦捕获到 WAF 拦截或 429 报错，该节点自动进入动态隔离冷却期，后续请求自动避开该节点。
 

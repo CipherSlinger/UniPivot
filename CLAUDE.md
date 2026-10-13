@@ -58,7 +58,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_lifecycle.py && \
 .venv/bin/python tests/test_risk_ledger.py && \
 .venv/bin/python tests/test_probe_gate.py && \
-.venv/bin/python tests/test_refresh_gate.py
+.venv/bin/python tests/test_refresh_gate.py && \
+.venv/bin/python tests/test_adaptive_pacing.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -75,6 +76,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_risk_ledger.py  # Risk-control severity tiers, durable cross-restart cooldowns, and the JSONL interception ledger
 .venv/bin/python tests/test_probe_gate.py   # Cooldown-aware health probe gating (banned nodes are never re-probed)
 .venv/bin/python tests/test_refresh_gate.py # Cooldown-aware token refresh gating with bounded deferred retry
+.venv/bin/python tests/test_adaptive_pacing.py # Evidence-driven pacing multiplier from the risk ledger
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -200,5 +202,8 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 13. **Cooldown-Aware Token Refresh Gate (`server.py:_auto_refresh_stale_sessions`)**:
     - The startup silent token-refresh pass consults the cooldown tracker: a node in a risk-avoidance cooldown is not refreshed (a login/refresh call to an upstream-banned account would only deepen the ban). Deferred nodes are retried by a bounded background thread (`GATEWAY_REFRESH_DEFER_POLL`, `GATEWAY_REFRESH_DEFER_MAX_WAIT`, default 24h) that refreshes once the cooldown clears and otherwise gives up cleanly. See `tests/test_refresh_gate.py`.
 
-14. **Web Frontend (`static/index.html`)**:
+14. **Evidence-Driven Adaptive Pacing (`providers/failover.py:compute_pacing_multiplier`)**:
+    - The traffic pacer widens each provider's call interval proportionally to its recent risk-control interceptions (weighted `waf > auth > ratelimit`), so a node that just tripped a captcha or 429 is called more slowly until its 6h evidence window drains. This is the "avoidance" half of the ban problem: when a ban cannot be bypassed, slow down before it happens. Cached per provider (`GATEWAY_PACING_EVIDENCE_TTL`, default 60s); `GATEWAY_DISABLE_ADAPTIVE_PACING=1` reverts to the fixed interval. See `tests/test_adaptive_pacing.py`.
+
+15. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

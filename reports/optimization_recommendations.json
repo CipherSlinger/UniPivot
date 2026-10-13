@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 18:50:23",
+  "generated_at": "2026-10-13 18:57:17",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -176,6 +176,16 @@
       "priority": "P0",
       "description": "启动时的静默令牌刷新会无差别复用浏览器配置对全部 Provider 发起登录/刷新请求，对已被上游风控封禁的账号而言是又一条隐蔽的持续触碰通道（登录请求同样会被风控记录并加剧封禁）。本次将 CooldownTracker 冷却状态接入刷新流程：处于避让冷却期的节点暂缓刷新，改由有界后台线程在冷却解除后补做刷新（默认最多等待 24h，超时放弃本轮，绝不无限阻塞），使「重启后静默刷新」不再成为封禁窗口的隐形延长器。",
       "expected_impact": "风控封禁节点在冷却窗口内零登录/刷新触碰，封禁恢复窗口不再被启动期刷新行为延长；冷却解除后令牌自动补齐，无需人工干预，避免「跳过即永久放弃」的功能回退；GATEWAY_REFRESH_DEFER_POLL / GATEWAY_REFRESH_DEFER_MAX_WAIT 可调。"
+    },
+    {
+      "id": "OPT-014",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控治理与避让",
+      "title": "风控证据驱动的自适应步调强化引擎 (Evidence-Driven Adaptive Pacing Engine)",
+      "priority": "P1",
+      "description": "在「风控封禁无法绕开、只能避免」的约束下，被动冷却（事后避让）不足以防患于未然——网关需要在触发拦截前主动降速。本次将风控台账证据接入流量整形器：依据各节点近 6h 的拦截严重度分布（waf > auth > ratelimit 加权）动态放大其上游调用间隔（每单位权重线性放慢 25%，封顶 2.5x），刚触发过验证码或 429 的节点被自动「降速避让」，直至证据窗口自然衰减回归基线。证据查询带 60s TTL 缓存，杜绝每请求读取台账的开销。",
+      "expected_impact": "高频调用节点在风控高压期自动降速，从「事后避让」升级为「事前预防」，显著降低触发验证码/封禁的概率；证据窗口衰减后自动回归基线，不牺牲长期吞吐；GATEWAY_DISABLE_ADAPTIVE_PACING=1 可无损回退，/v1/diagnostics 的 traffic_pacing 段暴露 pacing_multiplier 与 effective_interval_s。"
     }
   ],
   "system_health": "good"

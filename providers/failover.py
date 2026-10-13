@@ -40,6 +40,7 @@ from typing import (
     Callable,
     Dict,
     List,
+    Mapping,
     Optional,
     Set,
     Tuple,
@@ -57,6 +58,72 @@ from .risk_ledger import (
 )
 
 logger = logging.getLogger("gateway.failover")
+
+
+# ---------------------------------------------------------------- [OPT-014] 风控证据驱动的自适应步调
+
+# 各严重度对步调放大的权重（WAF 人机验证最危险 → 放慢最多）
+_SEVERITY_PACING_WEIGHT: Dict[str, float] = {
+    SEVERITY_WAF: 1.0,
+    SEVERITY_AUTH: 0.8,
+    SEVERITY_RATE_LIMIT: 0.6,
+}
+# provider -> (multiplier, expires_at) 证据缓存，避免每请求都读取台账文件
+_pacing_evidence_cache: Dict[str, Tuple[float, float]] = {}
+
+
+def compute_pacing_multiplier(
+    severities: Mapping[str, int], max_multiplier: float = 2.5
+) -> float:
+    """依据近期拦截严重度分布计算步调放大系数（纯函数，>= 1.0）。
+
+    每单位权重线性放大 25%，并以 ``max_multiplier`` 封顶；无证据时返回 1.0。
+    拦截越多、越危险（WAF > auth > ratelimit），上游调用间隔被拉得越长，
+    从而在无法绕开风控的前提下主动「降速避让」。
+    """
+    if not severities:
+        return 1.0
+    weight = 0.0
+    for sev, cnt in severities.items():
+        try:
+            weight += _SEVERITY_PACING_WEIGHT.get(str(sev), 0.5) * int(cnt)
+        except (TypeError, ValueError):
+            continue
+    ceiling = max(1.0, float(max_multiplier))
+    return float(min(max(1.0, 1.0 + 0.25 * weight), ceiling))
+
+
+def get_adaptive_pacing_multiplier(
+    provider_key: str, now: Optional[float] = None
+) -> float:
+    """查询指定 Provider 的自适应步调放大系数（带 TTL 缓存的证据查询）。
+
+    GATEWAY_DISABLE_ADAPTIVE_PACING=1 时恒为 1.0（退化为基础步调）。
+    查询失败/台账不可用时保守返回 1.0，绝不影响请求流程。
+    """
+    if os.getenv("GATEWAY_DISABLE_ADAPTIVE_PACING", "").strip().lower() in ("1", "true", "yes"):
+        return 1.0
+    pk = (provider_key or "").lower()
+    now = now if now is not None else time.time()
+    cached = _pacing_evidence_cache.get(pk)
+    if cached and cached[1] > now:
+        return cached[0]
+    try:
+        ttl = float(os.getenv("GATEWAY_PACING_EVIDENCE_TTL", "60"))
+        hours = float(os.getenv("GATEWAY_PACING_EVIDENCE_HOURS", "6"))
+        max_mult = float(os.getenv("GATEWAY_PACING_MAX_MULTIPLIER", "2.5"))
+        recent = get_risk_ledger().recent_interceptions(hours=hours, now=now)
+        bucket = (recent.get("per_provider") or {}).get(pk) or {}
+        mult = compute_pacing_multiplier(bucket.get("severities") or {}, max_mult)
+    except Exception:  # noqa: BLE001 - 证据查询失败绝不阻断请求
+        mult = 1.0
+    _pacing_evidence_cache[pk] = (mult, now + max(0.0, ttl))
+    return mult
+
+
+def clear_pacing_evidence_cache() -> None:
+    """清空自适应步调证据缓存（测试用）。"""
+    _pacing_evidence_cache.clear()
 
 
 class CapabilityRing(str, Enum):
@@ -423,7 +490,7 @@ class CooldownTracker:
         elapsed = now - last_time
 
         jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
-        target_interval = meta.min_call_interval + jitter
+        target_interval = meta.min_call_interval * get_adaptive_pacing_multiplier(provider_key) + jitter
 
         if elapsed < target_interval:
             wait_time = target_interval - elapsed
@@ -486,12 +553,14 @@ class TrafficPacer:
             if os.getenv("GATEWAY_DISABLE_PACING") != "1":
                 meta = PROVIDER_RISK_SPECS.get(pk)
                 if meta:
+                    # [OPT-014] 依据近期风控拦截证据自适应放大调用间隔
+                    mult = get_adaptive_pacing_multiplier(pk)
                     async with self._lock:
                         now = time.time()
                         last = self._last_call_times.get(pk, 0.0)
                         elapsed = now - last
                         jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
-                        target_interval = meta.min_call_interval + jitter
+                        target_interval = meta.min_call_interval * mult + jitter
                         if elapsed < target_interval:
                             wait_time = target_interval - elapsed
                             wait_ms = wait_time * 1000.0
@@ -519,12 +588,18 @@ class TrafficPacer:
                 "max_concurrency": limit,
                 "in_use": in_use,
                 "min_interval_s": meta.min_call_interval if meta else 0.1,
+                "effective_interval_s": round(
+                    (meta.min_call_interval if meta else 0.1) * get_adaptive_pacing_multiplier(pk), 4
+                ),
+                "pacing_multiplier": get_adaptive_pacing_multiplier(pk),
                 "jitter_s": list(meta.jitter_range) if meta else [0.01, 0.05],
                 "risk_level": meta.risk_level.value if meta else "medium",
             }
         return {
             "active_semaphores": active_semaphores,
             "providers": providers_info,
+            "adaptive_pacing": os.getenv("GATEWAY_DISABLE_ADAPTIVE_PACING", "").strip().lower()
+            not in ("1", "true", "yes"),
             "total_waits": self._total_waits,
             "avg_delay_ms": round(self._total_delay_ms / max(1, self._total_waits), 2),
         }
