@@ -51,7 +51,8 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_healing.py && \
 .venv/bin/python tests/test_responses.py && \
 .venv/bin/python tests/test_tools.py && \
-.venv/bin/python tests/test_affinity.py
+.venv/bin/python tests/test_affinity.py && \
+.venv/bin/python tests/test_singleflight.py
 
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
@@ -61,6 +62,7 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_responses.py   # OpenAI Responses protocol (/v1/responses) and Codex compatibility
 .venv/bin/python tests/test_tools.py       # Streaming tool calling, speculative streaming, and self-healing JSON engine
 .venv/bin/python tests/test_affinity.py    # Session affinity, cross-model state handoff, LRU/TTL, and telemetry headers
+.venv/bin/python tests/test_singleflight.py # Deterministic SHA-256 fingerprinting, streaming broadcast fanout, and debounce coalescing
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
@@ -155,5 +157,10 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
    - Detects provider degradation, WAF cooldown, or failure and performs seamless cross-model state handoff with heterogeneous upstream conversation ID stripping.
    - Emits `x-session-affinity`, `x-session-handoff-from`, and `x-session-turns` telemetry headers across all protocols.
 
-7. **Web Frontend (`static/index.html`)**:
+7. **SingleFlight & Stream Fanout Engine (`providers/singleflight.py`)**:
+   - Computes deterministic cross-protocol SHA-256 fingerprints across wire parameters and payload semantics.
+   - Leader/Follower flight groups with streaming multi-subscriber fanout and historical replay buffers.
+   - Non-streaming response coalescing with `x-singleflight: leader | follower` telemetry headers and zero duplicate upstream calls.
+
+8. **Web Frontend (`static/index.html`)**:
    - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.

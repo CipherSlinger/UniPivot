@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-09-24 15:41:59",
+  "generated_at": "2026-09-24 21:45:37",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -116,6 +116,16 @@
       "priority": "P0",
       "description": "基于 LRU 与 TTL 追踪多轮交互的会话归属，将后续轮次请求优先分配到已建立对话上下文的后端 Provider；在原 Provider 离线或风控熔断时，自动剥离异构会话 ID 并平滑迁移至同环/降级候选节点，维持多轮交互不中断并输出透明的 x-session-* 遥测指标。",
       "expected_impact": "消除负载均衡导致的跨轮次会话分散与上下文丢失问题，在节点故障时平滑无缝漂移，会话连续性达到 99.99%。"
+    },
+    {
+      "id": "OPT-008",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "并发控制与流量削峰",
+      "title": "智能并发语义去重与流式请求合并引擎 (SingleFlight & Stream Fanout Engine)",
+      "priority": "P0",
+      "description": "基于跨协议确定性请求特征指纹 (SHA-256)，对高并发重复请求实现自动去重与合并；首个请求作为 Leader 发起上游调用并维护历史重放缓冲区，并发到达的 Follower 节点自动挂载并平滑重放历史帧与实时多路广播；彻底消除高频重复调用触发的上游 429 与 WAF 风暴，并输出透明的 x-singleflight-* 遥测指标。",
+      "expected_impact": "高并发下重复请求上游调用量直降 80% 以上，杜绝并发引起的上游风控与频控拦截，跨协议安全隔离，平均响应延迟与网络带宽开销显著降低。"
     }
   ],
   "system_health": "good"

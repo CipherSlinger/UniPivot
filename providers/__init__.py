@@ -106,6 +106,14 @@ from .session_affinity import (
     SessionAffinityManager,
     session_affinity_manager,
 )
+from .singleflight import (
+    FlightGroup,
+    SingleFlightDecision,
+    SingleFlightManager,
+    broadcast_stream_wrapper,
+    singleflight_manager,
+    stream_follower_gen,
+)
 
 __all__ = [
     "ProviderError",
@@ -187,4 +195,10 @@ __all__ = [
     "SessionAffinityManager",
     "AffinityDecision",
     "session_affinity_manager",
+    "FlightGroup",
+    "SingleFlightDecision",
+    "SingleFlightManager",
+    "singleflight_manager",
+    "broadcast_stream_wrapper",
+    "stream_follower_gen",
 ]

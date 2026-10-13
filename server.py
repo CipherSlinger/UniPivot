@@ -104,6 +104,12 @@ from providers import http_client
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
 from providers.session_affinity import AffinityDecision, session_affinity_manager
+from providers.singleflight import (
+    SingleFlightDecision,
+    broadcast_stream_wrapper,
+    singleflight_manager,
+    stream_follower_gen,
+)
 from session_store import (
     MAX_AGE,
     resolve_deepseek,
@@ -575,6 +581,17 @@ def _make_affinity_headers(decision: AffinityDecision) -> dict[str, str]:
     return headers
 
 
+def _make_singleflight_headers(decision: SingleFlightDecision) -> dict[str, str]:
+    """构造并发去重 SingleFlight 响应头。"""
+    headers = {
+        "x-singleflight": "leader" if decision.is_leader else "follower",
+        "x-singleflight-key": decision.short_key,
+    }
+    if not decision.is_leader:
+        headers["x-singleflight-followers"] = str(decision.group.follower_count)
+    return headers
+
+
 def _is_provider_healthy(pkey: str) -> bool:
     """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。"""
     disabled = os.getenv("DISABLED_PROVIDERS", "").split(",")
@@ -1009,6 +1026,7 @@ async def get_diagnostics():
             ],
         },
         "session_affinity": session_affinity_manager.get_diagnostics(),
+        "singleflight": singleflight_manager.get_diagnostics(),
         "risk_avoidance": risk_avoidance,
     }
 
@@ -1289,6 +1307,23 @@ async def chat_completions(req: ChatCompletionRequest):
     async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
         risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
 
+    # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
+    flight_decision = None
+    sf_headers = {}
+    if not singleflight_manager.is_disabled():
+        flight_key = singleflight_manager.compute_key(
+            provider=dispatched_provider,
+            model=dispatched_model,
+            messages=messages,
+            tools=req.tools,
+            temperature=temperature,
+            thinking=is_thinking,
+            stream=req.stream,
+            protocol="openai_chat",
+        )
+        flight_decision = await singleflight_manager.get_or_create(flight_key)
+        sf_headers = _make_singleflight_headers(flight_decision)
+
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
@@ -1298,6 +1333,14 @@ async def chat_completions(req: ChatCompletionRequest):
         stream_headers.update(fold_headers)
         stream_headers.update(risk_headers)
         stream_headers.update(affinity_headers)
+        stream_headers.update(sf_headers)
+
+        if flight_decision and not flight_decision.is_leader:
+            return StreamingResponse(
+                stream_follower_gen(flight_decision.group),
+                media_type="text/event-stream",
+                headers=stream_headers,
+            )
 
         async def gen():
             cid = _id("chatcmpl")
@@ -1637,11 +1680,31 @@ async def chat_completions(req: ChatCompletionRequest):
                     error_msg=error_msg,
                 )
 
+        stream_body = gen()
+        if flight_decision and flight_decision.is_leader:
+            stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+
         return StreamingResponse(
-            gen(),
+            stream_body,
             media_type="text/event-stream",
             headers=stream_headers,
         )
+
+    # 非流式：若当前请求为 Follower，挂载等待 Leader 完成
+    if flight_decision and not flight_decision.is_leader:
+        try:
+            await asyncio.wait_for(flight_decision.group.done_event.wait(), timeout=TIMEOUT)
+        except asyncio.TimeoutError:
+            return JSONResponse(error_response("等待并发共享请求超时", 504, "timeout_error"), status_code=504)
+        if flight_decision.group.error:
+            if isinstance(flight_decision.group.error, ProviderError):
+                pe = flight_decision.group.error
+                return JSONResponse(error_response(pe.message, pe.status, pe.err_type), status_code=pe.status)
+            return JSONResponse(error_response(f"上游服务异常: {flight_decision.group.error}", 502, "upstream_error"), status_code=502)
+
+        follower_headers = dict(flight_decision.group.completed_headers or {})
+        follower_headers.update(sf_headers)
+        return JSONResponse(flight_decision.group.completed_result, headers=follower_headers)
 
     # 非流式：聚合上游流
     chunks: list[str] = []
@@ -1688,9 +1751,13 @@ async def chat_completions(req: ChatCompletionRequest):
         is_risk, _ = is_risk_interception(e.message)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
         error_msg = str(e)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
     finally:
         load_balancer.release(
@@ -1729,6 +1796,7 @@ async def chat_completions(req: ChatCompletionRequest):
     resp_headers.update(risk_headers)
     resp_headers.update(thinking_headers)
     resp_headers.update(affinity_headers)
+    resp_headers.update(sf_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -1767,6 +1835,8 @@ async def chat_completions(req: ChatCompletionRequest):
             )
             if failover_event:
                 resp_data["failover"] = failover_event.to_dict()
+            if flight_decision and flight_decision.is_leader:
+                await flight_decision.group.finish(result=resp_data, headers=resp_headers)
             return JSONResponse(resp_data, headers=resp_headers if resp_headers else None)
 
     resp_data = completion_response(
@@ -1774,6 +1844,8 @@ async def chat_completions(req: ChatCompletionRequest):
     )
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
+    if flight_decision and flight_decision.is_leader:
+        await flight_decision.group.finish(result=resp_data, headers=resp_headers)
     return JSONResponse(resp_data, headers=resp_headers if resp_headers else None)
 
 
@@ -1850,6 +1922,23 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
         risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
 
+    # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
+    flight_decision = None
+    sf_headers = {}
+    if not singleflight_manager.is_disabled():
+        flight_key = singleflight_manager.compute_key(
+            provider=dispatched_provider,
+            model=dispatched_model,
+            messages=gateway_messages,
+            tools=req.tools,
+            temperature=temperature,
+            thinking=enable_thinking,
+            stream=req.stream,
+            protocol="anthropic_messages",
+        )
+        flight_decision = await singleflight_manager.get_or_create(flight_key)
+        sf_headers = _make_singleflight_headers(flight_decision)
+
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
@@ -1859,6 +1948,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         stream_headers.update(fold_headers)
         stream_headers.update(risk_headers)
         stream_headers.update(affinity_headers)
+        stream_headers.update(sf_headers)
+
+        if flight_decision and not flight_decision.is_leader:
+            return StreamingResponse(
+                stream_follower_gen(flight_decision.group),
+                media_type="text/event-stream",
+                headers=stream_headers,
+            )
 
         async def gen():
             msg_id = _id("msg", "_")
@@ -2090,11 +2187,31 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     error_msg=error_msg,
                 )
 
+        stream_body = gen()
+        if flight_decision and flight_decision.is_leader:
+            stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+
         return StreamingResponse(
-            gen(),
+            stream_body,
             media_type="text/event-stream",
             headers=stream_headers,
         )
+
+    # 非流式：若当前请求为 Follower，挂载等待 Leader 完成
+    if flight_decision and not flight_decision.is_leader:
+        try:
+            await asyncio.wait_for(flight_decision.group.done_event.wait(), timeout=TIMEOUT)
+        except asyncio.TimeoutError:
+            return JSONResponse(anthropic_error_response("等待并发共享请求超时", 504, "timeout_error"), status_code=504)
+        if flight_decision.group.error:
+            if isinstance(flight_decision.group.error, ProviderError):
+                pe = flight_decision.group.error
+                return JSONResponse(anthropic_error_response(pe.message, pe.status, pe.err_type), status_code=pe.status)
+            return JSONResponse(anthropic_error_response(f"上游服务异常: {flight_decision.group.error}", 502, "upstream_error"), status_code=502)
+
+        follower_headers = dict(flight_decision.group.completed_headers or {})
+        follower_headers.update(sf_headers)
+        return JSONResponse(flight_decision.group.completed_result, headers=follower_headers)
 
     # 非流式
     chunks: list[str] = []
@@ -2141,12 +2258,16 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         is_risk, _ = is_risk_interception(e.message)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(
             anthropic_error_response(e.message, e.status, e.err_type),
             status_code=e.status,
         )
     except Exception as e:
         error_msg = str(e)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(
             anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error"),
             status_code=502,
@@ -2189,6 +2310,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     resp_headers.update(risk_headers)
     resp_headers.update(thinking_headers)
     resp_headers.update(affinity_headers)
+    resp_headers.update(sf_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -2222,6 +2344,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             )
             if failover_event:
                 msg_data["failover"] = failover_event.to_dict()
+            if flight_decision and flight_decision.is_leader:
+                await flight_decision.group.finish(result=msg_data, headers=resp_headers)
             return JSONResponse(
                 msg_data,
                 headers=resp_headers if resp_headers else None,
@@ -2240,6 +2364,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     )
     if failover_event:
         msg_data["failover"] = failover_event.to_dict()
+    if flight_decision and flight_decision.is_leader:
+        await flight_decision.group.finish(result=msg_data, headers=resp_headers)
     return JSONResponse(
         msg_data,
         headers=resp_headers if resp_headers else None,
@@ -2329,6 +2455,58 @@ async def responses_endpoint(req: ResponsesRequest):
     async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
         risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
 
+    # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
+    flight_decision = None
+    sf_headers = {}
+    if not singleflight_manager.is_disabled():
+        flight_key = singleflight_manager.compute_key(
+            provider=dispatched_provider,
+            model=dispatched_model,
+            messages=gateway_messages,
+            tools=req.tools,
+            temperature=temperature,
+            thinking=enable_thinking,
+            stream=req.stream,
+            protocol="openai_responses",
+        )
+        flight_decision = await singleflight_manager.get_or_create(flight_key)
+        sf_headers = _make_singleflight_headers(flight_decision)
+
+    base_headers = dict(lb_headers)
+    base_headers.update(fold_headers)
+    base_headers.update(risk_headers)
+    base_headers.update(affinity_headers)
+    base_headers.update(sf_headers)
+
+    if req.stream:
+        stream_headers = {
+            "Cache-Control": "no-cache",
+            "X-Accel-Buffering": "no",
+        }
+        stream_headers.update(base_headers)
+
+        if flight_decision and not flight_decision.is_leader:
+            return StreamingResponse(
+                stream_follower_gen(flight_decision.group),
+                media_type="text/event-stream",
+                headers=stream_headers,
+            )
+    else:
+        if flight_decision and not flight_decision.is_leader:
+            try:
+                await asyncio.wait_for(flight_decision.group.done_event.wait(), timeout=TIMEOUT)
+            except asyncio.TimeoutError:
+                return JSONResponse(error_response("等待并发共享请求超时", 504, "timeout_error"), status_code=504)
+            if flight_decision.group.error:
+                if isinstance(flight_decision.group.error, ProviderError):
+                    pe = flight_decision.group.error
+                    return JSONResponse(error_response(pe.message, pe.status, pe.err_type), status_code=pe.status)
+                return JSONResponse(error_response(f"上游服务异常: {flight_decision.group.error}", 502, "upstream_error"), status_code=502)
+
+            follower_headers = dict(flight_decision.group.completed_headers or {})
+            follower_headers.update(sf_headers)
+            return JSONResponse(flight_decision.group.completed_result, headers=follower_headers)
+
     resp_id = _id("resp", "_")
     msg_id = _id("msg", "_")
     start_time = time.time()
@@ -2349,6 +2527,8 @@ async def responses_endpoint(req: ResponsesRequest):
         is_risk, _ = is_risk_interception(e.message)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         load_balancer.release(
             dispatched_provider,
             success=False,
@@ -2357,6 +2537,8 @@ async def responses_endpoint(req: ResponsesRequest):
         )
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         load_balancer.release(
             dispatched_provider,
             success=False,
@@ -2365,10 +2547,7 @@ async def responses_endpoint(req: ResponsesRequest):
         )
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
 
-    resp_headers = dict(lb_headers)
-    resp_headers.update(fold_headers)
-    resp_headers.update(risk_headers)
-    resp_headers.update(affinity_headers)
+    resp_headers = dict(base_headers)
     if failover_event:
         resp_headers.update({
             "x-failover-from": failover_event.from_provider,
@@ -2642,8 +2821,12 @@ async def responses_endpoint(req: ResponsesRequest):
                     error_msg=error_msg,
                 )
 
+        stream_body = gen()
+        if flight_decision and flight_decision.is_leader:
+            stream_body = broadcast_stream_wrapper(stream_body, flight_decision.group)
+
         return StreamingResponse(
-            gen(),
+            stream_body,
             media_type="text/event-stream",
             headers=stream_headers,
         )
@@ -2678,9 +2861,13 @@ async def responses_endpoint(req: ResponsesRequest):
     except ProviderError as e:
         is_rate_limit = (e.status == 429)
         error_msg = e.message
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
     except Exception as e:
         error_msg = str(e)
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(error=e)
         return JSONResponse(error_response(f"上游服务异常: {e}", 502, "upstream_error"), status_code=502)
     finally:
         load_balancer.release(
@@ -2749,6 +2936,8 @@ async def responses_endpoint(req: ResponsesRequest):
     )
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
+    if flight_decision and flight_decision.is_leader:
+        await flight_decision.group.finish(result=resp_data, headers=resp_headers)
     return JSONResponse(
         resp_data,
         headers=resp_headers if resp_headers else None,
