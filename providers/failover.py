@@ -43,6 +43,7 @@ from typing import (
     List,
     Mapping,
     Optional,
+    Sequence,
     Set,
     Tuple,
     Union,
@@ -67,6 +68,11 @@ logger = logging.getLogger("gateway.failover")
 # [OPT-028] 观察期的**证据积累期**下限（秒）：即便 `GATEWAY_PROBATION_WINDOW=0`
 # 也必须保留这么长的记录，否则「零证据仍在门控」的节点永远无法通过后续成功毕业。
 _PROBATION_EVIDENCE_FLOOR = 300.0
+
+# [OPT-029] 「凭证确已更新」可解除的避让成因：认证失效（令牌过期，重登即修）与
+# 人机验证（RGV587 / 验证码，**只有**人工重登能解除）。两者被解除的依据是同一条
+# 可观测事实——凭证文件变了。频控**永不**在内：它本就会自行衰减，重登毫无意义。
+_RELEASABLE_BY_RENEWAL = (SEVERITY_AUTH, SEVERITY_WAF)
 
 
 # ---------------------------------------------------------------- [OPT-014] 风控证据驱动的自适应步调
@@ -770,9 +776,36 @@ class CooldownTracker:
                 # 针对频控与风控加权冷却 (指数退避: base_cd * (1.2 ** min(cur_fails - 1, 3)))
                 waf_cap = float(os.getenv("GATEWAY_WAF_COOLDOWN_MAX", "900"))
                 cooldown_duration = min(waf_cap, base_cd * (1.2 ** min(cur_fails - 1, 3)))
-                if is_risk:
+                if severity == SEVERITY_WAF:
+                    # [OPT-029] 人机验证与频控必须分开处置——两者的**恢复方式相反**：
+                    # 频控（429）是瞬时的、会自行衰减，因此「到点重试」本身就是正确的
+                    # 恢复策略，短冷却 + 有上限是对的；
+                    # 而人机验证（RGV587 / 验证码）**只有人能解除**（OPT-023 档案对此类
+                    # 的结论就是 auto_recovers=False、recoverable_by_relogin=True），
+                    # 每一次自动重试都是又一次「自动化尝试」，只会加重账号标记。
+                    # 实测旧行为：重复的人机验证拦截在第 4 次即饱和于 ~78s 且**永不再增长**
+                    # （1.2**3 封顶 + 900s 上限），于是该节点每 ~78 秒被再次触碰一次，无限循环
+                    # ——恰恰是对最需要人介入的那一类，给了最短的耐心。这是缺陷的反转形态，
+                    # 与 OPT-025 的整环风暴同源，只是发生在单节点上并自我维持。
+                    # 因此重复的人机验证必须按 2 的幂次长效升级（与认证级同构）。
+                    waf_min = self._waf_escalation_min_failures()
+                    if cur_fails >= waf_min:
+                        long_base = float(os.getenv("GATEWAY_WAF_LONG_COOLDOWN_BASE", "3600"))
+                        long_cap = float(os.getenv("GATEWAY_WAF_LONG_COOLDOWN_MAX", "86400"))
+                        cooldown_duration = min(
+                            long_cap, long_base * (2 ** min(cur_fails - waf_min, 6))
+                        )
+                        escalated = True
+                        logger.warning(
+                            f"[风控拦截避让] 节点 [{provider_key}] 人机验证重复出现 "
+                            f"(第 {cur_fails} 次)：该类拦截**只有人工重登可解除**，"
+                            f"自动重试只会加重标记，已升级为长效避让 {cooldown_duration:.1f}s。"
+                            f"请执行 `.venv/bin/python login.py {provider_key}` 由人工完成验证"
+                        )
+                if not escalated:
                     logger.warning(
-                        f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: {risk_reason}，"
+                        f"[风控拦截避让] 节点 [{provider_key}] 命中风控规则: "
+                        f"{risk_reason or error_msg[:80]}，"
                         f"触发避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
                     )
             else:
@@ -804,6 +837,14 @@ class CooldownTracker:
                 except Exception:  # noqa: BLE001
                     renewed_at_failure = False
                 self._note_renewal_rejection(provider_key, renewed_at_failure)
+            elif severity == SEVERITY_WAF:
+                # [OPT-029] 人机验证同样要留下凭证基线：人工 `login.py`（完成滑块验证）
+                # 成功后令牌必然刷新，指纹变化即「人类已介入」的唯一可观测证据。
+                # 没有这条基线，长效避让就没有出口——同一个自锁缺陷换了个成因。
+                try:
+                    self.renewal.note_interception(provider_key)
+                except Exception:  # noqa: BLE001 - 基线记录失败绝不影响冷却主流程
+                    pass
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
@@ -883,6 +924,26 @@ class CooldownTracker:
             return max(60.0, float(os.getenv("GATEWAY_AUTO_QUARANTINE_DURATION", "259200")))
         except ValueError:
             return 259200.0
+
+    # ---------------------------------------------------- [OPT-029] 人机验证长效避让
+
+    def _waf_escalation_min_failures(self) -> int:
+        """重复多少次人机验证拦截后升级为长效避让（默认 3）。"""
+        try:
+            return max(1, int(os.getenv("GATEWAY_WAF_ESCALATION_MIN_FAILURES", "3")))
+        except ValueError:
+            return 3
+
+    def cooldown_cause(self, provider_key: str) -> str:
+        """[OPT-029] 返回该节点**当前冷却的成因**（无冷却时返回空串）。
+
+        公开的只读访问器：档案与运维提示必须能区分「频控短暂退避，无需干预」与
+        「人机验证，必须由人工完成验证」，否则运维会照着「无需人工介入」的建议
+        去处理一个只有人能解决的节点。
+        """
+        if self.get_remaining_cooldown(provider_key) <= 0.0:
+            return ""
+        return self._effective_cooldown_severity(provider_key)
 
     def _note_renewal_rejection(self, provider_key: str, renewed_at_failure: bool) -> None:
         """[OPT-027] 累加「新凭证仍被拒」证据，达标即推断账号级封禁。
@@ -1032,8 +1093,13 @@ class CooldownTracker:
         except Exception:  # noqa: BLE001 - 台账不可读则不改变判定（保守）
             return ""
 
-    def release_auth_avoidance_locked(self, providers, reason: str = "credential-renewal") -> List[str]:
-        """[OPT-026] 复位「认证失效」成因的避让状态（调用方须持 `self._lock`，
+    def release_auth_avoidance_locked(
+        self,
+        providers,
+        reason: str = "credential-renewal",
+        causes: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """[OPT-026] 复位由**凭证成因**导致的避让状态（调用方须持 `self._lock`，
         或确保当前无并发访问——启动期单线程调用即属此列）。
 
         为什么需要它：`record_failure` 对认证失效按 2 的幂次长效升级，真实台账里
@@ -1043,12 +1109,19 @@ class CooldownTracker:
 
         严格限定作用域（fail-closed，任何不确定都选择继续避让）：
         1. 持有运维封禁租约的节点**永不**释放——租约表达账号级封禁，重登无效；
-        2. 仅当最近一次失败的严重度为 `auth` 时释放——若之后又发生 WAF/频控，
-           说明是另一类问题，绝不代它释放；
+        2. 仅当最近一次失败的严重度**属于 `causes`** 时释放——若之后又发生其它类
+           拦截，说明是另一类问题，绝不代它释放；
         3. 无实际冷却与失败计数可清者跳过，避免平白引入观察期。
         释放后节点进入恢复观察期 (OPT-022)：串行探路 + 放大步调，防止被压制的
         需求在凭证刚更新时集中涌出。
+
+        [OPT-029] `causes` 使**成因**成为显式参数：默认仅 `auth`，而「凭证确已更新」
+        这一触发条件（`release_renewed_credentials`）对 `waf` 同样成立——人工执行
+        `login.py` 完成滑块验证后令牌必然刷新，指纹变化即「人类已介入」的证据。
+        若不把 `waf` 纳入，人机验证的长效避让就没有出口，会退化成永久冻结。
+        `ratelimit` 永远不在可释放之列：它本就是瞬时可自愈的，重登毫无意义。
         """
+        allowed = tuple(causes) if causes else (SEVERITY_AUTH,)
         now = time.time()
         released: List[str] = []
         lifted: List[str] = []
@@ -1070,8 +1143,8 @@ class CooldownTracker:
                     continue
             except Exception:  # noqa: BLE001 - 查询失败按「有租约」处理（保守）
                 continue
-            # 2. 只有认证成因的冷却才可被续期复位
-            if self._effective_cooldown_severity(provider_key) != SEVERITY_AUTH:
+            # 2. 只有 `causes` 指定的成因才可被复位
+            if self._effective_cooldown_severity(provider_key) not in allowed:
                 continue
             # 3. 确有待复位状态
             has_cooldown = self._cooldowns.get(provider_key, 0.0) > now
@@ -1100,10 +1173,20 @@ class CooldownTracker:
             self._persist_state()
         return released
 
-    async def release_auth_avoidance(self, providers, reason: str = "credential-renewal") -> List[str]:
-        """[OPT-026] 持锁版本的认证级避让复位（供运行期管理接口调用）。"""
+    async def release_auth_avoidance(
+        self,
+        providers,
+        reason: str = "credential-renewal",
+        causes: Optional[Sequence[str]] = None,
+    ) -> List[str]:
+        """[OPT-026] 持锁版本的凭证成因避让复位（供运行期管理接口调用）。
+
+        [OPT-029] `causes` 默认仅 `auth`；显式点名某节点的管理接口可传入
+        `(SEVERITY_AUTH, SEVERITY_WAF)`，因为人工为某个节点完成 H 验证同样是
+        「凭证成因」被消除的直接证据。
+        """
         async with self._lock:
-            return self.release_auth_avoidance_locked(providers, reason)
+            return self.release_auth_avoidance_locked(providers, reason, causes)
 
     def renewed_providers(self) -> List[str]:
         """[OPT-026] 凭证文件确已更新的节点（只读判定）。"""
@@ -1117,19 +1200,22 @@ class CooldownTracker:
 
         `providers` 为 None 时依据凭证指纹自动判定；显式给出时跳过判定直接复位
         （覆盖环境变量式凭证等无法取指纹的部署）。
+
+        [OPT-029] 触发条件是「凭证**确已更新**」，该事实对 `auth` 与 `waf` 同时成立
+        （人工完成滑块验证后令牌同样会刷新），因此两者都可被复位；`ratelimit` 永不。
         """
         targets = list(providers) if providers is not None else self.renewed_providers()
         if not targets:
             return []
-        return self.release_auth_avoidance_locked(targets, reason)
+        return self.release_auth_avoidance_locked(targets, reason, _RELEASABLE_BY_RENEWAL)
 
     async def release_renewed_credentials(self, providers=None, reason: str = "credential-renewal") -> List[str]:
-        """[OPT-026] 运行期入口：自动判定（或指定）并复位认证级避让。"""
+        """[OPT-026] 运行期入口：自动判定（或指定）并复位凭证成因的避让。"""
         targets = list(providers) if providers is not None else self.renewed_providers()
         if not targets:
             return []
         async with self._lock:
-            return self.release_auth_avoidance_locked(targets, reason)
+            return self.release_auth_avoidance_locked(targets, reason, _RELEASABLE_BY_RENEWAL)
 
     def compute_pacing_interval(self, provider_key: str, jitter: float = 0.0) -> float:
         """计算节点下一次调用前应保持的最小间隔（秒，不含抖动时传入 jitter=0）。

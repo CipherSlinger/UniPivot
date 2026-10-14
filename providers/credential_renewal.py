@@ -229,6 +229,35 @@ class CredentialRenewalTracker:
             self._save_locked()
         return renewed_since_last
 
+    def note_interception(self, provider_key: str, now: Optional[float] = None) -> bool:
+        """记录一次**非认证类**拦截时刻的凭证指纹（[OPT-029]，只记基线，不做推断）。
+
+        为什么人机验证也需要基线：被 RGV587 / 验证码拦截的节点，唯一正确的解除方式
+        是**人工**执行 `login.py` 完成滑块验证，而这件事的可观测证据恰恰是**凭证文件
+        变了**（登录成功后令牌必然刷新）。若不在 WAF 拦截时刻留下基线，日后指纹变化
+        就无从比对，「人工已介入」这一事实将永远无法被网关识别——长效避让就会变成
+        没有出口的永久冻结，正是 OPT-026 已经修过的那类自锁缺陷，只是换了个成因。
+
+        与 `note_auth_failure` 的关键区别：**不返回**「本次失败是否发生在一枚更新的
+        凭证上」，也不计入 `rejections_after_renewal`。那条证据链是给 OPT-027 的
+        账号级封禁推断用的，判别式严格限定为「被 401 拒绝」；把人机验证混入其中会
+        污染该判别式（在封禁成因完全不同的时候触发自动租约）。
+        """
+        if self.is_disabled():
+            return False
+        pk = (provider_key or "").strip().lower()
+        if not pk:
+            return False
+        fp = credential_fingerprint(pk)
+        if fp is None:
+            return False
+        now = time.time() if now is None else now
+        with self._lock:
+            self._records[pk] = {"fingerprint": fp, "at": now}
+            self._stats["renewals_recorded"] += 1
+            self._save_locked()
+        return True
+
     def current_fingerprint(self, provider_key: str) -> Optional[str]:
         """返回该节点凭证的当前指纹（供调用方比对历史指纹，只读）。"""
         return credential_fingerprint(provider_key)

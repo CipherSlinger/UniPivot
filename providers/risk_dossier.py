@@ -98,7 +98,10 @@ AVOIDANCE_MATRIX: Dict[str, Dict[str, Any]] = {
         "typical_span": "分钟级 ~ 小时级",
         "strategy": "无法用程序绕过（这正是人机验证的设计目的，任何自动破解都属对抗性"
                     "且会加重风控评分）。正确做法是退出自动路径，由人工执行 "
-                    "`python login.py <provider>` 完成滑块验证，重登可恢复会话。",
+                    "`python login.py <provider>` 完成滑块验证，重登可恢复会话。"
+                    "重复出现时网关会升级为长效避让（与认证级同构）——因为持续重试"
+                    "只会加重标记，而这一类拦截**没有任何自动恢复路径**；人工完成"
+                    "验证后凭证指纹变化，网关自动解除避让并转入串行探路重新验证。",
     },
     "auth": {
         "label": "认证失效 (令牌/会话过期)",
@@ -277,6 +280,20 @@ class RiskDossier:
         except Exception:  # noqa: BLE001
             return 0.0
 
+    def _cooldown_cause(self, provider_key: str) -> str:
+        """[OPT-029] 当前冷却的成因（`auth` / `waf` / `ratelimit` / 空）。
+
+        档案必须能区分成因才能给出**正确**的处置建议：频控是瞬时可自愈的（等待即可），
+        认证失效可由重登修复，而人机验证只有人工完成验证才能解除。混为一谈会让运维
+        照「无需人工介入」的建议处理一个只有人能解决的节点。
+        """
+        if self.cooldown_tracker is None:
+            return ""
+        try:
+            return str(self.cooldown_tracker.cooldown_cause(provider_key) or "")
+        except Exception:  # noqa: BLE001 - 只读查询失败绝不影响档案装配
+            return ""
+
     def _probation_state(self, provider_key: str) -> Dict[str, Any]:
         if self.cooldown_tracker is None:
             return {"active": False, "successes": 0, "required": 0, "pacing_factor": 1.0}
@@ -372,8 +389,27 @@ class RiskDossier:
             ]
         if posture == POSTURE_COOLING:
             rem = entry["cooldown_remaining_s"]
+            cause = entry.get("cooldown_cause", "")
+            # [OPT-029] 冷却**不能**一律告知「无需人工介入」：人机验证类拦截只有人工
+            # 重登能解除，而重复出现时会升级为长效避让——此时「由自动门控管理」的建议
+            # 会把运维引向错误的等待，节点将被冻结数小时而无人处理。
+            if cause == "waf":
+                return [
+                    f"该节点因**人机验证**（RGV587 / 验证码）进入避让，剩余约 {rem:.0f} 秒；"
+                    f"重复出现已升级为长效避让，自动重试只会加重账号标记",
+                    f"唯一有效的处置是人工执行 `.venv/bin/python login.py {provider_key}` "
+                    f"完成滑块验证——登录成功后凭证指纹变化，网关会**自动解除**该避让"
+                    f"并转入串行探路重新验证",
+                    "在完成人工验证之前严禁以脚本方式重试或破解验证码：属对抗行为且会显著加重风控评分",
+                ]
+            if cause == "auth":
+                return [
+                    f"该节点因**凭证失效**进入避让，剩余约 {rem:.0f} 秒",
+                    f"执行 `.venv/bin/python login.py {provider_key}` 重新登录取令牌；"
+                    f"凭证更新后网关会自动解除避让并转入串行探路重新验证",
+                ]
             return [
-                f"保持避让：冷却剩余约 {rem:.0f} 秒，由自动门控管理，无需人工介入",
+                f"保持避让：冷却剩余约 {rem:.0f} 秒（成因：{cause or '未知'}），由自动门控管理，无需人工介入",
                 "流量已自动分流至同能力环的其他健康节点",
             ]
         if posture == POSTURE_PROBATION:
@@ -425,6 +461,7 @@ class RiskDossier:
                 "jitter_range": list(meta.jitter_range) if meta else None,
             },
             "cooldown_remaining_s": round(self._cooldown_state(provider_key), 1),
+            "cooldown_cause": self._cooldown_cause(provider_key),
             "quarantine": self._quarantine_state(provider_key),
             "probation": self._probation_state(provider_key),
             "pacing": self._pacing_state(provider_key),

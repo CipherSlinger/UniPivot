@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-14 13:04:50",
+  "generated_at": "2026-10-14 13:24:29",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -326,6 +326,16 @@
       "priority": "P0",
       "description": "OPT-022 的恢复观察期是「解封后防止二次封禁」的最后一道闸门，但它的毕业条件写成了**时间**：is_in_probation 在 now >= 释放时刻 + GATEWAY_PROBATION_WINDOW(默认 300s) 时直接返回 False，无论期间是否取得过任何证据（实测确认：episode 结束 400 秒后、成功握手数为 0，节点以全并发 + 基础步调回到环内）。这使保护在最需要它的场景下**静默失效**——低流量节点（尤其夜间）在 300 秒里往往连一次握手都没有，观察期就此空转结束；随后抵达的需求是**全并发**打向一个**仍可能处于封禁中**的账号，正是当初触发封禁的形态。第二处同类缺口在 _restore_persisted_state：episode_ends 仅在 now < end + window 时被保留，因此「解封后重启」会把仍在门控中的观察期记录整体丢弃，节点立刻全并发上线。本次修改 providers/failover.py：窗口降格为**续期单位**，新增纯函数 _probation_horizon()（续期次数由「已流逝窗口数」推导，min(floor(elapsed/window), GATEWAY_PROBATION_MAX_RENEWALS)，默认 3 次，即最多门控 窗口×4），续期期间串行闸门与放大步调继续有效；续期预算耗尽后仍按**证据**裁决——successes > 0 才毕业，零证据则保持门控（没有成功握手就没有洪峰可放行，继续门控不产生任何代价；放开却等于把完全未经验证的账号交给全并发）。同时修复三处配套缺陷：(1) 成功握手的记录窗口由 _probation_horizon 放宽到 _probation_retention，否则零证据被门控的节点连后来取得的成功都无法计入、门控成为死锁；(2) GATEWAY_PROBATION_WINDOW=0 视为「不给时间宽限」而非「立即放开」，并设 _PROBATION_EVIDENCE_FLOOR=300s 保证证据仍能被记录（完整关闭请用 GATEWAY_DISABLE_PROBATION=1）；(3) 记录保留期覆盖续期后的完整视野，堵住「解封后重启」这一绕过路径。遥测新增派生的 renewing / awaiting_first_handshake / budget_exhausted，使「观察期是否真的在起作用」可观测而非假设。",
       "expected_impact": "让解封后的最后一道保护从「看起来有」变成「确实有效」：观察期不再因时间流逝而静默失效，毕业条件由「时间到了」改为「确实通了」，杜绝「窗口内零握手→放行全并发→打向仍被封账号→二次封禁」的路径；同时堵住「解封后重启即绕过观察期」的旁路。对从未被触达的节点，门控不产生任何代价（无请求即无洪峰），因此该加固对可用性零影响；迟到的成功握手始终能使节点毕业，门控不会死锁。GATEWAY_PROBATION_MAX_RENEWALS=0 可恢复旧行为，GATEWAY_DISABLE_PROBATION=1 仍为总开关。"
+    },
+    {
+      "id": "OPT-029",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控避让与恢复安全",
+      "title": "人机验证的长效避让与人工介入解除 (Human-Verification Escalation & Human-Gated Release)",
+      "priority": "P0",
+      "description": "record_failure 把 waf 与 ratelimit 放进**同一个**升级分支，共用 base × 1.2 ** min(n-1, 3) 并封顶 GATEWAY_WAF_COOLDOWN_MAX(900s)。实测结果：重复的人机验证在第 4 次即饱和于 ~78s 且**永不再增长**（指数封顶 3 次），于是该节点每 ~78 秒被再次触碰一次、无限循环；反观 auth —— 其恢复手段不过是一次自动重登 —— 却升到 7200s 并继续向 24h 上限增长。这是**语义的完全倒置**：按 OPT-023 档案，waf 是唯一 auto_recovers=False、唯一必须由**人**完成滑块验证的一档，却承受了**最频繁**的自动重试。每一次重试都是一次落在已被人机验证标记的账号上的「自动化尝试」——与 OPT-025 那场整环凭证风暴同源（重试本身就是风控触发器），只是发生在单节点上并自我维持，且与本项目「严禁加重其他厂商风控」的约束直接冲突。修复分两半，缺一不可：(1) **升级**——重复出现的 waf（≥ GATEWAY_WAF_ESCALATION_MIN_FAILURES，默认 3）按 2 的幂次长效避让（GATEWAY_WAF_LONG_COOLDOWN_BASE 3600s × 2ⁿ，封顶 GATEWAY_WAF_LONG_COOLDOWN_MAX 86400s），与认证级同构；单次人机验证绝不升级（避免误伤偶发验证），无法识别为验证码的风控命中保持既有短冷却，**频控有意不动**（瞬时且自愈，「冷却到点后重试」本身就是正确策略，其短冷却与上限与修复前逐值一致）。(2) **解除，缺了它升级就是永久冻结**——长效避让只有**人能解除**才可接受，而「人已介入」的唯一可观测证据就是**凭证文件变了**（login.py 完成滑块验证后令牌必然刷新，Session.save() 每次捕获都刷新 captured_at，指纹必然移动）。因此 WAF 拦截时刻留下凭证基线（CredentialRenewalTracker.note_interception），复位路径的可复位集合扩为 auth **与** waf（_RELEASABLE_BY_RENEWAL），否则升级期就正是 OPT-026 已修过的那类自锁缺陷换了个成因。note_interception **只记基线、不做推断**：它不返回「本次失败是否发生在一枚更新的凭证上」，那是 OPT-027 的判别式且严格限定 401，混入人机验证会在成因完全不同时误触发自动租约。配套修正 OPT-023 档案：冷却姿态原本给出统一建议文本，被升级的 waf 节点会沿用频控的「无需人工介入」，让运维去「等」一个只有人能修的节点；档案现在逐节点暴露 cooldown_cause 并据此分支（waf → 人工重登并**明确禁止**脚本化破解验证码；auth → 重登；ratelimit → 无需人工介入且明确不建议重登）。",
+      "expected_impact": "把「最需要人介入的一类却耐心最短」倒置过来：重复的人机验证不再每 78 秒自动触碰一次已被人机验证标记的账号（实测升级序列 45 → 54 → 3600 → 7200 → 14400s），掐断一条自我维持、持续加重上游风控标记的通道，直接服务于「不得让其他厂商也被封」的项目约束；同时通过凭证指纹给出**人工出口**，避免长效避让退化为永久冻结——人工完成一次 login.py 滑块验证即自动解除避让，并进入 OPT-022 恢复观察期以串行探路重新验证，而不是解封即满速。频控行为逐值零回归（本套件第一个用例即为逐值断言），单次人机验证不升级，运维封禁租约优先级仍高于该释放路径，账号级封禁推断不受污染。遥测：档案条目新增 cooldown_cause，新增 GATEWAY_WAF_ESCALATION_MIN_FAILURES / GATEWAY_WAF_LONG_COOLDOWN_BASE / GATEWAY_WAF_LONG_COOLDOWN_MAX 三个可调参数。"
     }
   ],
   "system_health": "good"
