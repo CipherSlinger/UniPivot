@@ -265,6 +265,15 @@ PROVIDER_RISK_SPECS = {
 - **绝不卡死**：状态带 TTL（`GATEWAY_CREDENTIAL_OUTAGE_TTL`，默认 120s），到期后放行**恰好一次**探路；若整环仍在 401，首次失败即立刻重建失效态。于是探测频率由「每个客户端请求一次」退化为「每 TTL 一次」，风暴被削平，同时不可能因状态卡死而永久拒绝服务。任一节点成功（`record_success` → `note_success`）即从失效集合中摘除，容量回到阈值以上**立刻恢复派发**（fail-open）。
 - **开关与遥测**：`GATEWAY_DISABLE_CREDENTIAL_WATCH=1` 关闭；`GATEWAY_DISABLE_RISK_LEDGER=1` 一并关闭（与封禁租约同约定，保证纯内存冷却语义的测试套件不受影响）。`/v1/diagnostics` 暴露 `credential_outage`，`GET /v1/admin/credential-outage` 查看状态、`DELETE` 在重登后立即解除。
 
+#### 15. 凭证续期检测与认证级避让复位 (`providers/credential_renewal.py`)
+
+- **风暴之后的 24 小时尾巴（为什么 OPT-025 还不够）**：`record_failure` 对认证失效按 `GATEWAY_AUTH_COOLDOWN_BASE`(1800s) × 2ⁿ 长效升级，封顶 `GATEWAY_AUTH_COOLDOWN_MAX`(86400s)。真实台账里五个节点的认证失败次数是 54/54/54/87/60——**全部撞到 24 小时上限**，而且该状态随台账持久化、跨重启恢复。于是风暴结束后，五个节点**各自被冻结整整一天**。OPT-025 解决了风暴期间的重复派发，但没有解决风暴之后的冻结。
+- **惩罚的对象为什么消失了**：长效升级惩罚的是「拿着**同一个失效凭证**反复打」——这确实该罚。但凭证一旦续期，这个行为就不再存在，继续冻结惩罚的已不是坏行为，而是**已经修好的系统**：冷却读数仍为 24h，导致健康探针跳过该节点、自愈大脑选举将其排除、路由降级排序；最直接的问题是 `server.py:_deferred_refresh_after_cooldown`——**令牌静默刷新本身也被冷却门控挡住，最多推迟 24 小时**。也就是说「凭证失效」制造的状态，正好锁死了唯一能自动修复它的机制。反向验证：OPT-023 档案对 `auth` 类的结论是 `recoverable_by_relogin = True`，系统一面告诉运维「重登可恢复」，一面在重登之后继续避让 24 小时，结论与行为自相矛盾。
+- **判定「已续期」靠内容指纹**：在记录认证失败的那一刻对凭证来源（`session/<provider>.json`）取指纹——`sha256(token|cookie|captured_at|user_id|device_id)`，不可解析时退化为 `meta:mtime_ns:size`。指纹随冷却一并持久化，因此「先重登、再重启」同样能被识别。`Session.save()` 以 `os.replace` 原子落盘且每次捕获都会刷新 `captured_at`，任何一次真实重登都必然改变指纹。检测器**只回答事实**（凭证变了吗），状态变更由 `CooldownTracker.release_auth_avoidance()` 执行，两者分离使判定路径只读、可安全查询。
+- **复位严格限定成因（fail-closed）**：仅当该节点**最近一次**失败严重度为 `auth` 时才复位（成因随冷却持久化）；成因记录缺失时（本机制上线前遗留的冷却，如真实台账里那五条 24h 冻结）退化为**只读**查询风控台账中该节点最近一次拦截的成因，仍保持成因限定。持有**运维封禁租约**的节点永不复位——租约表达账号级封禁，重登无效，与「凭证过期」是两回事；`waf`/`频控` 成因也绝不被代为释放。无记录、凭证不可读、指纹相同，一律判定「未续期」。复位后节点经 OPT-022 恢复观察期重新进入：被压制数日的需求在凭证刚更新时集中释放，正是观察期要防的洪峰。
+- **解锁修复链**：复位使 `get_remaining_cooldown()` 归零，从而解除 OPT-013 令牌静默刷新的冷却门控——唯一自动修复路径因此恢复可用。启动时执行一次扫描（`await cooldown_tracker.release_renewed_credentials()`），因为「重登 + 重启」是最常见的运维流程。
+- **接口与开关**：`GATEWAY_DISABLE_CREDENTIAL_RENEWAL=1` 关闭；`GATEWAY_DISABLE_RISK_LEDGER=1` 一并关闭（与封禁租约 / 凭证失效检测同约定）。`/v1/diagnostics` 暴露 `credential_renewal`；`GET /v1/admin/credential-renewal` 查看指纹记录与判定结果；`POST /v1/admin/credential-renewal/scan` 触发复位，请求体 `{"providers":[...]}` 用于**凭证来自环境变量**（无文件可比指纹）的部署；`DELETE /v1/admin/credential-outage` 在清除全环失效态的同时**连带复位**这些节点的认证级避让——该接口的语义本就是「我已续期并修好」，否则接口承诺不兑现。
+
 
 ---
 
@@ -327,7 +336,7 @@ PROVIDER_RISK_SPECS = {
 ├── providers/                  # 提供方核心实现与协议转译包
 │   ├── __init__.py             # 统一导出各 Provider 类与公共工具函数
 │   ├── base.py                 # 基础抽象类、消息展平、Token 估算、SSE 帧构建、ProviderError
-│   ├── failover.py             # 对等互备路由网格：三级能力环、风控元数据、动态冷却、故障转移、封禁硬阻断、恢复观察期、凭证失效快速失败
+│   ├── failover.py             # 对等互备路由网格：三级能力环、风控元数据、动态冷却、故障转移、封禁硬阻断、恢复观察期、凭证失效快速失败、认证级避让复位
 │   ├── http_client.py          # 全局 HTTP/2 共享连接池单例维护与优雅关闭
 │   ├── anthropic_compat.py     # Anthropic Messages API 协议双向映射与 Tool Call 解析器
 │   ├── responses_compat.py     # OpenAI Responses API (/v1/responses) 协议转译器
@@ -337,6 +346,7 @@ PROVIDER_RISK_SPECS = {
 │   ├── risk_dossier.py         # 风控全量档案与姿态研判：拦截历史可审计、规避策略与重登有效性结论
 │   ├── risk_correlation.py     # 跨节点风控关联：系统性升级研判与全局步调治理
 │   ├── credential_watch.py     # 全环凭证失效检测：去重节点阈值、TTL 探路、零上游调用快速失败
+│   ├── credential_renewal.py   # 凭证续期检测：session 凭证内容指纹、认证级避让成因限定复位、封禁租约免疫
 │   ├── session_affinity.py     # 会话亲和与跨模型状态移交引擎（LRU/TTL、异构上游会话 ID 剥离）
 │   ├── singleflight.py         # 单飞去重与流式扇出引擎（SHA-256 指纹、Leader/Follower 广播）
 │   ├── token_counter_cache.py  # Token 计量结果缓存
@@ -416,7 +426,8 @@ PROVIDER_RISK_SPECS = {
 │   └── test_probation.py       # 避让解除后的恢复观察期：串行探路闸门、步调放大、毕业与跨重启持久化测试
 │   └── test_risk_dossier.py    # 风控全量档案：窗口外证据保留、姿态 fail-closed、只读性与重登恢复结论测试
 │   └── test_risk_correlation.py # 跨节点风控关联：去重节点语义、系统性分级、全局步调压制与只读性测试
-│   └── test_credential_watch.py # 全环凭证失效：去重节点阈值、TTL 探路与永不卡死、零上游调用快速失败与双协议错误语义测试
+│   ├── test_credential_watch.py # 全环凭证失效：去重节点阈值、TTL 探路与永不卡死、零上游调用快速失败与双协议错误语义测试
+│   └── test_credential_renewal.py # 凭证续期：内容指纹判定、24h 认证级冻结复位、租约/WAF 免疫、解锁刷新门控与跨重启持久化测试
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -450,6 +461,7 @@ PROVIDER_RISK_SPECS = {
    - **必须区分「单账号成因」与「系统性成因」，严禁把后者当作前者处理**：多账号被拦的成因有二——各账号自身风控（按账号避让 + 换节点有效），或我们自己的客户端足迹（请求头指纹/UA/设备参数/出口 IP/时间分布）被平台标记（避让与换节点**均无效**，换节点只会以同样足迹把剩余账号逐个送进封禁）。关联性必须以**去重节点数**而非拦截次数衡量：同一账号被拦百次仍是单账号问题，而多个不同账号在同一突发窗口内被集中拦截则几乎不可能彼此独立。判定为系统性时，必须整体放大全局调用步调并明确提示「换节点无效」；任何面向运维的输出都不得暗示继续轮换节点。
    - **风控拦截必须留下可审计的全量档案，且规避结论不得含糊**：滑动窗口只服务实时避让，封禁历史以「天」计，窗口滑过即不可复盘。因此每家节点的拦截历史、严重度分布与最近一次上游原文必须可从全量台账聚合查询（`GET /v1/admin/risk`）。规避研判必须给出确定性结论而非模棱两可的建议：账号级封禁**不可绕开、重登无效**，只能零误触等待平台解封，严禁在任何面向用户或运维的文案中暗示「重登可解封」；人机验证与令牌失效才可由重登恢复。档案查询必须**只读**，严禁因查询而解除租约或清除冷却。
    - **整环凭证失效必须快速失败，严禁以「重试」制造无效凭证风暴**：当多个**不同**节点在同一窗口内相继返回 401，说明我们没有可用凭证，故障转移不可能成功；此时继续为每个客户端请求逐个打满五个节点，恰恰构成上游 WAF 眼中的「自动化凭证尝试」流量特征——**风暴本身就是风控触发器**。因此派发路径必须在**任何上游调用之前**检测并拒绝（`503 / err_type=credential_outage`，Anthropic 映射为 `authentication_error`），并明确提示执行 `login.py all` 重登。该状态必须带 TTL 自动失效以免永久拒绝服务（到期放行单次探路），且任一节点成功即立即恢复派发。严禁将「整环凭证失效」与「单节点软冷却」「运维封禁租约」混为一谈：前者的处置是重登而非避让，且无需人工声明。
+   - **认证级避让必须可被「凭证续期」解除，严禁让修复机制被自己制造的状态锁死**：认证失效按 2 的幂次长效升级（封顶 24h）本意是惩罚「拿着同一个失效凭证反复打」，但凭证一旦续期惩罚对象即消失，继续冻结只会惩罚**已修好的系统**——探针跳过、自愈选举排除、路由降级，甚至把 OPT-013 的令牌静默刷新（唯一自动修复路径）一并推迟 24 小时。因此必须依据**凭证内容指纹**（`session/<provider>.json` 的 token/cookie/captured_at 哈希）在失败时刻留痕、在续期后判定并复位。复位必须**成因限定且 fail-closed**：仅 `auth` 成因可释放，持有运维封禁租约的节点永不释放（账号级封禁重登无效），`waf`/频控成因不得代为释放，无记录/凭证不可读/指纹相同一律判定「未续期」；复位后必须经恢复观察期重新进入。
    - **避让解除后必须经过恢复观察期，严禁解封即满速**：避让只保证「不触碰」，不保证「不再被打进封禁」。多日避让期间被压制的需求会在解封瞬间同时释放，复现当初触发封禁的流量特征。因此任一避让 episode 结束（冷却到期、租约到期或被解除）后，该节点必须先进入恢复观察期：串行放行单个探路握手（并发峰值恒为 1）并放大步调间隔，累计若干次**连续成功**后才毕业恢复常规并发。观察期状态必须随风控台账持久化，严禁通过重启绕过。普通 5xx/超时（上游故障，非账号被标记）不得触发观察期。
 
 ---
@@ -480,6 +492,7 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_risk_dossier.py && \
 .venv/bin/python tests/test_risk_correlation.py && \
 .venv/bin/python tests/test_credential_watch.py
+.venv/bin/python tests/test_credential_renewal.py
 ```
 
 ### 测试矩阵要求：

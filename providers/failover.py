@@ -49,6 +49,7 @@ from typing import (
 )
 
 from .base import ProviderError
+from .credential_renewal import get_credential_renewal
 from .credential_watch import get_credential_watch
 from .quarantine import get_quarantine_store
 from .risk_correlation import get_risk_correlation
@@ -332,6 +333,11 @@ class CooldownTracker:
         self.quarantine = get_quarantine_store()
         # [OPT-025] 全环凭证失效检测：整环 401 时快速失败，杜绝"无效凭证风暴"
         self.credential_watch = get_credential_watch()
+        # [OPT-026] 凭证续期检测：认证失败时留指纹，续期后据此复位「认证级」避让
+        self.renewal = get_credential_renewal()
+        # [OPT-026] provider -> 当前冷却的成因严重度（auth/ratelimit/waf），
+        # 随冷却一并持久化：只有确认冷却由「认证失效」造成，才允许被续期复位。
+        self._cooldown_severity: Dict[str, str] = {}
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
         self._episode_ends: Dict[str, float] = {}
@@ -368,6 +374,13 @@ class CooldownTracker:
             for pk, n in failures.items():
                 if isinstance(n, int) and n > 0:
                     self._failure_counts[str(pk)] = n
+        # [OPT-026] 恢复冷却成因：缺失时**不**推断（fail-closed，宁可继续避让），
+        # 因此本机制启用前遗留的冷却不会被误判为认证成因而提前释放。
+        severity_map = state.get("cooldown_severity") or {}
+        if isinstance(severity_map, dict):
+            for pk, sev in severity_map.items():
+                if isinstance(sev, str) and sev:
+                    self._cooldown_severity[str(pk)] = sev
         # [OPT-022] 恢复 episode 结束时间：据此可在解封瞬间重新启用观察期，
         # 使「避让期间重启」不会绕过惊群保护。仅保留观察期窗口内仍有意义的记录。
         episode_ends = state.get("episode_ends") or {}
@@ -393,6 +406,9 @@ class CooldownTracker:
                     # [OPT-022] 观察期判定依赖 episode 结束时间，须随冷却一并持久化，
                     # 否则「避让期间重启」会丢失观察期，导致解封瞬间直接放行并发洪峰。
                     "episode_ends": {k: v for k, v in self._episode_ends.items()},
+                    # [OPT-026] 冷却成因同样必须持久化：否则重启后无法判断
+                    # 「这次冷却是否由认证失效造成」，复位便失去依据（fail-closed）。
+                    "cooldown_severity": {k: v for k, v in self._cooldown_severity.items()},
                 }
             )
         except Exception:  # noqa: BLE001
@@ -652,6 +668,8 @@ class CooldownTracker:
             end_time = time.time() + cooldown_duration
             # 如果已有更长的冷却期，保留较长者
             self._cooldowns[provider_key] = max(self._cooldowns.get(provider_key, 0.0), end_time)
+            # [OPT-026] 记录本次冷却的成因，供凭证续期后判定「是否可复位」
+            self._cooldown_severity[provider_key] = severity
 
             # [OPT-025] 认证失效还需上报全环检测器：若多个**不同**节点在同一窗口内
             # 相继 401，说明整环凭证已失效，故障转移不可能成功——必须快速失败而非
@@ -660,6 +678,12 @@ class CooldownTracker:
                 try:
                     self.credential_watch.note_auth_failure(provider_key)
                 except Exception:  # noqa: BLE001 - 检测器异常绝不影响冷却主流程
+                    pass
+                # [OPT-026] 留下**此刻**的凭证指纹：日后指纹变化即说明凭证已续期，
+                # 由 2 的幂次升级来的 24h 冻结便失去了惩罚对象，应被复位。
+                try:
+                    self.renewal.note_auth_failure(provider_key)
+                except Exception:  # noqa: BLE001
                     pass
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
@@ -701,9 +725,128 @@ class CooldownTracker:
                 self.credential_watch.note_success(provider_key)
             except Exception:  # noqa: BLE001
                 pass
+            # [OPT-026] 节点已恢复正常：指纹记录失去意义，清除以免日后误判为「已续期」
+            try:
+                self.renewal.clear_provider(provider_key)
+            except Exception:  # noqa: BLE001
+                pass
             self._failure_counts[provider_key] = 0
             self._cooldowns.pop(provider_key, None)
+            self._cooldown_severity.pop(provider_key, None)
             self._persist_state()
+
+    # -------------------------------------------------------- [OPT-026] 认证级避让复位
+
+    def _effective_cooldown_severity(self, provider_key: str) -> str:
+        """[OPT-026] 返回该节点冷却的成因严重度。
+
+        优先用随冷却一并持久化的记录；记录缺失时（本机制上线之前就已存在的冷却，
+        例如真实台账里那五条 24h 冻结）退化为**只读**查询风控台账的最近一次拦截成因。
+        没有这个退化，运维照档案建议重登之后仍然无法复位，机制形同虚设。
+        台账查询同样以「最近一次拦截」判定，因此成因限定并未放松。
+        """
+        sev = self._cooldown_severity.get(provider_key)
+        if sev:
+            return sev
+        try:
+            recent = self.risk_ledger.recent_interceptions(hours=24.0)
+            bucket = (recent.get("per_provider") or {}).get(provider_key) or {}
+            return str(bucket.get("last_severity") or "")
+        except Exception:  # noqa: BLE001 - 台账不可读则不改变判定（保守）
+            return ""
+
+    def release_auth_avoidance_locked(self, providers, reason: str = "credential-renewal") -> List[str]:
+        """[OPT-026] 复位「认证失效」成因的避让状态（调用方须持 `self._lock`，
+        或确保当前无并发访问——启动期单线程调用即属此列）。
+
+        为什么需要它：`record_failure` 对认证失效按 2 的幂次长效升级，真实台账里
+        五个节点各 54~87 次失败，全部撞到 24h 上限。这个惩罚针对的是「拿着同一个
+        失效凭证反复打」；凭证一旦续期，惩罚就失去了对象——继续冻结只会锁死已修好的
+        系统（`_deferred_refresh_after_cooldown` 甚至会把令牌静默刷新一并推迟 24h）。
+
+        严格限定作用域（fail-closed，任何不确定都选择继续避让）：
+        1. 持有运维封禁租约的节点**永不**释放——租约表达账号级封禁，重登无效；
+        2. 仅当最近一次失败的严重度为 `auth` 时释放——若之后又发生 WAF/频控，
+           说明是另一类问题，绝不代它释放；
+        3. 无实际冷却与失败计数可清者跳过，避免平白引入观察期。
+        释放后节点进入恢复观察期 (OPT-022)：串行探路 + 放大步调，防止被压制的
+        需求在凭证刚更新时集中涌出。
+        """
+        now = time.time()
+        released: List[str] = []
+        for raw in providers or []:
+            provider_key = (raw or "").strip().lower()
+            if not provider_key:
+                continue
+            # 1. 租约是账号级封禁的表达，与「凭证过期」无关，绝不因续期释放
+            try:
+                if self.quarantine.remaining(provider_key, now) > 0.0:
+                    logger.warning(
+                        "[凭证续期] 节点 [%s] 持有运维封禁租约，拒绝复位认证级避让", provider_key
+                    )
+                    continue
+            except Exception:  # noqa: BLE001 - 查询失败按「有租约」处理（保守）
+                continue
+            # 2. 只有认证成因的冷却才可被续期复位
+            if self._effective_cooldown_severity(provider_key) != SEVERITY_AUTH:
+                continue
+            # 3. 确有待复位状态
+            has_cooldown = self._cooldowns.get(provider_key, 0.0) > now
+            if not has_cooldown and self._failure_counts.get(provider_key, 0) <= 0:
+                continue
+
+            self._cooldowns.pop(provider_key, None)
+            self._cooldown_severity.pop(provider_key, None)
+            self._failure_counts[provider_key] = 0
+            try:
+                self.renewal.clear_provider(provider_key)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                self.credential_watch.note_success(provider_key)
+            except Exception:  # noqa: BLE001
+                pass
+            # 释放即进入恢复观察期：解封瞬间的并发洪峰同样适用于「凭证刚续期」
+            self._enter_probation(provider_key, now)
+            released.append(provider_key)
+            logger.warning(
+                "[凭证续期] 节点 [%s] 认证级避让已复位 (原因: %s)：请以串行探路方式重新进入",
+                provider_key, reason,
+            )
+        if released:
+            self._persist_state()
+        return released
+
+    async def release_auth_avoidance(self, providers, reason: str = "credential-renewal") -> List[str]:
+        """[OPT-026] 持锁版本的认证级避让复位（供运行期管理接口调用）。"""
+        async with self._lock:
+            return self.release_auth_avoidance_locked(providers, reason)
+
+    def renewed_providers(self) -> List[str]:
+        """[OPT-026] 凭证文件确已更新的节点（只读判定）。"""
+        try:
+            return self.renewal.renewed_providers()
+        except Exception:  # noqa: BLE001 - 判定失败绝不阻断任何流程
+            return []
+
+    def release_renewed_credentials_now(self, providers=None, reason: str = "credential-renewal") -> List[str]:
+        """[OPT-026] 同步复位入口：用于启动期（无并发）或已在锁内的调用方。
+
+        `providers` 为 None 时依据凭证指纹自动判定；显式给出时跳过判定直接复位
+        （覆盖环境变量式凭证等无法取指纹的部署）。
+        """
+        targets = list(providers) if providers is not None else self.renewed_providers()
+        if not targets:
+            return []
+        return self.release_auth_avoidance_locked(targets, reason)
+
+    async def release_renewed_credentials(self, providers=None, reason: str = "credential-renewal") -> List[str]:
+        """[OPT-026] 运行期入口：自动判定（或指定）并复位认证级避让。"""
+        targets = list(providers) if providers is not None else self.renewed_providers()
+        if not targets:
+            return []
+        async with self._lock:
+            return self.release_auth_avoidance_locked(targets, reason)
 
     def compute_pacing_interval(self, provider_key: str, jitter: float = 0.0) -> float:
         """计算节点下一次调用前应保持的最小间隔（秒，不含抖动时传入 jitter=0）。
@@ -763,6 +906,8 @@ class CooldownTracker:
         self._cooldowns.clear()
         self._failure_counts.clear()
         self._last_call_time.clear()
+        # [OPT-026] 冷却成因记录一并重置（否则会与后续用例的冷却串扰）
+        self._cooldown_severity.clear()
         # [OPT-022] 观察期状态一并重置，确保用例之间零串扰
         self._episode_ends.clear()
         self._probation_successes.clear()

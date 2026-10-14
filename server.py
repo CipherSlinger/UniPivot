@@ -112,6 +112,7 @@ from providers.singleflight import (
     stream_follower_gen,
     terminate_aborted_group,
 )
+from providers.credential_renewal import credential_renewal, get_credential_renewal
 from providers.credential_watch import credential_watch, get_credential_watch
 from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
 from providers.risk_correlation import get_risk_correlation, risk_correlation
@@ -505,6 +506,11 @@ class DispatchTaskRequest(BaseModel):
     run_tests: bool = True
 
 
+class CredentialRenewalScanRequest(BaseModel):
+    """[OPT-026] 凭证续期扫描请求：providers 省略时按凭证指纹自动判定。"""
+    providers: Optional[List[str]] = None
+
+
 # ---------------------------------------------------------------- 应用
 
 def _provider_cooldown_remaining(name: str) -> float:
@@ -598,6 +604,16 @@ def _auto_refresh_stale_sessions() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    # [OPT-026] 启动即检测凭证续期：一次「重登 + 重启」的常见运维流程必须自动
+    # 复位由 2 的幂次升级来的 24h 认证级冻结，否则令牌刷新门控（OPT-013）本身
+    # 会被这个冻结挡住最多 24h——即「凭证失效」制造的状态锁死了修复它的机制。
+    try:
+        renewed = await failover_router.cooldown_tracker.release_renewed_credentials()
+        if renewed:
+            print(f"[网关] 检测到凭证已续期，已复位认证级避让: {', '.join(renewed)}")
+    except Exception as exc:  # noqa: BLE001 - 检测失败绝不阻断启动
+        print(f"[网关] 凭证续期检测失败 (已忽略): {type(exc).__name__}: {exc}")
+
     threading.Thread(target=_auto_refresh_stale_sessions, daemon=True).start()
     await get_http_client(TIMEOUT)
     if os.getenv("TESTING") != "1":
@@ -1237,6 +1253,8 @@ async def get_diagnostics():
         "risk_correlation": risk_correlation.evaluate(),
         # [OPT-025] 全环凭证失效检测（整环 401 时快速失败，避免无效凭证风暴）
         "credential_outage": credential_watch.get_diagnostics(),
+        # [OPT-026] 凭证续期检测（认证级避让的复位依据）
+        "credential_renewal": credential_renewal.get_diagnostics(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1379,11 +1397,50 @@ async def clear_credential_outage(reason: Optional[str] = None):
     watch = get_credential_watch()
     before = watch.get_diagnostics()
     watch.clear(reason or "manual")
+    # [OPT-026] 本接口的语义就是「我已经续期并修好了凭证」，因此除了清除全环失效态，
+    # 还必须一并复位这些节点的**认证级**避让（含 2 的幂次升级来的 24h 冻结），
+    # 否则运维照做之后网关仍会继续避让最多 24h，与接口承诺不符。
+    released = await failover_router.cooldown_tracker.release_auth_avoidance(
+        before["failed_providers"], reason or "manual"
+    )
     return JSONResponse({
         "status": "ok",
         "was_active": before["outage_active"],
         "cleared_providers": before["failed_providers"],
+        "released_auth_avoidance": released,
         "outage": watch.get_diagnostics(),
+    })
+
+
+# [OPT-026] 凭证续期检测与认证级避让复位：
+# 「重登」是 auth 类故障唯一正确的修复动作，但 record_failure 对认证失效按 2 的幂次
+# 长效升级（真实台账中五个节点各 54~87 次失败 -> 全部撞到 24h 上限），且该状态跨重启
+# 持久化。于是凭证修好之后节点仍被冻结：探针跳过、自愈选举排除、路由降级，
+# 连 `_deferred_refresh_after_cooldown` 都会把令牌静默刷新一并推迟最多 24h——
+# 亦即「凭证失效」制造的状态锁死了修复它的机制。本接口提供两条复位路径。
+@app.get("/v1/admin/credential-renewal")
+@app.get("/admin/credential-renewal")
+async def get_credential_renewal_report():
+    return JSONResponse(get_credential_renewal().get_diagnostics())
+
+
+@app.post("/v1/admin/credential-renewal/scan")
+@app.post("/admin/credential-renewal/scan")
+async def scan_credential_renewal(req: Optional[CredentialRenewalScanRequest] = None):
+    tracker = failover_router.cooldown_tracker
+    explicit = list(req.providers) if req and req.providers else None
+    if explicit:
+        # 显式指定：用于凭证来自环境变量（无 session/<provider>.json 可比指纹）的部署
+        targets, released = explicit, await tracker.release_auth_avoidance(explicit, "admin-scan")
+    else:
+        targets = tracker.renewed_providers()
+        released = await tracker.release_renewed_credentials(None, "admin-scan")
+    return JSONResponse({
+        "status": "ok",
+        "scan_mode": "explicit" if explicit else "fingerprint",
+        "candidates": targets,
+        "released": released,
+        "renewal": get_credential_renewal().get_diagnostics(),
     })
 
 

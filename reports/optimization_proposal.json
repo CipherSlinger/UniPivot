@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-13 21:32:05",
+  "generated_at": "2026-10-14 12:31:56",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -296,6 +296,16 @@
       "priority": "P0",
       "description": "真实台账证据纠正了此前的误判：session/risk_ledger.jsonl 显示 80 分钟内五个节点被记录 335 次拦截，其中 auth 类占 312 次，waf 类极少——这次故障不是风控封禁而是整环凭证失效；更关键的是五个节点在**同一秒**内同时返回 401（19:36:11、19:44:22…），每约 7 分钟重复一次。五个节点在同一秒各自独立过期概率上不可能，真实过程是**一个客户端请求沿能力环依次故障转移、五个节点全部以 401 拒绝**，单个请求即在 1 秒内产生 5 条 auth 记录，整环容量为零、故障转移不可能成功。危害不止于浪费：环内无可用凭证时网关仍会为每个客户端请求打满五个节点，80 分钟 335 次带无效凭证的失败请求恰好是上游 WAF 眼中「自动化凭证尝试」的流量特征——**风暴本身就是风控触发器**，很可能正是账号被封的成因之一。而这是单节点冷却**无法表达**的：每个节点各自冷却，整环仍会被完整走一遍。本次新增 providers/credential_watch.py：判定依据为**去重节点数**（同 OPT-024 而非失败次数），GATEWAY_CREDENTIAL_OUTAGE_MIN_PROVIDERS（默认 3）个不同节点在 GATEWAY_CREDENTIAL_OUTAGE_WINDOW（默认 300s）内相继认证失败即进入失效态；检查点位于 execute_chat 派发循环最前（在 OPT-021 封禁硬阻断之前、且在任何 Provider 实例化之前），请求以 503 / err_type=credential_outage 被拒绝且**零上游调用**（Anthropic 映射为 authentication_error），错误文案点名失效节点并给出重登指引。语义与既有机制严格区分：软冷却=单节点/有时长上限/自动解除，封禁租约=单节点/运维声明/以天计，凭证失效=**整环**/无需声明/凭证更新即刻恢复——处置方式是重登而非避让。此外状态带 TTL（默认 120s）自动失效以保证**永不卡死**：到期放行恰好一次探路，仍 401 则首次失败即重建；探测频率由「每个客户端请求一次」退化为「每 TTL 一次」；任一节点成功即摘除，容量回到阈值以上立刻恢复派发（fail-open）。",
       "expected_impact": "把一次被误判为「风控封禁」的真实故障（整环凭证失效）固化为可检测、可止血、可自愈的机制：失效期间请求快速失败且零上游调用，从源头掐断「无效凭证风暴」这一自身制造的风控触发源；同时给出明确且唯一正确的运维动作（.venv/bin/python login.py all），并在重登成功后由 DELETE /v1/admin/credential-outage 立即解除或由 TTL/成功调用自动解除。TTL 探路与单次成功即恢复派发保证了可用性下限（绝不因状态卡死而永久拒绝服务），GATEWAY_DISABLE_CREDENTIAL_WATCH=1 可关闭，/v1/diagnostics 暴露 credential_outage 完整可观测。"
+    },
+    {
+      "id": "OPT-026",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "凭证可用性与风控风暴治理",
+      "title": "凭证续期检测与认证级避让复位 (Credential Renewal Detection & Cause-Scoped Avoidance Release)",
+      "priority": "P0",
+      "description": "OPT-025 解决了风暴**期间**的重复派发，却没有解决风暴**之后**的冻结，这是同一条因果链的下半段。record_failure 对认证失效按 GATEWAY_AUTH_COOLDOWN_BASE(1800s) × 2ⁿ 长效升级、封顶 GATEWAY_AUTH_COOLDOWN_MAX(86400s)；真实台账里五个节点的认证失败次数是 54/54/54/87/60——**全部撞到 24 小时上限**，且该状态随台账持久化、跨重启恢复。于是风暴结束后五个节点各自被冻结整整一天。这个惩罚本身并非错误：它惩罚的是「拿着**同一个失效凭证**反复打」，而每次重试确实都是一次「自动化凭证尝试」。但凭证一旦续期，惩罚对象即消失——继续冻结惩罚的不再是坏行为而是**已经修好的系统**：get_remaining_cooldown() 仍返回 24h，导致健康探针跳过、自愈大脑选举排除、路由降级；最直接的问题是 server.py:_deferred_refresh_after_cooldown ——**令牌静默刷新本身也被冷却门控挡住、最多推迟 24 小时**，即「凭证失效」制造的状态正好锁死了唯一能自动修复它的机制。反向验证：OPT-023 档案对 auth 类的结论是 recoverable_by_relogin = True，系统一面告诉运维「重登可恢复」，一面在重登之后继续避让 24 小时，结论与行为自相矛盾。本次新增 providers/credential_renewal.py：在记录认证失败的那一刻对凭证来源（session/<provider>.json）取**内容指纹**（sha256(token|cookie|captured_at|user_id|device_id)，不可解析时退化为 meta:mtime_ns:size），指纹随冷却一并持久化，因此「先重登、再重启」同样可识别（Session.save() 以 os.replace 原子落盘且每次捕获刷新 captured_at，任何真实重登必然改变指纹）。复位动作由 CooldownTracker.release_auth_avoidance() 执行，与只读的判定路径分离。复位严格**成因限定且 fail-closed**：仅最近一次失败严重度为 auth 时才复位（成因随冷却持久化；记录缺失时退化为**只读**查询风控台账该节点最近一次拦截的成因，仍保持成因限定），持有运维封禁租约的节点永不释放（账号级封禁重登无效），waf/频控成因绝不被代为释放，无记录/凭证不可读/指纹相同一律判定「未续期」；复位后经 OPT-022 恢复观察期重新进入，因为被压制数日的需求会在凭证刚更新时集中释放。",
+      "expected_impact": "打通修复闭环并与 OPT-023 的运维结论取得一致：复位使 get_remaining_cooldown() 归零，从而解除 OPT-013 令牌静默刷新的冷却门控（唯一自动修复路径），并解除探针/自愈选举/路由层的连带避让——「重登即恢复」不再被网关自己制造的 24 小时冻结抵消。启动时自动扫描（await cooldown_tracker.release_renewed_credentials()）以匹配「重登 + 重启」这一最常见运维流程。遥测：/v1/diagnostics 暴露 credential_renewal，GET /v1/admin/credential-renewal 查看指纹记录与判定，POST /v1/admin/credential-renewal/scan 触发复位（请求体 providers 供环境变量凭证的部署显式指定），DELETE /v1/admin/credential-outage 在清除全环失效态时连带复位认证级避让。GATEWAY_DISABLE_CREDENTIAL_RENEWAL=1 可关闭，GATEWAY_DISABLE_RISK_LEDGER=1 一并关闭（与封禁租约 / 凭证失效检测同约定，保证纯内存冷却语义的测试套件不受影响）。"
     }
   ],
   "system_health": "good"
