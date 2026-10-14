@@ -42,28 +42,40 @@ def pick_healer_model(monitor: HealthMonitor, failing_provider: str) -> Optional
     转发为一次真实上游调用，选到被封禁节点等同于在封禁窗口内持续触碰该账号。
     冷却节点被跳过后若已无可用候选，则返回 None，交由上层「缺少健康备选模型」分支
     安全推迟自愈，而不是强行触碰封禁节点。
+
+    [OPT-034] 排除范围由「冷却」扩为**全部后台避让成因**（运维禁用 ∪ 运维/自动租约 ∪
+    冷却），判据统一来自 `monitor.touch_avoidance_reason`：此前只问冷却，于是被
+    `DISABLED_PROVIDERS` 声明出局、却恰好没有冷却的节点仍会被选为自愈大脑，把一次
+    真实上游补全发给一个运维已宣布不用的账号。成因分开记日志，避免把「禁用」说成
+    「冷却中」而误导运维（对照 OPT-026/027/029/031 反复修复的同一类错误）。
     """
     # 优先顺序：qwen(qwen3.7-max) -> deepseek(deepseek-chat) -> doubao(doubao-pro) -> kimi(kimi-explore) -> glm(glm-4-plus)
     priority = ["qwen", "deepseek", "doubao", "kimi", "glm"]
 
-    def _cooling(cand: str) -> bool:
+    _CAUSE_LABEL = {
+        "disabled": "已被运维禁用 (DISABLED_PROVIDERS)",
+        "quarantined": "处于运维/自动封禁租约期",
+        "cooldown": "处于风控避让冷却期",
+    }
+
+    def _avoiding(cand: str) -> bool:
         try:
-            remaining = monitor.get_cooldown_remaining(cand)
-        except Exception:  # noqa: BLE001 - 门控查询失败按「无冷却」处理，不影响可用性
+            reason = monitor.touch_avoidance_reason(cand)
+        except Exception:  # noqa: BLE001 - 门控查询失败按「不避让」处理，不影响可用性
             return False
-        if remaining > 0:
+        if reason:
             monitor.record_healer_skip(cand)
             logger.warning(
-                "[自愈选举] 跳过处于风控避让冷却中的节点 %s (剩余 %.0fs)，避免在封禁窗口内触碰该账号",
+                "[自愈选举] 跳过%s的节点 %s，避免在避让期内触碰该账号",
+                _CAUSE_LABEL.get(reason, "处于后台避让期"),
                 cand,
-                remaining,
             )
             return True
         return False
 
-    # 先对全部候选求一次冷却快照：两轮遍历共享同一视图，
+    # 先对全部候选求一次避让快照：两轮遍历共享同一视图，
     # 避免同一节点在两个循环中被重复统计为跳过。
-    cooling = {cand for cand in priority if cand != failing_provider and _cooling(cand)}
+    cooling = {cand for cand in priority if cand != failing_provider and _avoiding(cand)}
 
     for cand in priority:
         if cand == failing_provider or cand in cooling:

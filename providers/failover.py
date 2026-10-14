@@ -348,6 +348,8 @@ class CooldownTracker:
         # [OPT-026] provider -> 当前冷却的成因严重度（auth/ratelimit/waf），
         # 随冷却一并持久化：只有确认冷却由「认证失效」造成，才允许被续期复位。
         self._cooldown_severity: Dict[str, str] = {}
+        # [OPT-034] 后台触点避让门控的拒绝直方图（按成因）
+        self._touch_block_stats: Dict[str, int] = {}
         # [OPT-027] 「新凭证仍被拒」证据：provider -> 自凭证更新以来，拿着**已更新**的
         # 凭证仍被 401 拒绝的连续次数。凭证换过仍被拒 => 问题不在凭证上（账号级封禁），
         # 继续按「凭证过期」处置只会一次次重新触碰被封的账号。
@@ -512,6 +514,64 @@ class CooldownTracker:
     def is_in_cooldown(self, provider_key: str) -> bool:
         """检查指定 Provider 是否处于冷却避让期（含运维封禁租约）"""
         return self.get_remaining_cooldown(provider_key) > 0.0
+
+    # ---------------------------------------------------- [OPT-034] 后台触点判据
+
+    def touch_avoidance_reason(self, provider_key: str) -> str:
+        """[OPT-034] 后台自维护触点（探针/令牌刷新/会话回收/自愈选举）的**唯一**判据。
+
+        返回 `""` 表示可以触碰上游；否则返回成因，取值 `disabled` / `quarantined` /
+        `cooldown`（heaviest-wins，顺序即优先级）。
+
+        为什么需要这一条：派发边界（OPT-033）与健康探针（OPT-012）都遵守「运维禁用」，
+        但**另外三条自维护通道只问了冷却、没问禁用**——一个被 `DISABLED_PROVIDERS`
+        声明出局的节点，只要它恰好没有冷却，网关仍会对它发起真实的令牌刷新、真实的
+        临时会话删除、以及自愈选举中的真实上游补全。实测复现：`DISABLED_PROVIDERS=kimi`
+        且无冷却时，`_refresh_stale_provider("kimi", …)` 真的调用了 refresher
+        （打印「kimi 令牌已超过 6h，尝试静默刷新…」）。这与 OPT-020（租约折入冷却读数，
+        使所有门控自动遵循）同属一类问题：一条避让声明只在部分通道生效。
+
+        语义分层（与 OPT-033 的派发闸门同序，但**更严**）：运维禁用是部署声明，排在最前；
+        其次是运维/自动租约；最后是自动冷却。与派发闸门的唯一差别是**短软冷却**：派发
+        保留「最后一搏」，而后台自维护永远不值得为一次冷却中的节点冒险，故此处一律阻断。
+
+        成因必须如实返回而不是笼统的「冷却中」：禁用的解除方式是改配置，租约的解除方式
+        是人工撤租，冷却的解除方式是等待——把三者混成一句话正是本项目反复修复的
+        「误导运维」缺陷类型（OPT-026/027/029/031）。
+
+        判定为非空即在此记录一次拒载（`note_touch_block`）：各消费方**只在决定是否触碰
+        上游的那一刻**调用本方法，因此直方图读作「被拦下的触碰次数」而非节点数。记录写在
+        判据内，是为了让日后新增的消费方自动获得遥测，而不是每加一处就漏记一处。
+        """
+        if self.is_disabled(provider_key):
+            self.note_touch_block("disabled")
+            return "disabled"
+        # 用本类自己的 is_quarantined（与派发闸门对租约的判定完全同源），
+        # 而不是直接问 quarantine store——后者没有这个谓词，写错会被下面的
+        # except 静默吞掉，把租约误报成「冷却中」（正是本条要消除的误导）。
+        try:
+            if self.is_quarantined(provider_key):
+                self.note_touch_block("quarantined")
+                return "quarantined"
+        except Exception:  # noqa: BLE001 - 租约查询失败回退到冷却判读，绝不误放行
+            pass
+        if self.get_remaining_cooldown(provider_key) > 0.0:
+            self.note_touch_block("cooldown")
+            return "cooldown"
+        return ""
+
+    def note_touch_block(self, cause: str) -> None:
+        """[OPT-034] 记一次后台触点被避让声明拦下（按成因分类）。"""
+        if not cause:
+            return
+        self._touch_block_stats[cause] = self._touch_block_stats.get(cause, 0) + 1
+
+    def touch_gate_report(self) -> Dict[str, Any]:
+        """[OPT-034] 后台触点避让门控诊断。"""
+        return {
+            "blocked_by_cause": dict(self._touch_block_stats),
+            "causes": ["disabled", "quarantined", "cooldown"],
+        }
 
     def get_remaining_cooldown(self, provider_key: str) -> float:
         """获取剩余冷却时间（秒），若未处于冷却期则返回 0.0。
@@ -1505,6 +1565,8 @@ class CooldownTracker:
             "quarantine": 0,
             "long_avoidance": 0,
         }
+        # [OPT-034] 后台触点拒载直方图同样复位（它不是持久状态，只是本轮观测）
+        self._touch_block_stats = {}
         disabled_str = os.getenv("DISABLED_PROVIDERS", "")
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()

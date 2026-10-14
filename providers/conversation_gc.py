@@ -56,6 +56,8 @@ class ConversationGC:
         self._pending: Dict[str, Dict[str, Any]] = {}
         self._resolver: Optional[Callable[[str], Any]] = None
         self._cooldown_gate: Optional[Callable[[str], float]] = None
+        # [OPT-034] 后台避让成因判据（优先于冷却浮点门控；未注册时退回后者）
+        self._avoidance_gate: Optional[Callable[[str], str]] = None
         self._defer_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
         self._stats = {
             "scheduled": 0,
@@ -94,13 +96,20 @@ class ConversationGC:
         """
         self._cooldown_gate = gate
 
+    def set_avoidance_gate(self, gate: Callable[[str], str]) -> None:
+        """[OPT-034] 注册后台避让成因判据：返回 "" 表示可删除，否则返回成因。
+
+        成因来自 `CooldownTracker.touch_avoidance_reason`：`disabled`（运维禁用）、
+        `quarantined`（运维/自动租约）、`cooldown`（自动冷却）。注册后本判据**优先于**
+        冷却浮点门控，因为只有它能区分「禁用」与「冷却」——两者对运维的含义与解除方式
+        完全不同（改配置 vs 等待），笼统报一句「冷却中」正是本项目反复修复的误导类型。
+        未注册时退回 `set_cooldown_gate` 的既有行为，保持向后兼容。
+        """
+        self._avoidance_gate = gate
+
     def _cooldown_remaining(self, provider_key: str) -> float:
         """查询节点剩余风控冷却秒数（未注册回调或已关闭门控时返回 0）。"""
-        if os.getenv("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", "").strip().lower() in (
-            "1",
-            "true",
-            "yes",
-        ):
+        if self._gate_disabled():
             return 0.0
         gate = self._cooldown_gate
         if gate is None:
@@ -110,16 +119,49 @@ class ConversationGC:
         except Exception:  # noqa: BLE001 - 门控查询失败绝不阻断回收流程
             return 0.0
 
-    def _record_defer(self, provider_key: str, remaining: float) -> None:
+    def _gate_disabled(self) -> bool:
+        """[OPT-017/034] 会话回收冷却门控的总开关。"""
+        return os.getenv("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def _avoidance_reason(self, provider_key: str) -> str:
+        """[OPT-034] 查询节点后台避让成因（"" 表示可删除）。
+
+        优先使用成因判据（能区分禁用/租约/冷却）；未注册时用冷却浮点门控折算为
+        `cooldown`，与 OPT-017 的既有行为逐值一致。
+        """
+        if self._gate_disabled():
+            return ""
+        gate = self._avoidance_gate
+        if gate is not None:
+            try:
+                return str(gate(provider_key) or "")
+            except Exception:  # noqa: BLE001 - 判据查询失败绝不阻断回收流程
+                return ""
+        return "cooldown" if self._cooldown_remaining(provider_key) > 0 else ""
+
+    def _record_defer(self, provider_key: str, remaining: float, cause: str = "cooldown") -> None:
         with self._lock:
             self._defer_stats["total"] += 1
             per = self._defer_stats["per_provider"]
             key = (provider_key or "unknown").lower()
             per[key] = per.get(key, 0) + 1
+            by_cause = self._defer_stats.setdefault("per_cause", {})
+            by_cause[cause] = by_cause.get(cause, 0) + 1
+        _CAUSE_LABEL = {
+            "disabled": "已被运维禁用 (DISABLED_PROVIDERS)",
+            "quarantined": "处于运维/自动封禁租约期",
+            "cooldown": "处于风控避让冷却中",
+        }
+        detail = f" (剩余 {remaining:.0f}s)" if cause == "cooldown" else ""
         logger.warning(
-            "[会话回收] 节点 %s 处于风控避让冷却中 (剩余 %.0fs)，推迟其临时会话删除以避免触碰封禁账号",
+            "[会话回收] 节点 %s %s%s，推迟其临时会话删除以避免触碰被封禁/已下线的账号",
             provider_key,
-            remaining,
+            _CAUSE_LABEL.get(cause, "处于后台避让期"),
+            detail,
         )
 
     @staticmethod
@@ -243,9 +285,10 @@ class ConversationGC:
         self.enqueue(provider_key, conversation_id)
         self._stats["scheduled"] += 1
         # [OPT-017] 冷却期节点推迟删除：记录保留在队列，不消耗重试次数
-        remaining = self._cooldown_remaining(provider_key)
-        if remaining > 0:
-            self._record_defer(provider_key, remaining)
+        # [OPT-034] 判据扩为全部后台避让成因（运维禁用 ∪ 租约 ∪ 冷却）
+        reason = self._avoidance_reason(provider_key)
+        if reason:
+            self._record_defer(provider_key, self._cooldown_remaining(provider_key), reason)
             return
         try:
             asyncio.get_running_loop()
@@ -314,9 +357,10 @@ class ConversationGC:
             )
         attempted = succeeded = deferred = 0
         for pk, cid in items:
-            remaining = self._cooldown_remaining(pk)
-            if remaining > 0:
-                self._record_defer(pk, remaining)
+            # [OPT-034] 与 schedule 同一判据：禁用/租约/冷却一律推迟
+            reason = self._avoidance_reason(pk)
+            if reason:
+                self._record_defer(pk, self._cooldown_remaining(pk), reason)
                 deferred += 1
                 continue
             try:
@@ -345,6 +389,8 @@ class ConversationGC:
             defer_stats = {
                 "total": int(self._defer_stats.get("total", 0)),
                 "per_provider": dict(self._defer_stats.get("per_provider", {})),
+                # [OPT-034] 按成因拆分：使「谁在推迟」可观测，而不是笼统一句「冷却中」
+                "per_cause": dict(self._defer_stats.get("per_cause", {})),
             }
         return {
             "enabled": not self.is_disabled(),
@@ -359,6 +405,8 @@ class ConversationGC:
                 and os.getenv("GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE", "").strip().lower()
                 not in ("1", "true", "yes")
             ),
+            # [OPT-034] 成因判据启用状态（启用时它优先于冷却浮点门控）
+            "avoidance_gate_enabled": self._avoidance_gate is not None and not self._gate_disabled(),
             "deferred_by_cooldown": defer_stats,
         }
 
@@ -366,7 +414,7 @@ class ConversationGC:
         """清空队列与统计（测试用）。"""
         with self._lock:
             self._pending.clear()
-            self._defer_stats = {"total": 0, "per_provider": {}}
+            self._defer_stats = {"total": 0, "per_provider": {}, "per_cause": {}}
             self._stats = {
                 "scheduled": 0,
                 "deleted": 0,

@@ -164,6 +164,12 @@ risk_dossier.set_cooldown_tracker(failover_router.cooldown_tracker)
 # [OPT-012] 将风控冷却状态接入健康探针门控：处于避让冷却期的节点，
 # 周期探针跳过真实网络调用，杜绝持续触碰已被上游风控封禁的节点。
 health_monitor.set_cooldown_probe_gate(failover_router.cooldown_tracker.get_remaining_cooldown)
+# [OPT-034] 「运维禁用」的判读只有一处：此前健康监控自行现读 DISABLED_PROVIDERS
+# （同一份配置的第三份解读），现统一取 CooldownTracker 的并集判读者。
+health_monitor.set_disabled_gate(failover_router.cooldown_tracker.is_disabled)
+# [OPT-034] 后台自维护触点（探针/刷新/会话回收/自愈选举）统一向同一判据求值：
+# 只问冷却、不问禁用会让运维声明出局的节点仍收到真实的上游请求。
+health_monitor.set_touch_avoidance_gate(failover_router.cooldown_tracker.touch_avoidance_reason)
 
 # 全局自适应流量整形器（并发与反爬步调控制）
 traffic_pacer = get_traffic_pacer()
@@ -534,13 +540,22 @@ def _provider_cooldown_remaining(name: str) -> float:
 def _refresh_stale_provider(name: str, resolver, refresher) -> str:
     """按需对单个 Provider 执行静默令牌刷新。
 
-    返回: "fresh"（无需刷新）/ "cooling"（风控避让中，暂缓）/ "refreshed" / "failed"。
+    返回: "fresh"（无需刷新）/ "disabled"（运维禁用，不做）/ "cooling"（风控避让中，暂缓）
+          / "refreshed" / "failed"。
     [OPT-013] 处于风控避让冷却期的节点绝不发起登录/刷新请求，
     避免「静默刷新」成为持续触碰已被上游封禁账号的隐蔽通道。
+    [OPT-034] 运维禁用（DISABLED_PROVIDERS）的节点同样不做：它是运维「该节点不属于本次
+    部署」的声明，且往往正因封禁而下线——一次静默刷新就是一次真实的上游登录请求。实测
+    复现：DISABLED_PROVIDERS=kimi 且无冷却时，此处真的调用了 refresher。
+    与冷却的区别在于**不进入延迟重试**：冷却是在等一个会到期的窗口，而禁用是在等运维改
+    配置，没有可等待的期限，因此不加入 deferred（运维改回配置后，下一次启动即会刷新）。
     """
     s = resolver()
     if not s or not s.token or getattr(s, "age", 0.0) < MAX_AGE:
         return "fresh"
+    if failover_router.cooldown_tracker.is_disabled(name):
+        print(f"[网关] {name} 已被运维禁用 (DISABLED_PROVIDERS)，不做令牌刷新")
+        return "disabled"
     if _provider_cooldown_remaining(name) > 0:
         print(f"[网关] {name} 处于风控避让冷却期，暂缓令牌刷新（避免加剧上游封禁）")
         return "cooling"
@@ -1280,6 +1295,8 @@ async def get_diagnostics():
         "long_avoidance": failover_router.cooldown_tracker.long_avoidance_report(),
         # [OPT-033] 禁用门控与闸门拒载分布（哪一道闸门在承担拒载，可观测）
         "dispatch_gates": failover_router.cooldown_tracker.disabled_gate_report(),
+        # [OPT-034] 后台自维护触点的避让拒载分布（按成因）
+        "touch_gates": failover_router.cooldown_tracker.touch_gate_report(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1745,6 +1762,9 @@ for _p_name, (_resolver, _err_msg, _factory) in PROVIDER_SPECS.items():
 conversation_gc.set_resolver(_make_provider)
 # [OPT-017] 会话删除同样遵守风控冷却门控：冷却期节点不得被删除请求触碰
 conversation_gc.set_cooldown_gate(failover_router.cooldown_tracker.get_remaining_cooldown)
+# [OPT-034] 成因判据优先于冷却浮点门控：只有它能区分「运维禁用」与「冷却中」，
+# 使被声明出局的节点连临时会话删除也不会被发起。
+conversation_gc.set_avoidance_gate(failover_router.cooldown_tracker.touch_avoidance_reason)
 
 
 @app.post("/v1/chat/completions")

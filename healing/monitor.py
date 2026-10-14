@@ -81,6 +81,9 @@ class HealthMonitor:
         self._running = False
         # [OPT-012] 风控冷却门控：返回节点剩余冷却秒数的回调 (>0 表示处于避让期)
         self._cooldown_probe_gate: Optional[Callable[[str], float]] = None
+        # [OPT-034] 运维禁用与后台触点避让的注入判据（未注入时退化为环境变量/冷却判读）
+        self._disabled_gate: Optional[Callable[[str], bool]] = None
+        self._touch_avoidance_gate: Optional[Callable[[str], str]] = None
         self._probe_skip_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
         # [OPT-018] 自愈大脑选举的冷却避让统计
         self._healer_skip_stats: Dict[str, Any] = {"total": 0, "per_provider": {}}
@@ -88,13 +91,66 @@ class HealthMonitor:
             name: asyncio.Lock() for name in self._states
         }
 
+    def set_disabled_gate(self, gate: Callable[[str], bool]) -> None:
+        """[OPT-034] 注入「节点是否被运维禁用」的唯一判读器。
+
+        此前本类自行现读 `DISABLED_PROVIDERS` 环境变量（同一份配置的**第三**份解读：
+        CooldownTracker 持有一份并集判读者，本类又现读一次），于是运行时改配置时两者
+        给出不同答案。现在改由外部注入的那个判读者回答。
+        """
+        self._disabled_gate = gate
+
     def is_disabled(self, name: str) -> bool:
-        """检查提供方是否被环境变量 DISABLED_PROVIDERS 禁用。"""
+        """检查提供方是否被运维禁用。
+
+        [OPT-034] 判读委托给注入的判据（`CooldownTracker.is_disabled`，程序集合 ∪ 环境
+        变量现读）。未注入时退化为现读环境变量，使本类在独立构造时（单元测试、无网关
+        上下文的调用者）仍可用。
+        """
+        gate = self._disabled_gate
+        if gate is not None:
+            try:
+                return bool(gate(name))
+            except Exception:  # noqa: BLE001 - 判据查询失败回退到环境变量，绝不误放行
+                pass
         disabled_str = os.getenv("DISABLED_PROVIDERS", "")
         if not disabled_str:
             return False
         disabled_set = {p.strip().lower() for p in disabled_str.split(",") if p.strip()}
         return (name or "").lower() in disabled_set
+
+    def set_touch_avoidance_gate(self, gate: Callable[[str], str]) -> None:
+        """[OPT-034] 注入后台触点避让判据（`CooldownTracker.touch_avoidance_reason`）。
+
+        自愈选举（`pick_healer_model`）最终会经本网关发出一次**真实上游补全**，因此它也
+        属于后台自维护触点，与探针/刷新/会话回收共用同一判据。
+        """
+        self._touch_avoidance_gate = gate
+
+    def touch_avoidance_reason(self, name: str) -> str:
+        """[OPT-034] 查询节点是否处于后台避让期，返回成因（"" 表示可触碰）。
+
+        判定顺序即优先级：运维禁用 → （冷却总开关）→ 注入判据（租约 ∪ 冷却）。
+
+        「运维禁用」**不**受冷却总开关 `GATEWAY_DISABLE_COOLDOWN_GATE` 影响：该开关的
+        语义是「回退为无冷却感知」，而禁用是部署声明（本类原有的 `is_disabled` 分支也一
+        直不受该开关影响），把它一并交出去等于让一个开关悄悄放开一个被声明出局的节点。
+        租约与冷却则仍受总开关约束，关闭时退化为「冷却即可避让」之外不再扩大阻断范围，
+        与 OPT-018 的既有行为逐值一致。
+
+        未注入判据时退化为「冷却即避让」（成因 `cooldown`），保证独立构造本类时语义不变。
+        """
+        if self.is_disabled(name):
+            return "disabled"
+        if self._cooldown_gate_disabled():
+            return ""
+        gate = self._touch_avoidance_gate
+        if gate is not None:
+            try:
+                return str(gate(name) or "")
+            except Exception:  # noqa: BLE001 - 判据查询失败按「不避让」处理，不影响可用性
+                return ""
+        return "cooldown" if self._probe_cooldown_remaining(name) > 0 else ""
 
     def register_provider(
         self,
@@ -303,7 +359,9 @@ class HealthMonitor:
             self._check_locks[name] = asyncio.Lock()
 
         async with self._check_locks[name]:
-            if self.is_disabled(name):
+            # [OPT-034] 一次性向唯一判据求值（运维禁用 ∪ 租约 ∪ 冷却），而不是分别读两次
+            avoidance = self.touch_avoidance_reason(name)
+            if avoidance == "disabled":
                 logger.info("Provider %s 已被禁用 (DISABLED_PROVIDERS)，跳过健康探测", name)
                 if name not in self._states:
                     self._states[name] = ProviderHealth()
@@ -325,6 +383,7 @@ class HealthMonitor:
 
             # [OPT-012] 风控冷却门控：避让冷却期内绝不发起真实探针，
             # 既不触碰已封禁节点（避免延长封禁窗口），也不计入失败或触发自愈。
+            # [OPT-034] 判据来自唯一的 touch_avoidance_reason，成因如实记录。
             cooldown_remaining = self._probe_cooldown_remaining(name)
             if cooldown_remaining > 0:
                 st = self._states[name]
@@ -338,9 +397,10 @@ class HealthMonitor:
                 per = self._probe_skip_stats["per_provider"]
                 per[name] = per.get(name, 0) + 1
                 logger.warning(
-                    "[探针冷却门控] 节点 [%s] 处于风控避让冷却期 (剩余 %.0fs)，本轮跳过真实探针，"
+                    "[探针冷却门控] 节点 [%s] 处于风控避让冷却期 (成因 %s, 剩余 %.0fs)，本轮跳过真实探针，"
                     "避免加剧上游封禁",
                     name,
+                    avoidance or "cooldown",
                     cooldown_remaining,
                 )
                 return False, st.last_error

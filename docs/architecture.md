@@ -342,6 +342,18 @@ PROVIDER_RISK_SPECS = {
 
 ---
 
+#### 22. 运维禁用贯穿全部上游自维护触点 (`providers/failover.py:touch_avoidance_reason`)
+
+- **一条声明只在部分通道生效**：`DISABLED_PROVIDERS` 是运维「这个节点不属于本次部署」的声明。派发边界遵守它（OPT-033），健康探针也遵守它（OPT-012）——但另外三条自维护通道**只问了冷却、没问禁用**：启动静默令牌刷新（一次真实的上游登录请求）、匿名调用的临时会话删除（一次真实的删除请求）、自愈大脑选举（一次真实的上游补全）。一个被声明出局、却恰好没有冷却的节点，仍在被持续真实触碰。实测复现：`DISABLED_PROVIDERS=kimi` 且无冷却时，`_refresh_stale_provider("kimi", …)` 真的调用了 refresher（打印「kimi 令牌已超过 6h，尝试静默刷新…」）。运维已宣布停用的账号仍在被触碰，正是「绝不触碰被封禁/已下线节点」这条约束针对的失效模式。
+- **一条声明，一个判据**：新增 `CooldownTracker.touch_avoidance_reason()` 作为后台自维护触点的**唯一**判据（运维禁用 → 运维/自动租约 → 冷却，heaviest-wins，`""` 表示可触碰），四条通道（探针、令牌刷新、会话回收、自愈选举）全部向它求值，在 `server.py` 中只接线一次。这是 OPT-020 的同一套手法（把声明折入读数，使所有门控自动遵循），只是这次补上的是当初漏掉的那条声明。
+- **与派发闸门同序，但在一处更严**：后台自维护永远不值得为一次冷却中的节点冒险，因此派发边界刻意保留的短软冷却「最后一搏」（OPT-021）在此**无条件阻断**。**成因如实返回**而不是笼统的「冷却中」：禁用靠改配置解除、租约靠人工撤租、冷却靠等待——把三者混成一句正是本项目反复修复的误导运维缺陷类型（OPT-026/027/029/031）。
+- **禁用不进入延迟重试，冷却才进**：冷却是在等一个会到期的窗口，故进入有界的延迟重试队列（OPT-013/017）；禁用是在等人改配置，没有可等期限，因此被禁用的节点既不被刷新也不入队，运维改回配置后下一次启动即会刷新。这正是两种结论必须可区分、而不能都报 `cooling` 的原因。
+- **同一份配置又只有一份解读**：`HealthMonitor.is_disabled` 此前**自行**现读 `DISABLED_PROVIDERS`（同一份配置的第三份解读，进程内改集合即与 tracker 分歧），现改为接收注入的 `CooldownTracker.is_disabled`；独立构造本类时退回环境变量现读，保持其脱离网关仍可用。
+- **冷却总开关不得放开被禁用节点**：`GATEWAY_DISABLE_COOLDOWN_GATE=1` 的语义是「回退为无冷却感知」，而运维禁用是部署声明、不是冷却感知——一个开关悄悄放开一个已被声明出局的节点正是这里的陷阱。故禁用判定**不受**该开关覆盖；租约与冷却判定仍受其约束，逐值不变。
+- **遥测**：`/v1/diagnostics` 新增 `touch_gates`（`blocked_by_cause` 为**逐成因拒载直方图**；各消费方只在「即将触碰上游」的那一刻求值，故直方图读作被拦下的触碰次数而非节点数），会话回收的 `deferred_by_cooldown.per_cause` 按成因拆分推迟计数。`GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1` 仍可回退回收门控；未注入成因判据时退回冷却浮点门控并报 `cooldown`，逐值不变。见 `tests/test_disabled_propagation.py`（9 个用例）。
+
+---
+
 ### 2.3 自愈与自动热修复系统 (`healing/`)
 
 系统内置故障诊断与自动化热修复闭环系统，当上游 Web 协议更新导致服务异常时自动执行自愈：
@@ -500,6 +512,7 @@ PROVIDER_RISK_SPECS = {
 │   └── test_long_avoidance.py  # 长效避让派发硬阻断：阈值真空带证明、整环混合成因零上游快速失败、短冷却最后一搏零回归、改派零触碰、档案 fail-closed 姿态测试
 │   └── test_dispatch_audit.py  # 零上游派发预演：只读闸门审计、逐节点阻断成因与剩余时长、整环 fail-closed 预测，以及「预演必须与真实派发一致」的零漂移回归测试
 │   └── test_dispatch_gate.py   # 派发闸门唯一定义与运维禁用硬阻断：DISABLED_PROVIDERS 在派发边界生效（实测漏洞：预演报阻断而 execute_chat 直接派发进被禁用节点）、闸门顺序只有一份副本（篡改唯一闸门定义即须改变派发）、同一配置只有一份解读、短冷却最后一搏零回归
+│   └── test_disabled_propagation.py # 运维禁用贯穿全部自维护触点：DISABLED_PROVIDERS 在令牌刷新/会话回收/自愈选举/健康探针四处生效（实测漏洞：被禁用且无冷却的节点仍被发起真实刷新请求）、唯一成因判据（disabled > quarantined > cooldown）、禁用不进入延迟重试、禁用不受冷却总开关影响、健康/冷却/租约节点零回归
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -575,6 +588,7 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_waf_escalation.py && \
 .venv/bin/python tests/test_device_identity.py && \
 .venv/bin/python tests/test_long_avoidance.py && \
+.venv/bin/python tests/test_disabled_propagation.py && \
 .venv/bin/python tests/test_dispatch_audit.py && \
 .venv/bin/python tests/test_dispatch_gate.py
 ```
