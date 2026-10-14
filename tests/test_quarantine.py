@@ -257,7 +257,7 @@ def test_existing_gates_honour_lease():
             "封禁租约节点绝不得出现在路由后备候选中"
         )
         audit = srv.failover_router.get_fallback_candidates(
-            "glm", "glm-4-plus", include_quarantined=True
+            "glm", "glm-4-plus", include_quarantined=True, include_long_avoidance=True
         )
         cd_cands = [c for c in audit if c.in_cooldown]
         assert any(c.provider_key == "deepseek" for c in cd_cands), (

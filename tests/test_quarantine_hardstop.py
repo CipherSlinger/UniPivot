@@ -158,7 +158,7 @@ def test_candidates_exclude_quarantined_but_keep_soft_cooling():
 
         # 显式放行（仅用于诊断/审计视图）
         all_cands = srv.failover_router.get_fallback_candidates(
-            "qwen", "Qwen", include_quarantined=True
+            "qwen", "Qwen", include_quarantined=True, include_long_avoidance=True
         )
         assert "deepseek" in [c.provider_key for c in all_cands]
     finally:

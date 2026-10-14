@@ -1260,6 +1260,8 @@ async def get_diagnostics():
         "ban_inference": failover_router.cooldown_tracker.ban_inference_report(),
         # [OPT-030] 节点设备身份稳定性（同一节点每次请求必须是同一台「设备」）
         "device_identity": get_device_identity_store().get_diagnostics(),
+        # [OPT-031] 长效避让门控（整环长效避让时零上游快速失败，短冷却仍保留最后一搏）
+        "long_avoidance": failover_router.cooldown_tracker.long_avoidance_report(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }

@@ -488,6 +488,10 @@ _ERR_TYPE_MAP = {
     # 语义最贴近的是 authentication_error（本网关确实无法用当前凭证完成认证），
     # 故归入该枚举，便于客户端识别为「需重新认证/联系运维」而非「上游过载」。
     "credential_outage": "authentication_error",
+    # [OPT-031] 能力环内全部节点处于长效避让（升级后的人机验证/认证冷却），
+    # 本次请求零上游调用拒绝派发：与 quarantined 同源（服务当下无法承接该请求），
+    # 故映射到 overloaded_error，客户端可按「稍后重试/改用其他模型」处理。
+    "ring_exhausted": "overloaded_error",
 }
 
 

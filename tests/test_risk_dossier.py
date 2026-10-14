@@ -53,6 +53,7 @@ from providers.risk_dossier import (  # noqa: E402
     AVOIDANCE_MATRIX,
     POSTURE_CLEAR,
     POSTURE_COOLING,
+    POSTURE_LONG_AVOIDANCE,
     POSTURE_PROBATION,
     POSTURE_QUARANTINED,
     POSTURE_WATCH,
@@ -362,7 +363,8 @@ def test_diagnostics_and_admin_endpoint_exposure():
         summary = diag["risk_dossier_summary"]
         assert "posture_counts" in summary
         assert set(summary["posture_counts"]) == {
-            POSTURE_QUARANTINED, POSTURE_COOLING, POSTURE_PROBATION, POSTURE_WATCH, POSTURE_CLEAR
+            POSTURE_QUARANTINED, POSTURE_LONG_AVOIDANCE, POSTURE_COOLING,
+            POSTURE_PROBATION, POSTURE_WATCH, POSTURE_CLEAR
         }
 
         r = TestClient(srv.app).get("/v1/admin/risk")

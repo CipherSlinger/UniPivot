@@ -361,6 +361,15 @@ class CooldownTracker:
             "auto_leases_applied": 0,
             "auto_leases_lifted": 0,
         }
+        # [OPT-031] 长效避让门控统计：整环长效避让时的零上游快速失败，以及把长效避让
+        # 节点改派给健康节点的次数。两者都是「没有触碰被封节点」的证据，必须可观测。
+        self._long_avoidance_stats: Dict[str, Any] = {
+            "fast_fails": 0,
+            "redirects": 0,
+            "last_fast_fail_provider": "",
+            "last_fast_fail_cause": "",
+            "last_redirect": "",
+        }
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
         self._episode_ends: Dict[str, float] = {}
@@ -497,6 +506,116 @@ class CooldownTracker:
             return self.quarantine.remaining(provider_key) > 0.0
         except Exception:  # noqa: BLE001 - 查询失败时按未封禁处理，绝不误伤正常节点
             return False
+
+    # ---------------------------------------------------------------- [OPT-031] 长效避让
+    @staticmethod
+    def _env_float(name: str, default: float) -> float:
+        try:
+            return float(os.getenv(name, str(default)))
+        except ValueError:
+            return default
+
+    def long_avoidance_threshold(self) -> float:
+        """[OPT-031] 「短冷却」与「长效避让」的分界（秒，默认 1200）。
+
+        这个阈值不是调出来的经验值，而是一条**真空带**，两端都由代码常量给出：
+        - 上界（短冷却可达上界）：频控与人机验证的短冷却被 `GATEWAY_WAF_COOLDOWN_MAX`
+          （默认 900）封顶，指数也在第 4 次封顶（base * 1.2^3，实测上界 deepseek
+          60s -> 103.7s，见 `tests/test_waf_escalation.py`）；
+        - 下界（升级下界）：认证级长效底数 `GATEWAY_AUTH_COOLDOWN_BASE`（默认 1800），
+          人机验证升级底数更高（3600，见 OPT-029）。
+
+        真空带即 (900, 1800)，默认值 1200 落在正中。**夹逼是强制的**：误配既不能侵入
+        短冷却（那会吃掉 OPT-021 为「环内全部冷却」刻意保留的最后一搏），也不能等于
+        或超过升级下界（那会让升级后的节点重新被派发，风暴复现）。因此实际取值恒满足
+        `短冷却上界 < 阈值 < 升级下界`——两侧都是**严格**不等，各留 1 秒余量，避免
+        「读取时刻略晚于写入时刻」把边界判定翻个面（这正是把阈值取成 1800 时的实测
+        缺陷：认证升级恰好是 1800，读到的剩余时长已是 1799.99，判定立刻翻回「非长效」）。
+        """
+        short_cap = self._env_float("GATEWAY_WAF_COOLDOWN_MAX", 900.0)
+        escal_floor = self._env_float("GATEWAY_AUTH_COOLDOWN_BASE", 1800.0)
+        configured = self._env_float("GATEWAY_LONG_AVOIDANCE_THRESHOLD", 1200.0)
+        return min(max(short_cap + 1.0, configured), escal_floor - 1.0)
+
+    def is_long_avoidance_disabled(self) -> bool:
+        """[OPT-031] 总开关：禁用后回退到「逐个走遍能力环」的旧行为。"""
+        return os.getenv("GATEWAY_DISABLE_LONG_AVOIDANCE_FAST_FAIL", "").strip().lower() in (
+            "1",
+            "true",
+            "yes",
+        )
+
+    def is_in_long_avoidance(self, provider_key: str) -> bool:
+        """[OPT-031] 该节点是否处于**长效避让**（升级后的长冷却，或任何封禁租约）。
+
+        与 `is_in_cooldown`（软冷却）的差别**只在时长**，但处置相反：
+        - 短冷却（频控退避，秒级~两分钟）是可自愈的短暂退避，值得一次最后一搏；
+        - 长效避让（升级后的人机验证/认证冷却，小时~天级）意味着上游已经用**连续多次**
+          拦截给出了答案，再打一发只是又一次「自动化触碰」的证据，只会延长封禁窗口。
+
+        为什么要单独立一个语义：OPT-021 的硬阻断只覆盖运维租约，OPT-025 的快速失败只
+        覆盖整环 401。当环内全部节点都处于**混合成因**的长效避让（有的 waf 升级、有的
+        auth 升级）时，每条客户端请求仍会把五个节点逐个打满——这正是 OPT-025 记录的
+        「无效凭证风暴」形状，只不过成因不是 401。风暴本身就是风控触发器。
+        """
+        if self.is_long_avoidance_disabled():
+            return False
+        # 运维租约无论长短一律硬阻断（与 OPT-021 一致：人工声明优先于时长）
+        try:
+            if self.quarantine.remaining(provider_key) > 0.0:
+                return True
+        except Exception:  # noqa: BLE001 - 租约查询失败不改变软冷却判定
+            pass
+        return self.get_remaining_cooldown(provider_key) >= self.long_avoidance_threshold()
+
+    def ring_long_avoidance_snapshot(self) -> Dict[str, Dict[str, Any]]:
+        """[OPT-031] 当前处于长效避让的节点及其成因/剩余时长（只读，供快速失败文案与诊断）。"""
+        snapshot: Dict[str, Dict[str, Any]] = {}
+        for p_key in PROVIDER_RISK_SPECS:
+            if not self.is_in_long_avoidance(p_key):
+                continue
+            remaining = self.get_remaining_cooldown(p_key)
+            snapshot[p_key] = {
+                "cause": self.long_avoidance_cause(p_key),
+                "remaining_seconds": round(remaining, 1),
+                "remaining_hours": round(remaining / 3600.0, 2),
+            }
+        return snapshot
+
+    def long_avoidance_cause(self, provider_key: str) -> str:
+        """[OPT-031] 长效避让的**成因**，用于给运维正确的处置指引。
+
+        与 `cooldown_cause()` 的差别：租约（人工或自动）在这里一律报 `ban`——租约表达的
+        是账号级封禁，重登无效、只能等平台解除；若沿用软冷却的成因（例如升级前的那个
+        `auth`），运维会照着「执行 login.py 重登」去处理一个重登根本无效的节点，
+        正是 OPT-027/OPT-029 反复修正的同一类错误。
+        """
+        try:
+            if self.quarantine.remaining(provider_key) > 0.0:
+                return "ban"
+        except Exception:  # noqa: BLE001 - 租约查询失败退回软冷却成因判定
+            pass
+        return self.cooldown_cause(provider_key) or "risk"
+
+    def note_long_avoidance_fast_fail(self, provider_key: str, cause: str) -> None:
+        """[OPT-031] 记一次「整环长效避让 → 零上游调用拒绝派发」。"""
+        self._long_avoidance_stats["fast_fails"] += 1
+        self._long_avoidance_stats["last_fast_fail_provider"] = provider_key
+        self._long_avoidance_stats["last_fast_fail_cause"] = cause
+
+    def note_long_avoidance_redirect(self, from_key: str, to_key: str) -> None:
+        """[OPT-031] 记一次「长效避让节点被改派到健康节点」（未触碰避让节点）。"""
+        self._long_avoidance_stats["redirects"] += 1
+        self._long_avoidance_stats["last_redirect"] = f"{from_key}->{to_key}"
+
+    def long_avoidance_report(self) -> Dict[str, Any]:
+        """[OPT-031] 长效避让门控诊断。"""
+        return {
+            "enabled": not self.is_long_avoidance_disabled(),
+            "threshold_seconds": self.long_avoidance_threshold(),
+            "avoiding": self.ring_long_avoidance_snapshot(),
+            "stats": dict(self._long_avoidance_stats),
+        }
 
     # -------------------------------------------------------- [OPT-022] 恢复观察期
 
@@ -1295,6 +1414,14 @@ class CooldownTracker:
             "canary_serialized": 0,
             "canary_successes": 0,
         }
+        # [OPT-031] 长效避让门控统计一并重置，确保用例之间零串扰
+        self._long_avoidance_stats = {
+            "fast_fails": 0,
+            "redirects": 0,
+            "last_fast_fail_provider": "",
+            "last_fast_fail_cause": "",
+            "last_redirect": "",
+        }
         disabled_str = os.getenv("DISABLED_PROVIDERS", "")
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()
@@ -1459,19 +1586,26 @@ class FailoverRouter:
         primary_model: str,
         excluded_providers: Optional[Set[str]] = None,
         include_quarantined: bool = False,
+        include_long_avoidance: bool = False,
     ) -> List[FailoverCandidate]:
         """根据当前主选节点生成同等能力环内的有序候选节点列表。
 
         排序策略：
         1. 排除当前排除集（已尝试失败过的 Provider 以及被主动禁用的 Provider）
         2. [OPT-021] 排除处于运维长期封禁租约的节点（硬阻断，除非显式放行）
-        3. 健康节点排在冷却避让中节点之前
-        4. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
-        5. 同等风险下，按历史失败次数升序排列
+        3. [OPT-031] 排除处于**长效避让**（升级后的长冷却，小时~天级）的节点
+        4. 健康节点排在冷却避让中节点之前
+        5. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
+        6. 同等风险下，按历史失败次数升序排列
 
-        注意软冷却节点**仍保留在候选中**（仅被沉底）：短时自动冷却属于可自愈退避，
-        环内全部冷却时允许最后一搏以保可用性；而运维封禁租约意味着账号级封禁，
-        触碰不会有正常返回，必须彻底排除。
+        注意**短时软冷却**节点仍保留在候选中（仅被沉底）：秒级~两分钟的自动退避属于可
+        自愈的短暂冷却，环内全部冷却时允许最后一搏以保可用性；而运维封禁租约意味着账号级
+        封禁，长效避让意味着上游已连续多次拦截（见 OPT-029/OPT-031），触碰不会有正常返回，
+        只会延长封禁，两者都必须彻底排除而非降级。
+
+        `include_quarantined` / `include_long_avoidance` 是**仅供审计与诊断视图**的两个
+        放行开关：审计需要看到「被排除的节点此刻的冷却读数」，因此必须能把它们包含回来。
+        派发路径一律不传，所以在真实的派发决策中租约与长效避让恒被排除。
         """
         ring = classify_capability_ring(primary_provider, primary_model)
         ring_members = RING_DEFINITIONS.get(ring, [])
@@ -1486,6 +1620,12 @@ class FailoverRouter:
 
             # [OPT-021] 被封禁租约锁定的账号绝不作为后备候选
             if not include_quarantined and self.cooldown_tracker.is_quarantined(p_key):
+                continue
+
+            # [OPT-031] 长效避让节点同样绝不作为后备候选（小时~天级的升级冷却，
+            # 上游已连续拦截过多次；把它留在候选里等于给风暴留了一条通道）。
+            # 短冷却不受影响：它小于阈值，因此这里恒为 False，降级排序语义不变。
+            if not include_long_avoidance and self.cooldown_tracker.is_in_long_avoidance(p_key):
                 continue
 
             meta = PROVIDER_RISK_SPECS.get(p_key)
@@ -1596,6 +1736,65 @@ class FailoverRouter:
                 next_cand = candidates[0]
                 logger.warning(
                     "[封禁硬阻断] 改派: [%s] -> [%s] (模型: %s)",
+                    curr_provider_key,
+                    next_cand.provider_key,
+                    next_cand.wire_model,
+                )
+                curr_provider_key = next_cand.provider_key
+                curr_wire_model = next_cand.wire_model
+                continue
+
+            # [OPT-031] 长效避让硬阻断：处于升级后长冷却（人机验证/认证，小时~天级）的
+            # 节点拒绝派发真实请求。与上面 OPT-021 的租约硬阻断是同一处置，成因不同：
+            # 租约是人工声明，这里是自动升级出来的长期避让。
+            #
+            # 为什么必须收在这里：OPT-021 只挡租约、OPT-025 只挡整环 401，两者之间留下了
+            # 「整环混合成因的长效避让」这一片空白——五家都已被各自的守护机制判定为
+            # 长期不可用，每条客户端请求却仍会把这五个节点逐个打满，产出若干次新的拦截。
+            # 这正是 OPT-025 记录的「无效凭证风暴」形状（风暴本身即风控触发器），只是
+            # 成因从 401 换成了 waf/auth 升级。而且此刻敲哪个节点都拿不到正常返回。
+            #
+            # 与「最后一搏」的边界：短软冷却（频控退避，秒级~两分钟）仍按 OPT-021 的
+            # demote-only 语义保留最后一搏，可用性不受影响——`is_in_long_avoidance`
+            # 的阈值落在短冷却可达上界与升级下界之间的真空带内，短冷却恒定不越界。
+            if self.cooldown_tracker.is_in_long_avoidance(curr_provider_key):
+                remaining = self.cooldown_tracker.get_remaining_cooldown(curr_provider_key)
+                cause = self.cooldown_tracker.long_avoidance_cause(curr_provider_key)
+                logger.error(
+                    "[长效避让硬阻断] 节点 [%s] 处于长效避让 (成因 %s，剩余 %.1f 小时)，拒绝派发",
+                    curr_provider_key,
+                    cause,
+                    remaining / 3600.0,
+                )
+                candidates = self.get_fallback_candidates(
+                    primary_provider_key,
+                    primary_wire_model,
+                    excluded_providers=tried_providers,
+                )
+                if not candidates:
+                    avoiding = self.cooldown_tracker.ring_long_avoidance_snapshot()
+                    detail = "、".join(
+                        f"{k}({v['cause']}，剩余{v['remaining_hours']:.1f}h)" for k, v in sorted(avoiding.items())
+                    ) or f"{curr_provider_key}({cause})"
+                    self.cooldown_tracker.note_long_avoidance_fast_fail(curr_provider_key, cause)
+                    logger.error(
+                        "[长效避让硬阻断] 能力环 [%s] 已无可用容量 (%s)，零上游调用拒绝派发",
+                        ring.value,
+                        detail,
+                    )
+                    raise ProviderError(
+                        f"能力环 [{ring.value}] 内所有节点均处于长效避让，本次请求已拒绝派发"
+                        f"（零上游调用），以免继续触碰上游风控而延长封禁。当前状态: {detail}。"
+                        f"处置: 成因 auth/waf 表示凭证失效或需完成人机验证，请执行 "
+                        f"`.venv/bin/python login.py <provider>`；成因 ban 表示账号级封禁，"
+                        f"重登无效，请静待平台解除，切勿重试。",
+                        status=503,
+                        err_type="ring_exhausted",
+                    )
+                next_cand = candidates[0]
+                self.cooldown_tracker.note_long_avoidance_redirect(curr_provider_key, next_cand.provider_key)
+                logger.warning(
+                    "[长效避让硬阻断] 改派: [%s] -> [%s] (模型: %s)",
                     curr_provider_key,
                     next_cand.provider_key,
                     next_cand.wire_model,

@@ -40,6 +40,7 @@ logger = logging.getLogger("gateway.risk_dossier")
 # ---------------------------------------------------------------- 姿态分级
 
 POSTURE_QUARANTINED = "quarantined"
+POSTURE_LONG_AVOIDANCE = "long_avoidance"
 POSTURE_COOLING = "cooling"
 POSTURE_PROBATION = "probation"
 POSTURE_WATCH = "watch"
@@ -48,6 +49,7 @@ POSTURE_CLEAR = "clear"
 # 姿态由重到轻；派生取**最重**的命中项（fail-closed）。
 POSTURE_ORDER: tuple = (
     POSTURE_QUARANTINED,
+    POSTURE_LONG_AVOIDANCE,
     POSTURE_COOLING,
     POSTURE_PROBATION,
     POSTURE_WATCH,
@@ -56,15 +58,20 @@ POSTURE_ORDER: tuple = (
 
 POSTURE_LABELS: Dict[str, str] = {
     POSTURE_QUARANTINED: "长期封禁（硬阻断，零派发）",
+    POSTURE_LONG_AVOIDANCE: "长效避让（升级后的长冷却，硬阻断，零派发）",
     POSTURE_COOLING: "避让冷却中（自动，时长有界）",
     POSTURE_PROBATION: "恢复观察期（串行探路 + 步调放大）",
     POSTURE_WATCH: "监视期（近期有拦截证据，步调已放慢）",
     POSTURE_CLEAR: "正常（无近期风控记录）",
 }
 
-# 只有硬封禁不可派发；软冷却保留「最后一搏」语义以保可用性（见 OPT-021）。
+# 只有硬封禁与长效避让不可派发；短软冷却保留「最后一搏」语义以保可用性（见 OPT-021）。
+# [OPT-031] 之所以把「长效避让」单列一档而不是并入 cooling：派发边界的处置相反——
+# 短冷却仍会被派发（最后一搏），升级后的长冷却已被硬阻断、零上游调用。若沿用同一个
+# 姿态与 dispatchable=True，档案就在派发事实上说了谎，运维会据此误判节点仍可用。
 POSTURE_DISPATCHABLE: Dict[str, bool] = {
     POSTURE_QUARANTINED: False,
+    POSTURE_LONG_AVOIDANCE: False,
     POSTURE_COOLING: True,
     POSTURE_PROBATION: True,
     POSTURE_WATCH: True,
@@ -346,6 +353,13 @@ class RiskDossier:
         now = time.time() if now is None else now
         if self._quarantine_state(provider_key)["active"]:
             return POSTURE_QUARANTINED
+        # [OPT-031] 升级后的长效避让（小时~天级）在派发边界已被硬阻断，必须先于
+        # 「冷却中」判定，否则档案会给出一个可派发、实则零派发的错误姿态。
+        try:
+            if self.cooldown_tracker.is_in_long_avoidance(provider_key):
+                return POSTURE_LONG_AVOIDANCE
+        except Exception:  # noqa: BLE001 - 判定失败退回既有的「冷却中」姿态，绝不误报可用
+            pass
         if self._cooldown_state(provider_key) > 0.0:
             return POSTURE_COOLING
         if self._probation_state(provider_key)["active"]:
@@ -386,6 +400,34 @@ class RiskDossier:
                 f"零误触等待平台自然解封（租约剩余约 {hours} 小时）；此期间网关已在派发路径硬阻断该节点",
                 "**不要**尝试重新登录或更换令牌：账号级封禁作用在账号本身，重登无效且会延长封禁",
                 "确认封禁已实际解除后，再执行 `DELETE /v1/admin/quarantine` 并留意解封后的恢复观察期",
+            ]
+        if posture == POSTURE_LONG_AVOIDANCE:
+            rem = entry["cooldown_remaining_s"]
+            cause = entry.get("cooldown_cause", "")
+            # [OPT-031] 长效避让**不是**「冷却中」的一种说法：它已被派发边界硬阻断
+            # （零上游调用），成因是上游连续多次拦截后的时长升级。因此建议必须是
+            # 「解除成因」而不是「等待自动门控」——后者会把运维引向数小时的空等。
+            if cause == "waf":
+                return [
+                    f"该节点处于**人机验证升级后的长效避让**（剩余约 {rem / 3600.0:.1f} 小时）："
+                    f"重复出现的验证码拦截已按 2 的幂升级，自动重试只会加重账号标记",
+                    f"唯一有效的处置是人工执行 `.venv/bin/python login.py {provider_key}` "
+                    f"完成滑块验证——登录成功后凭证指纹变化，网关会**自动解除**该避让"
+                    f"并转入串行探路重新验证",
+                    "在完成人工验证之前严禁以脚本方式重试或破解验证码：属对抗行为且会显著加重风控评分",
+                ]
+            if cause == "auth":
+                return [
+                    f"该节点处于**凭证失效升级后的长效避让**（剩余约 {rem / 3600.0:.1f} 小时）："
+                    f"多次认证失败已按 2 的幂升级",
+                    f"执行 `.venv/bin/python login.py {provider_key}` 重新登录取令牌；"
+                    f"凭证更新后网关会自动解除该避让并转入串行探路重新验证",
+                    "若重登后仍被拒绝，说明是账号级问题而非凭证问题，网关会据此自动施加租约停止触碰",
+                ]
+            return [
+                f"该节点处于长效避让（剩余约 {rem / 3600.0:.1f} 小时，成因：{cause or '未知'}），"
+                f"已被派发边界硬阻断（零上游调用）",
+                "流量已自动分流至同能力环的其他健康节点；整环都在长效避让时请求会被拒绝而非逐个重试",
             ]
         if posture == POSTURE_COOLING:
             rem = entry["cooldown_remaining_s"]
