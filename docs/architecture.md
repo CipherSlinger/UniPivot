@@ -352,6 +352,14 @@ PROVIDER_RISK_SPECS = {
 - **冷却总开关不得放开被禁用节点**：`GATEWAY_DISABLE_COOLDOWN_GATE=1` 的语义是「回退为无冷却感知」，而运维禁用是部署声明、不是冷却感知——一个开关悄悄放开一个已被声明出局的节点正是这里的陷阱。故禁用判定**不受**该开关覆盖；租约与冷却判定仍受其约束，逐值不变。
 - **遥测**：`/v1/diagnostics` 新增 `touch_gates`（`blocked_by_cause` 为**逐成因拒载直方图**；各消费方只在「即将触碰上游」的那一刻求值，故直方图读作被拦下的触碰次数而非节点数），会话回收的 `deferred_by_cooldown.per_cause` 按成因拆分推迟计数。`GATEWAY_DISABLE_CONVERSATION_GC_COOLDOWN_GATE=1` 仍可回退回收门控；未注入成因判据时退回冷却浮点门控并报 `cooldown`，逐值不变。见 `tests/test_disabled_propagation.py`（9 个用例）。
 
+#### 23. 档案姿态与派发事实的一致性 (`providers/risk_dossier.py:derive_posture`)
+
+- **动机（与 OPT-031 同源、只换了一格）**：档案（OPT-023）的职责之一是回答「这个节点现在能不能被派发」，而派发边界才是唯一的事实来源。OPT-031 发现**长效避让**这一格在派发边界已被硬阻断、档案却报「冷却中（可派发）」；**「运维声明出局」（`DISABLED_PROVIDERS`）这一格被以完全相同的方式漏掉了**：派发边界对它硬阻断（OPT-033），档案却报「正常」且 `dispatchable=True`。实测复现（`DISABLED_PROVIDERS=qwen`、无租约无冷却）：派发闸门 `{'dispatchable': False, 'blocked_by': 'disabled'}` vs 档案 `posture=clear`。运维据此会误判一个已被声明出局的节点仍可用。
+- **姿态词表新增 `disabled`，且按「危险者优先」排序**：`POSTURE_ORDER` = `quarantined → disabled → long_avoidance → cooling → probation → watch → clear`。排序是刻意的而非字母序：一个**既被封禁又被声明出局**的节点（本机 DeepSeek 的真实状态）必须先报「封禁」——若先报「出局」，运维最自然的反应是「那就解除禁用」，从而把一个**被封禁**的节点重新放回派发路径。先报封禁给出正确动作（等待平台解封），而「出局」作为逐节点标记（`entry["disabled"]`）与 `POSTURE_LABELS` 仍然可见。
+- **一致性写成「性质」而非六个用例**：`tests/test_dossier_dispatch_agreement.py` 对**每一种逐节点状态**（健康 / 短冷却 / 升级后的长效避让 / 租约 / 禁用）断言 `档案 dispatchable == 派发闸门 dispatchable`。OPT-031 与 OPT-035 都是「漏了一格」，写成性质意味着**下一格再被漏掉时会直接变红**，而不是等运维实测发现。唯一的刻意例外——**环级凭证失效**（OPT-025）是环级事实而档案是逐节点姿态，故档案报 `clear` 而闸门报 `blocked_by=credential_outage`——被显式断言锁住而不是隐瞒，使它既不会被误当成 bug，也不会静默改变。
+- **研判按成因分支，且绝不给出无效解药**：`AVOIDANCE_MATRIX["disabled"]` 给出 `technically_bypassable: False`、`recoverable_by_relogin: **False**`（配置声明不是凭证问题，重登无效）、`auto_recovers: False`。`_avoidance()` 把禁用分支放在租约分支**之后**，使持有租约的节点保持 `ban` 研判；`recommended_actions` 的 `POSTURE_DISABLED` 分支点名 `DISABLED_PROVIDERS` 并声明重登无效——把本项目反复修复的「误导运维」缺陷类（OPT-026/027/029/031/034）在档案层也一并闭合。整个查询路径保持**只读**，`entry["disabled"]` 仅作信息展示，绝不改动风控状态。
+- **遥测**：档案摘要的 `posture_counts` 新增 `disabled` 桶、`AVOIDANCE_MATRIX` 新增 `disabled` 行，两者都属 `/v1/admin/risk` 与 `/v1/diagnostics` 的对外形态，并由 `tests/test_risk_dossier.py` 钉死（词表新增成员必须同步改断言）。`GATEWAY_DISABLE_RISK_DOSSIER=1` 仍可整体关闭。见 `tests/test_dossier_dispatch_agreement.py`（6 个用例）。
+
 ---
 
 ### 2.3 自愈与自动热修复系统 (`healing/`)
@@ -512,6 +520,7 @@ PROVIDER_RISK_SPECS = {
 │   └── test_long_avoidance.py  # 长效避让派发硬阻断：阈值真空带证明、整环混合成因零上游快速失败、短冷却最后一搏零回归、改派零触碰、档案 fail-closed 姿态测试
 │   └── test_dispatch_audit.py  # 零上游派发预演：只读闸门审计、逐节点阻断成因与剩余时长、整环 fail-closed 预测，以及「预演必须与真实派发一致」的零漂移回归测试
 │   └── test_dispatch_gate.py   # 派发闸门唯一定义与运维禁用硬阻断：DISABLED_PROVIDERS 在派发边界生效（实测漏洞：预演报阻断而 execute_chat 直接派发进被禁用节点）、闸门顺序只有一份副本（篡改唯一闸门定义即须改变派发）、同一配置只有一份解读、短冷却最后一搏零回归
+│   └── test_dossier_dispatch_agreement.py # 档案与派发事实一致：档案绝不得报一个被派发闸门硬阻断的节点「可派发」（实测漏洞：DISABLED_PROVIDERS 在派发被阻断而档案报 clear/可派发）、一致性写成覆盖全部逐节点状态的性质、环级凭证失效例外被显式锁住、危险者优先排序（封禁+出局先报封禁）、查询只读
 │   └── test_disabled_propagation.py # 运维禁用贯穿全部自维护触点：DISABLED_PROVIDERS 在令牌刷新/会话回收/自愈选举/健康探针四处生效（实测漏洞：被禁用且无冷却的节点仍被发起真实刷新请求）、唯一成因判据（disabled > quarantined > cooldown）、禁用不进入延迟重试、禁用不受冷却总开关影响、健康/冷却/租约节点零回归
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
@@ -589,6 +598,7 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_device_identity.py && \
 .venv/bin/python tests/test_long_avoidance.py && \
 .venv/bin/python tests/test_disabled_propagation.py && \
+.venv/bin/python tests/test_dossier_dispatch_agreement.py && \
 .venv/bin/python tests/test_dispatch_audit.py && \
 .venv/bin/python tests/test_dispatch_gate.py
 ```

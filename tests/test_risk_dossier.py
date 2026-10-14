@@ -53,6 +53,7 @@ from providers.risk_dossier import (  # noqa: E402
     AVOIDANCE_MATRIX,
     POSTURE_CLEAR,
     POSTURE_COOLING,
+    POSTURE_DISABLED,
     POSTURE_LONG_AVOIDANCE,
     POSTURE_PROBATION,
     POSTURE_QUARANTINED,
@@ -363,16 +364,18 @@ def test_diagnostics_and_admin_endpoint_exposure():
         summary = diag["risk_dossier_summary"]
         assert "posture_counts" in summary
         assert set(summary["posture_counts"]) == {
-            POSTURE_QUARANTINED, POSTURE_LONG_AVOIDANCE, POSTURE_COOLING,
-            POSTURE_PROBATION, POSTURE_WATCH, POSTURE_CLEAR
-        }
+            POSTURE_QUARANTINED, POSTURE_DISABLED, POSTURE_LONG_AVOIDANCE,
+            POSTURE_COOLING, POSTURE_PROBATION, POSTURE_WATCH, POSTURE_CLEAR
+        }, "姿态词表新增成员时必须同步更新此断言（OPT-035 新增 disabled）"
 
         r = TestClient(srv.app).get("/v1/admin/risk")
         assert r.status_code == 200, r.text
         body = r.json()
         for key in ("summary", "providers", "avoidance_matrix"):
             assert key in body
-        assert set(body["avoidance_matrix"]) == {"ratelimit", "waf", "auth", "ban"}
+        assert set(body["avoidance_matrix"]) == {"ratelimit", "waf", "auth", "ban", "disabled"}, (
+            "研判矩阵新增成因时必须同步更新此断言（OPT-035 新增 disabled）"
+        )
 
         # 单节点视图
         r2 = TestClient(srv.app).get("/v1/admin/risk", params={"provider": "qwen"})

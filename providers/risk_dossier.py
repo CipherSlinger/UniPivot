@@ -40,6 +40,7 @@ logger = logging.getLogger("gateway.risk_dossier")
 # ---------------------------------------------------------------- 姿态分级
 
 POSTURE_QUARANTINED = "quarantined"
+POSTURE_DISABLED = "disabled"
 POSTURE_LONG_AVOIDANCE = "long_avoidance"
 POSTURE_COOLING = "cooling"
 POSTURE_PROBATION = "probation"
@@ -49,6 +50,7 @@ POSTURE_CLEAR = "clear"
 # 姿态由重到轻；派生取**最重**的命中项（fail-closed）。
 POSTURE_ORDER: tuple = (
     POSTURE_QUARANTINED,
+    POSTURE_DISABLED,
     POSTURE_LONG_AVOIDANCE,
     POSTURE_COOLING,
     POSTURE_PROBATION,
@@ -58,6 +60,7 @@ POSTURE_ORDER: tuple = (
 
 POSTURE_LABELS: Dict[str, str] = {
     POSTURE_QUARANTINED: "长期封禁（硬阻断，零派发）",
+    POSTURE_DISABLED: "运维声明出局（DISABLED_PROVIDERS，硬阻断，零派发）",
     POSTURE_LONG_AVOIDANCE: "长效避让（升级后的长冷却，硬阻断，零派发）",
     POSTURE_COOLING: "避让冷却中（自动，时长有界）",
     POSTURE_PROBATION: "恢复观察期（串行探路 + 步调放大）",
@@ -69,8 +72,15 @@ POSTURE_LABELS: Dict[str, str] = {
 # [OPT-031] 之所以把「长效避让」单列一档而不是并入 cooling：派发边界的处置相反——
 # 短冷却仍会被派发（最后一搏），升级后的长冷却已被硬阻断、零上游调用。若沿用同一个
 # 姿态与 dispatchable=True，档案就在派发事实上说了谎，运维会据此误判节点仍可用。
+# [OPT-035] 同理把「运维声明出局」单列一档：派发边界（OPT-033）对 DISABLED_PROVIDERS
+# 是硬阻断，而档案此前对它给出「正常（可派发）」——档案在派发事实上说谎的第二处。
+# 排序上刻意把 quarantined 放在 disabled **之前**（危险者优先）：一个既被封禁又被运维
+# 禁用的节点（正是本机 deepseek 的真实状态）若先报「出局」，运维最自然的反应是「那就把
+# 禁用解除」，从而把一个**被封禁**的节点重新放回派发路径——静默且有害。先报「封禁」
+# 则给出「等待解封」的正确动作，而「出局」作为条目标记仍然可见。
 POSTURE_DISPATCHABLE: Dict[str, bool] = {
     POSTURE_QUARANTINED: False,
+    POSTURE_DISABLED: False,
     POSTURE_LONG_AVOIDANCE: False,
     POSTURE_COOLING: True,
     POSTURE_PROBATION: True,
@@ -132,6 +142,22 @@ AVOIDANCE_MATRIX: Dict[str, Dict[str, Any]] = {
                     "网关以运维长期封禁租约 (`POST /v1/admin/quarantine`) 表达该窗口，"
                     "并在租约解除后以恢复观察期 (OPT-022) 渐进试探，避免解封瞬间的并发"
                     "洪峰把账号二次打进封禁。",
+    },
+    # [OPT-035] 运维声明出局：不是平台的风控，而是运维把节点排除出本次部署。
+    # 措辞刻意与「封禁」和「认证失效」都不同，因为它们**都**建议重登，而这里重登
+    # 完全无效——这正是本项目反复修复的「误导运维」缺陷类型（OPT-026/027/029/031）。
+    "disabled": {
+        "label": "运维声明出局 (DISABLED_PROVIDERS)",
+        "technically_bypassable": False,
+        "recoverable_by_relogin": False,
+        "auto_recovers": False,
+        "typical_span": "需人工修改配置",
+        "strategy": "这不是平台风控，而是运维的部署声明：该节点被 `DISABLED_PROVIDERS` "
+                    "显式排除，派发边界对其**硬阻断**（零上游调用）。解除方式只有一处——"
+                    "修改 `DISABLED_PROVIDERS` 或程序化解除声明；**重新登录无效**，"
+                    "自动避让也不会解除它（它不是冷却，没有会到期的窗口）。"
+                    "解除前请先确认该节点本身是否仍处于封禁或人机验证避让，"
+                    "否则会把一个仍受风控限制的节点直接放回派发路径。",
     },
 }
 
@@ -242,6 +268,11 @@ class RiskDossier:
                           "仍被 401 拒绝）；重新登录取新令牌即可自动解除并重新验证")
             else:
                 reason = "该节点处于运维长期封禁租约，按平台侧账号级封禁研判"
+        elif self._is_disabled(provider_key):
+            # [OPT-035] 声明出局优先于「按拦截严重度研判」：对一个运维已排除的节点谈
+            # 「主要症结是频控/认证」会把运维引向重登，而重登对声明出局完全无效。
+            verdict_key = "disabled"
+            reason = "该节点被运维声明出局（DISABLED_PROVIDERS），非平台风控"
         else:
             # 取出现次数最多的严重度作为主要症结；无记录则按最轻的 ratelimit。
             by_sev = stats.get("by_severity") or {}
@@ -254,6 +285,16 @@ class RiskDossier:
             "reason": reason,
             **matrix,
         }
+
+    def _is_disabled(self, provider_key: str) -> bool:
+        """[OPT-035] 该节点是否被运维声明出局（判读委托给唯一判读者，查询失败按未禁用）。"""
+        tracker = self.cooldown_tracker
+        if tracker is None:
+            return False
+        try:
+            return bool(tracker.is_disabled(provider_key))
+        except Exception:  # noqa: BLE001 - 判读失败绝不误报「出局」
+            return False
 
     def _quarantine_state(self, provider_key: str) -> Dict[str, Any]:
         try:
@@ -353,6 +394,14 @@ class RiskDossier:
         now = time.time() if now is None else now
         if self._quarantine_state(provider_key)["active"]:
             return POSTURE_QUARANTINED
+        # [OPT-035] 运维声明出局（DISABLED_PROVIDERS）在派发边界是硬阻断（OPT-033），
+        # 档案必须与之一致。排在租约**之后**：既被封禁又被禁用的节点先报「封禁」，
+        # 避免运维看到「出局」就去解除禁用、把一个被封禁的节点放回派发路径。
+        try:
+            if self.cooldown_tracker is not None and self.cooldown_tracker.is_disabled(provider_key):
+                return POSTURE_DISABLED
+        except Exception:  # noqa: BLE001 - 判定失败退回既有姿态，绝不误报可用
+            pass
         # [OPT-031] 升级后的长效避让（小时~天级）在派发边界已被硬阻断，必须先于
         # 「冷却中」判定，否则档案会给出一个可派发、实则零派发的错误姿态。
         try:
@@ -377,6 +426,12 @@ class RiskDossier:
 
     def recommended_actions(self, provider_key: str, posture: str, entry: Dict[str, Any]) -> List[str]:
         """给出可执行的下一步（按优先级排序），直接回应「如何避免」。"""
+        if posture == POSTURE_DISABLED:
+            return [
+                "该节点被运维声明出局（DISABLED_PROVIDERS），派发边界对其硬阻断、零上游调用",
+                "如需恢复使用：修改 DISABLED_PROVIDERS 或程序化解除声明后重启网关；重登无效",
+                "解除前先确认该节点本身是否仍处于封禁/人机验证避让，避免把受控节点放回派发路径",
+            ]
         if posture == POSTURE_QUARANTINED:
             q = entry["quarantine"]
             hours = q.get("remaining_hours", 0.0)
@@ -504,6 +559,9 @@ class RiskDossier:
             },
             "cooldown_remaining_s": round(self._cooldown_state(provider_key), 1),
             "cooldown_cause": self._cooldown_cause(provider_key),
+            # [OPT-035] 逐节点备注：即便姿态被更重的成因（封禁/长效避让）占据，
+            # 「运维已声明出局」这一事实仍必须可见——否则运维会以为解除封禁即可恢复派发。
+            "disabled": self._is_disabled(provider_key),
             "quarantine": self._quarantine_state(provider_key),
             "probation": self._probation_state(provider_key),
             "pacing": self._pacing_state(provider_key),
