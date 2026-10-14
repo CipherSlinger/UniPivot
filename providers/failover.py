@@ -1655,6 +1655,128 @@ class FailoverRouter:
         candidates.sort(key=sort_key)
         return candidates
 
+    def audit_dispatch(self, provider_key: str, wire_model: str) -> Dict[str, Any]:
+        """[OPT-032] 零上游派发预演：此刻这个请求会被谁承接、谁被排除、被**哪一道**闸门排除。
+
+        动机来自一次真实操作：运维声明「deepseek 已被封禁，零误触是硬约束」之后，唯一能
+        确认这份声明**真的生效**的办法是手写一段脚本、注入假 Provider 工厂、用 TestClient
+        发一次请求，再看被触碰的节点集合。而这个确认动作本身是日常的——每次改租约、改
+        环境变量、重启之后都要问一遍「现在到底会不会派发到它」。逐个翻看五个 admin 端点
+        （quarantine / risk / correlation / credential-outage / ban-inference）都回答不了它，
+        因为问题不是「这个节点处于什么姿态」，而是「这条请求此刻的派发决定是什么」。
+
+        只读且零上游调用：不实例化任何 Provider，只向**派发路径同一组**闸门函数提问，
+        因此不存在「文档说会避让、实际仍派发」的漂移——预演与派发读的是同一份状态、同一组
+        谓词。这也是它敢被称为「预演」而不是「估算」的唯一理由。
+
+        刻意**不模拟**负载均衡与会话亲和：它们可能改变最终承接节点，而模拟它们就等于在
+        这里重写一遍三个协议的派发前管线，那正是本项目反复出现的「文档与实现漂移」缺陷的
+        温床。因此字段以 `predicted_` 命名，`scope_note` 显式声明该边界——宁可说清它不管
+        什么，也不要给一个看起来更完整、实则会错的承诺。
+
+        闸门顺序与 `execute_chat` 派发循环**逐条一致**（全环凭证失效 → 运维租约 →
+        长效避让），因为「哪一道闸门先开火」正是运维需要知道的信息。
+        """
+        ring = classify_capability_ring(provider_key, wire_model)
+        member_keys = {p_key for p_key, _ in RING_DEFINITIONS.get(ring, [])}
+        if provider_key not in member_keys:
+            # 宁可当场报错，也不要产出一份「看起来完整、实则问错了对象」的预演：
+            # 传入模型别名而非 provider key 是最容易犯的错，而它会让 is_quarantined
+            # 等谓词对着一个不存在的 key 求值，从而把封禁节点报成可派发——这正是
+            # 本预演存在意义所要消灭的那类谎报。
+            raise ValueError(
+                f"provider_key {provider_key!r} 不属于能力环 {ring.value!r}；"
+                f"预演需要已解析的 (provider_key, wire_model)，请先用 resolve_model() 解析模型别名"
+            )
+
+        # [OPT-025] 全环凭证失效是**环级**决定：它一旦成立，环内任何节点都不会被派发，
+        # 且必须排在逐节点闸门之前报告，否则会误导运维去处理某单个节点。
+        try:
+            outage_active = bool(self.cooldown_tracker.credential_watch.is_outage_active())
+            outage_failed = list(self.cooldown_tracker.credential_watch.active_failures())
+        except Exception:  # noqa: BLE001
+            outage_active, outage_failed = False, []
+
+        members: List[Dict[str, Any]] = []
+        for p_key, w_model in RING_DEFINITIONS.get(ring, []):
+            blocked_by = ""
+            remaining = 0.0
+            cause = ""
+            if self.cooldown_tracker.is_disabled(p_key):
+                blocked_by = "disabled"
+            elif outage_active:
+                # 环级闸门：此刻无论哪个节点都不会被派发
+                blocked_by = "credential_outage"
+            elif self.cooldown_tracker.is_quarantined(p_key):
+                blocked_by = "quarantine"
+                try:
+                    remaining = self.cooldown_tracker.quarantine.remaining(p_key)
+                except Exception:  # noqa: BLE001
+                    remaining = 0.0
+                cause = "ban"
+            elif self.cooldown_tracker.is_in_long_avoidance(p_key):
+                blocked_by = "long_avoidance"
+                remaining = self.cooldown_tracker.get_remaining_cooldown(p_key)
+                cause = self.cooldown_tracker.long_avoidance_cause(p_key)
+
+            members.append(
+                {
+                    "provider": p_key,
+                    "wire_model": w_model,
+                    "dispatchable": not blocked_by,
+                    "blocked_by": blocked_by or None,
+                    "blocking_cause": cause or None,
+                    "remaining_seconds": round(remaining, 1) if remaining else 0.0,
+                    "remaining_hours": round(remaining / 3600.0, 2) if remaining else 0.0,
+                }
+            )
+
+        dispatchable = [m for m in members if m["dispatchable"]]
+        primary = next((m for m in members if m["provider"] == provider_key), None)
+
+        # 改派目标**必须**取自真正的候选选择函数，而不是「环内第一个可派发成员」。
+        # 实测教训：两者并不相同——`get_fallback_candidates` 按 (冷却, 风险等级, 失败次数)
+        # 排序，所以 glm 可能排在环序更靠前的 qwen 之前；按环序猜会预测出 qwen 而实际派发
+        # 到 glm，预演当场变成谎报。本套件的 test_prediction_matches_real_dispatch_redirect
+        # 就是据这次实测写的。
+        redirect_target = None
+        if primary is not None and not primary["dispatchable"]:
+            try:
+                candidates = self.get_fallback_candidates(provider_key, wire_model)
+            except Exception:  # noqa: BLE001
+                candidates = []
+            if candidates:
+                redirect_target = candidates[0].provider_key
+
+        # 预测的错误类型必须与派发路径**真正会抛出**的那一个一致：租约/长效避让是先改派、
+        # 改派不出去才报错，因此只有整环确实无节点可派时才有 err_type——否则预演就成了谎报
+        # （把一次正常的改派说成会失败）。
+        if outage_active:
+            err_type: Optional[str] = "credential_outage"
+        elif not dispatchable and primary is not None and not primary["dispatchable"]:
+            err_type = "quarantined" if primary["blocked_by"] == "quarantine" else "ring_exhausted"
+        else:
+            err_type = None
+
+        return {
+            "provider": provider_key,
+            "wire_model": wire_model,
+            "ring": ring.value,
+            "upstream_calls": 0,
+            "predicted_primary_dispatchable": bool(primary and primary["dispatchable"]),
+            "predicted_redirect_target": redirect_target,
+            "predicted_fail_closed": not dispatchable,
+            "predicted_err_type": err_type,
+            "dispatchable_count": len(dispatchable),
+            "ring_size": len(members),
+            "credential_outage": {"active": outage_active, "failed_providers": sorted(outage_failed)},
+            "ring_members": members,
+            "scope_note": (
+                "仅预演**闸门**决定（全环凭证失效 / 运维租约 / 长效避让），零上游调用；"
+                "不含负载均衡分流与会话亲和固定，最终承接节点可能与 predicted_redirect_target 不同。"
+            ),
+        }
+
     async def execute_chat(
         self,
         primary_provider_key: str,

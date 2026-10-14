@@ -363,6 +363,48 @@ def test_e2e_quarantined_primary_is_redirected_and_served():
     print("test_e2e_quarantined_primary_is_redirected_and_served: PASSED")
 
 
+def test_e2e_env_declared_lease_blocks_dispatch_without_touch():
+    """运维声明封禁的**最短路径**：`.env` 里写一行 `GATEWAY_QUARANTINE`，重启后即零触碰。
+
+    env 解析（test_quarantine.py::test_env_quarantine_applied_on_startup）与派发硬阻断
+    （本套件其余用例）各自都有覆盖，但两者的**接缝**此前没有：那条接缝恰好是运维实际
+    使用的那条路——写一行环境变量、重启、期望被封禁的节点从此再也不被触碰。接缝处出
+    问题是最典型的「两个部件都测过、组合起来却没用」，因此这里把「带 .env 重启」的
+    进程状态显式构造出来：新建的 store 在构造时读取环境变量，再交给派发路径使用。
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="env_lease_"))
+    tracker = srv.failover_router.cooldown_tracker
+    original_store = tracker.quarantine
+    original_make = srv._make_provider
+    os.environ["GATEWAY_QUARANTINE"] = "deepseek:72h"
+    try:
+        tracker.reset()
+        TOUCHED.clear()
+        fresh = QuarantineStore(directory=tmp)  # 构造时读取 GATEWAY_QUARANTINE
+        assert fresh.remaining("deepseek") > 71 * 3600, "前置条件：环境变量未生效"
+        assert fresh.list_active()["deepseek"]["source"] == "operator"
+        tracker.quarantine = fresh
+
+        srv._make_provider = _make_fake()
+        client = TestClient(srv.app)
+        r = client.post(
+            "/v1/chat/completions",
+            json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}]},
+        )
+        assert r.status_code == 200, r.text
+        assert TOUCHED, "必须改派到某个健康节点"
+        assert "deepseek" not in TOUCHED, f"环境变量声明的封禁节点被触碰了: {TOUCHED}"
+        # 落盘后即便日后不经 run.sh（无 .env）启动，租约也必须仍在
+        assert fresh.path.exists()
+    finally:
+        srv._make_provider = original_make
+        tracker.quarantine = original_store
+        os.environ.pop("GATEWAY_QUARANTINE", None)
+        tracker.reset()
+        shutil.rmtree(tmp, ignore_errors=True)
+    print("test_e2e_env_declared_lease_blocks_dispatch_without_touch: PASSED")
+
+
 def run_all():
     test_is_quarantined_semantics()
     test_is_quarantined_never_raises()
@@ -373,6 +415,7 @@ def run_all():
     test_load_balancer_redirects_off_quarantined_primary()
     test_e2e_all_quarantined_returns_503_without_upstream_call()
     test_e2e_quarantined_primary_is_redirected_and_served()
+    test_e2e_env_declared_lease_blocks_dispatch_without_touch()
     print("\n✅ All quarantine hard-stop tests (OPT-021) passed!")
 
 

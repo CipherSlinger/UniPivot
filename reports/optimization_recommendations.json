@@ -1,7 +1,7 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-14 14:35:12",
-  "total_tasks_evaluated": 0,
+  "generated_at": "2026-10-14 15:15:34",
+  "total_tasks_evaluated": 2,
   "model_metrics": {
     "Qwen3.7-Max": {
       "avg_ttft_ms": 780.0,
@@ -356,6 +356,16 @@
       "priority": "P0",
       "description": "派发循环此前只有两道前置闸口：OPT-021 拦**运维/自动租约**（is_quarantined），OPT-025 拦**整环 401 失效**（credential_watch）。两者之间留下一整片未覆盖的地带：**整环混合成因的长效避让**——有人是升级后的 waf（OPT-029，3600s 起）、有人是升级后的 auth（OPT-026，1800s 起），时长小时~天级。实证：apply_pacing_and_acquire 只按**步调间隔**睡眠，从不等满冷却时长；get_fallback_candidates 对冷却节点也只是**沉底**。于是每条客户端请求仍会把这五个节点逐个打满，为一个**根本不可能成功**的请求产出若干次新的拦截——这正是 OPT-025 记录过的「风暴本身就是风控触发器」，只是成因从 401 换成了 waf/auth 升级，且此刻敲哪个节点都拿不到正常返回。设计张力必须显式处理：OPT-021 **刻意**让软冷却保持 demote-only（「环内全部冷却时允许最后一搏，以保可用性」），因此不能粗暴地改成「全部冷却即失败」。唯一正当的判别式是**时长**：短冷却（频控退避，秒级~两分钟）值得一次最后一搏，长效避让（升级后冷却，小时~天级）不值得——上游已用连续多次拦截作答。阈值必须是一条**真空带**而非调出来的经验值：短冷却可达上界由代码常量给出（GATEWAY_WAF_COOLDOWN_MAX 默认 900s；频控指数亦在 base*1.2^3 饱和，实测最深 103.7s），升级下界是 GATEWAY_AUTH_COOLDOWN_BASE（默认 1800s，waf 升级起点 3600s）；GATEWAY_LONG_AVOIDANCE_THRESHOLD 默认取 1200 并被**夹逼**到 [短冷却上界+1, 升级下界-1]，误配既不能侵入短冷却（吃掉最后一搏），也不能触到升级下界（风暴复现）。两侧都是严格不等并各留 1 秒余量——把阈值取成恰好 1800 是实测有缺陷的：认证升级恰好就是 1800，读回的剩余时长已是 1799.99，判定立刻翻回「非长效」。语义与所有邻居都不同：长效避让既不是租约（无人声明、本身不等于账号级封禁）也不是凭证失效（不要求整环、不限定 401），它就是**同一个节点**，只是被给了一个长到「再碰一次比等着更糟」的时长，因此按**硬阻断**而非降级处置——长效避让节点被排除出后备候选（短冷却仍只被沉底，逐字节不变），长效避让的主选被**改派**给健康候选，整环无不可避让成员时则以 503 / err_type=\"ring_exhausted\"（Anthropic 映射 overloaded_error）**零上游调用**拒绝，并逐节点列出成因与剩余时长及处置方式。成因不得误导运维：long_avoidance_cause() 对持有租约的节点一律报 ban（重登无效——封禁绑定账号），仅无租约时退回软冷却成因严重度，杜绝 OPT-026/027/029 各自修过的同一类「把重登有效的成因贴到重登无效的节点上」。OPT-023 档案新增 long_avoidance 姿态（置于 quarantined 与 cooling 之间，dispatchable=false），使档案绝不在派发边界已硬阻断时仍声称可派发；get_fallback_candidates 的两个 include_* 放行开关仅供审计/诊断视图，派发路径一律不传。GATEWAY_DISABLE_LONG_AVOIDANCE_FAST_FAIL=1 精确回退「逐个走遍能力环」的旧行为。",
       "expected_impact": "掐断一条**每条请求都在发生**的无效触碰通道：整环处于长效避让时，不再为每个客户端请求把五个已被风控标记的节点逐个打满（零上游调用），从而不再向「自动化尝试」的风控评分里持续投喂证据、不再延长封禁窗口——直接服务于「deepseek 已被封、不得加重其余四家风控」的硬约束。可用性按设计零回归：短冷却的 demote-only「最后一搏」语义逐字节保持不变，且由阈值夹逼**结构性地**保证短冷却永远不可能被误判为长效避让（测试证明真空带存在而非假设）。改派路径已被证明是真正的零触碰——长效避让节点的剩余冷却只允许衰减、不得延长。运维可观测且可操作：诊断暴露 enabled/threshold_seconds/avoiding/stats，快速失败报文逐节点给出成因与剩余小时数及重登/静默等待的分别指引，档案姿态与派发事实一致（不再自称可派发）。"
+    },
+    {
+      "id": "OPT-032",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "风控避让可验证性",
+      "title": "零上游派发预演与文档事实一致性 (Zero-Upstream Dispatch Dry-Run)",
+      "priority": "P1",
+      "description": "动机来自一次真实操作：运维声明「deepseek 已被封禁、零误触是硬约束」之后，唯一能确认这份声明**真的生效**的办法，是手写一段脚本、注入假 Provider 工厂、用 TestClient 发一次请求，再看被触碰的节点集合。这个确认动作是日常的——每次改租约、改环境变量、重启之后都要再问一遍「现在到底会不会派发到它」；而当时已有的五个 admin 端点（quarantine / ban-inference / credential-outage / risk / risk-correlation）逐个翻看都回答不了它：它们回答的是「这个节点处于什么姿态」，而真正的问题是把节点姿态**合成为一条具体请求的派发决定**——「这条请求此刻会被谁承接、谁被排除、被**哪一道**闸门排除、改派到谁、还是会快速失败、失败时的 err_type 是什么」。这恰恰是 OPT-021/025/031 三道前置闸口叠加之后的结果，而三道闸口的**顺序**是语义的一部分（全环凭证失效是环级、必须排在逐节点之前）。修复新增 `FailoverRouter.audit_dispatch(provider_key, wire_model)`：纯只读、零上游调用，按与 execute_chat 派发循环**逐条一致**的顺序复算闸门（disabled → 全环凭证失效 → 运维/自动租约 → 长效避让），逐节点给出 blocked_by / blocking_cause / 剩余时长与小时数，并合成 predicted_primary_dispatchable / predicted_redirect_target / predicted_fail_closed / predicted_err_type。两条设计纪律：(1) 改派目标**必须**取自真正的候选选择函数 `get_fallback_candidates(...)[0]`，而不是「环内第一个可派发成员」——实测二者会**不一致**（候选按 (in_cooldown, risk_level, failure_count, remaining_cooldown) 排序，glm 可以排在环序更靠前的 qwen 之前），按后者实现会产出一份看似合理、实则与派发路径漂移的预演；这正是本项目反复记录过的「文档说会避让、实现仍派发」那一类缺陷，只不过换成了「预演说会改派到 A、真实派发到 B」。(2) 预演**刻意不模拟**负载均衡与会话亲和，因此字段一律以 `predicted_` 命名，并在返回值中携带 scope_note 显式声明该边界——一个隐瞒边界的预演比没有预演更危险。易用性上宁可当场报错也不产出问错对象的预演：传入未解析的模型别名（而非 provider key）直接抛 ValueError 并提示先用 resolve_model() 解析，因为「把封禁节点报成可派发」正是这种误用最可能的静默后果。同批修复一处**测试隔离缺陷**：`server.py` 在 **import 时**执行 `dotenv.load_dotenv()`，而各测试套件的「清空 GATEWAY_* 前置」写在 import 之前——于是真实 `.env` 里的一行 `GATEWAY_QUARANTINE=\"deepseek:...\"` 会在前置之后重新灌回进程，击穿整个隔离（实测后果：新增 .env 声明封禁后 test_quarantine_hardstop.py 首个用例立刻变红，而代码本身完全正确）。现以既有约定 TESTING=1 为闸门，测试进程绝不加载部署配置。",
+      "expected_impact": "把「封禁声明到底生效了没有」从一次**需要手写脚本的实测**降级为一次**幂等只读查询**（`curl /v1/admin/dispatch-audit?model=deepseek-chat`），使运维在每次改租约/改环境变量/重启后都能低成本确认零触碰，从而让「deepseek 已被封、不得加重其余四家风控」这条硬约束**可持续地被验证**，而不是依赖一次性的人工检查。预演与派发路径的零漂移由测试**锁死**（预演说改派到 X，真实 execute_chat 就必须派发到 X；预演说 err_type，真实抛出的 err_type 就必须一致），否则预演会退化为「更精致的谎报」；零上游调用由构造性证明保证（端点路径下把 Provider 工厂换成会抛错的实现，预演仍必须成功）。短冷却**不得**被报成阻断，保住 OPT-021 的最后一搏语义。测试隔离修复消除了「本机 .env 决定测试结果」这一本项目记录过的最难排查的顺序相关失败类型，使新增的部署配置不再污染任何既有套件。"
     }
   ],
   "system_health": "good"

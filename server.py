@@ -131,7 +131,16 @@ from session_store import (
 )
 from healing import HealthMonitor, HealingEngine, TaskDispatcher, TaskEvaluator, find_agent_cli
 
-dotenv.load_dotenv()
+# [OPT-032] 测试进程绝不能被部署环境的 .env 配置。
+# `load_dotenv()` 在 **import 时**执行，而各测试套件的「清空 GATEWAY_* 前置」写在 import
+# 之前——于是 .env 里的一行真实配置（例如 `GATEWAY_QUARANTINE="deepseek:21d"`）会在前置
+# 之后重新灌回进程，击穿整个隔离。实测后果：新增 .env 声明深度封禁后，
+# `tests/test_quarantine_hardstop.py` 的第一个用例立刻变红（`is_quarantined("deepseek")`
+# 期望 False 却为 True），而代码本身完全正确——这是本项目记录过的「本机环境决定测试结果」
+# 那一类最难排查的顺序相关失败。`TESTING=1` 是所有会 import server 的套件的既有约定，
+# 因此以它为闸门：零新增约定，且语义正确（测试运行时不存在「部署配置」这一概念）。
+if os.getenv("TESTING") != "1":
+    dotenv.load_dotenv()
 
 HOST = os.getenv("HOST", "127.0.0.1")
 PORT = int(os.getenv("PORT", "8000"))
@@ -1388,6 +1397,39 @@ async def get_risk_correlation_report():
     后者只能通过整体降速与更换客户端身份特征应对。
     """
     return JSONResponse(risk_correlation.evaluate())
+
+
+# [OPT-032] 零上游派发预演：把「此刻这条请求会被谁承接、谁被排除、被哪一道闸门排除」
+# 变成一次可随时执行的查询。它存在的理由是运维动作之后的确认成本——改完租约/环境变量
+# 或重启后，「现在到底还会不会派发到被封禁的那个节点」本该一问即知，而不是靠发一次
+# 真实请求去试（那正是本项目一直在消除的「用一次上游触碰换一个答案」）。
+# 只读、零上游调用：不实例化任何 Provider，只向派发路径同一组闸门提问。
+@app.get("/v1/admin/dispatch-audit")
+@app.get("/admin/dispatch-audit")
+async def dispatch_audit(model: Optional[str] = None):
+    """派发预演：回答该模型此刻的派发决定（零上游调用）。
+
+    `?model=` 可传模型别名（如 `deepseek-chat` / `claude-3-7-sonnet` / `gpt-4o`），
+    缺省用 `CLAUDE_BACKEND`（默认 qwen）。逐节点给出 `blocked_by`（credential_outage /
+    quarantine / long_avoidance / disabled）与剩余时长，并预测是否会改派或快速失败。
+
+    边界：只预演**闸门**决定，不含负载均衡分流与会话亲和固定，故字段以 `predicted_`
+    命名；最终承接节点可能与之不同。
+    """
+    target = (model or os.getenv("CLAUDE_BACKEND", "qwen")).strip()
+    provider_key, wire_model = resolve_model(target)
+    if not provider_key:
+        return JSONResponse(
+            {"error": {"type": "invalid_request_error", "message": f"无法解析模型 {target!r}"}},
+            status_code=400,
+        )
+    try:
+        report = failover_router.audit_dispatch(provider_key, wire_model)
+    except ValueError as exc:
+        return JSONResponse(
+            {"error": {"type": "invalid_request_error", "message": str(exc)}}, status_code=400
+        )
+    return JSONResponse({"generated_at": round(time.time(), 3), "model": target, **report})
 
 # [OPT-025] 整环凭证失效检测：查询 / 手动解除。
 # 与「冷却」(单节点、自动) 和「封禁租约」(单节点、运维声明) 不同，本状态是**整环**的
