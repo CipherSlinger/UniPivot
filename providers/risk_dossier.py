@@ -244,7 +244,10 @@ class RiskDossier:
         except Exception:  # noqa: BLE001
             remaining = 0.0
         if remaining <= 0.0:
-            return {"active": False, "remaining_hours": 0.0, "until": None, "reason": ""}
+            return {
+                "active": False, "remaining_hours": 0.0, "until": None,
+                "reason": "", "source": "",
+            }
         active = self.quarantine.list_active()
         info = active.get(provider_key, {})
         return {
@@ -253,6 +256,10 @@ class RiskDossier:
             "remaining_hours": round(remaining / 3600.0, 2),
             "until": info.get("until"),
             "reason": info.get("reason", ""),
+            # [OPT-027] 租约来源："operator"（人类声明，重登亦无效，只能等平台解除）
+            # 或 "auto"（网关由「新凭证仍被拒」推断而来，出现更新的凭证即自动解除）。
+            # 二者对运维的动作要求不同，档案必须能区分，否则会误导。
+            "source": info.get("source", "operator"),
         }
 
     def _cooldown_state(self, provider_key: str) -> float:

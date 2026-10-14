@@ -290,8 +290,9 @@ def test_release_caps_to_24h_freeze_and_unblocks_refresh_gate():
         assert tracker._cooldown_severity.get("deepseek") is None
         # 释放即进入恢复观察期：解封瞬间的洪峰同样适用于「凭证刚续期」
         assert tracker.is_in_probation("deepseek") is True
-        # 指纹记录随之清除（节点已恢复，无需再判定续期）
-        assert get_credential_renewal().has_record("deepseek") is False
+        # 指纹记录**必须保留**：释放只是「假设凭证已修好」，下一次失败的比对基准
+        # 正是它（否则 OPT-027 无法判定「新凭证仍被拒」）。
+        assert get_credential_renewal().has_record("deepseek") is True
     finally:
         _reset_all(tracker)
     print("test_release_caps_to_24h_freeze_and_unblocks_refresh_gate: PASSED")

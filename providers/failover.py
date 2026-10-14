@@ -338,6 +338,19 @@ class CooldownTracker:
         # [OPT-026] provider -> 当前冷却的成因严重度（auth/ratelimit/waf），
         # 随冷却一并持久化：只有确认冷却由「认证失效」造成，才允许被续期复位。
         self._cooldown_severity: Dict[str, str] = {}
+        # [OPT-027] 「新凭证仍被拒」证据：provider -> 自凭证更新以来，拿着**已更新**的
+        # 凭证仍被 401 拒绝的连续次数。凭证换过仍被拒 => 问题不在凭证上（账号级封禁），
+        # 继续按「凭证过期」处置只会一次次重新触碰被封的账号。
+        self._fresh_credential_rejected: Dict[str, int] = {}
+        # [OPT-027] provider -> 自动推断租约生效时所用的凭证指纹。用于判定「自动租约的
+        # 推断依据是否已失效」：若之后又出现更新的凭证，说明当时那次「新凭证仍被拒」
+        # 只针对旧凭证，自动租约必须可被自动解除并重新验证。
+        self._auto_lease_fingerprint: Dict[str, str] = {}
+        self._ban_stats: Dict[str, Any] = {
+            "rejections_after_renewal": 0,
+            "auto_leases_applied": 0,
+            "auto_leases_lifted": 0,
+        }
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
         self._episode_ends: Dict[str, float] = {}
@@ -381,6 +394,19 @@ class CooldownTracker:
             for pk, sev in severity_map.items():
                 if isinstance(sev, str) and sev:
                     self._cooldown_severity[str(pk)] = sev
+        # [OPT-027] 恢复「新凭证仍被拒」证据与自动租约指纹。二者都必须跨界存活：
+        # 一次重启若能抹掉「我们已经试过新凭证」这一事实，就等于给了被封账号一个
+        # 重新被反复触碰的入口。
+        rejected_map = state.get("fresh_credential_rejected") or {}
+        if isinstance(rejected_map, dict):
+            for pk, n in rejected_map.items():
+                if isinstance(n, int) and n > 0:
+                    self._fresh_credential_rejected[str(pk)] = n
+        auto_fp_map = state.get("auto_lease_fingerprint") or {}
+        if isinstance(auto_fp_map, dict):
+            for pk, fp in auto_fp_map.items():
+                if isinstance(fp, str) and fp:
+                    self._auto_lease_fingerprint[str(pk)] = fp
         # [OPT-022] 恢复 episode 结束时间：据此可在解封瞬间重新启用观察期，
         # 使「避让期间重启」不会绕过惊群保护。仅保留观察期窗口内仍有意义的记录。
         episode_ends = state.get("episode_ends") or {}
@@ -409,6 +435,10 @@ class CooldownTracker:
                     # [OPT-026] 冷却成因同样必须持久化：否则重启后无法判断
                     # 「这次冷却是否由认证失效造成」，复位便失去依据（fail-closed）。
                     "cooldown_severity": {k: v for k, v in self._cooldown_severity.items()},
+                    # [OPT-027] 「新凭证仍被拒」的证据与自动租约指纹必须跨界存活：
+                    # 重启若能抹掉它，账号就会被重新反复触碰。
+                    "fresh_credential_rejected": {k: v for k, v in self._fresh_credential_rejected.items()},
+                    "auto_lease_fingerprint": {k: v for k, v in self._auto_lease_fingerprint.items()},
                 }
             )
         except Exception:  # noqa: BLE001
@@ -681,10 +711,15 @@ class CooldownTracker:
                     pass
                 # [OPT-026] 留下**此刻**的凭证指纹：日后指纹变化即说明凭证已续期，
                 # 由 2 的幂次升级来的 24h 冻结便失去了惩罚对象，应被复位。
+                # [OPT-027] 该调用同时回答一个关键问题：本次失败是否发生在一枚
+                # **已更新过**的凭证上。凭证已经换过了仍被 401 拒绝，就排除了
+                # 「凭证只是过期」这一唯一无害解释——问题不在凭证上。
+                renewed_at_failure = False
                 try:
-                    self.renewal.note_auth_failure(provider_key)
+                    renewed_at_failure = bool(self.renewal.note_auth_failure(provider_key))
                 except Exception:  # noqa: BLE001
-                    pass
+                    renewed_at_failure = False
+                self._note_renewal_rejection(provider_key, renewed_at_failure)
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
@@ -733,7 +768,165 @@ class CooldownTracker:
             self._failure_counts[provider_key] = 0
             self._cooldowns.pop(provider_key, None)
             self._cooldown_severity.pop(provider_key, None)
+            # [OPT-027] 节点已用当前凭证成功 -> 「新凭证仍被拒」的证据被证伪，清除。
+            self._fresh_credential_rejected.pop(provider_key, None)
+            self._auto_lease_fingerprint.pop(provider_key, None)
             self._persist_state()
+
+    # -------------------------------------------------------- [OPT-027] 账号级封禁推断
+
+    def is_ban_inference_disabled(self) -> bool:
+        """[OPT-027] 是否关闭「新凭证仍被拒 -> 账号级封禁」推断。
+
+        与租约/台账同约定关闭：本机制的唯一产物是自动租约，若租约被关闭，
+        推断出结论也无处安放，继续计数只会制造无意义的日志。
+        """
+        if os.getenv("GATEWAY_DISABLE_BAN_INFERENCE", "").strip().lower() in ("1", "true", "yes"):
+            return True
+        for name in ("GATEWAY_DISABLE_QUARANTINE", "GATEWAY_DISABLE_RISK_LEDGER"):
+            if os.getenv(name, "").strip().lower() in ("1", "true", "yes"):
+                return True
+        return False
+
+    def _ban_inference_min_failures(self) -> int:
+        try:
+            return max(1, int(os.getenv("GATEWAY_BAN_INFERENCE_MIN_FAILURES", "2")))
+        except ValueError:
+            return 2
+
+    def _auto_quarantine_seconds(self) -> float:
+        try:
+            return max(60.0, float(os.getenv("GATEWAY_AUTO_QUARANTINE_DURATION", "259200")))
+        except ValueError:
+            return 259200.0
+
+    def _note_renewal_rejection(self, provider_key: str, renewed_at_failure: bool) -> None:
+        """[OPT-027] 累加「新凭证仍被拒」证据，达标即推断账号级封禁。
+
+        为什么这条证据是决定性的：401 只有两种解释——凭证过期，或账号级封禁。
+        凭证一旦（已证明地）更新过仍被 401 拒绝，第一种解释就被排除，第二种成立。
+        而两者的正确处置完全相反：前者要重登（`login.py`），后者重登彻底无效——
+        封禁绑定的是账号而不是令牌，重登只是又一次触碰被封账号。
+        因此这里不再等待人工判断，直接施加**自动租约**停止一切触碰。
+        """
+        if self.is_ban_inference_disabled():
+            return
+        if renewed_at_failure:
+            # 出现了一枚**更新**的凭证并被拒：此前针对旧凭证积累的证据就此作废，
+            # 新凭证理应获得属于自己的机会，因此重置为 1 而非累加。
+            self._fresh_credential_rejected[provider_key] = 1
+            self._ban_stats["rejections_after_renewal"] += 1
+        elif provider_key in self._fresh_credential_rejected:
+            # 已处于「新凭证被拒」状态：本次失败发生在同一枚已更新的凭证上，
+            # 是同一份证据的延续，计数必须继续累加而不是归零。
+            self._fresh_credential_rejected[provider_key] += 1
+        else:
+            # 普通凭证过期：不进入封禁推断路径
+            return
+        self._maybe_apply_ban_lease(provider_key)
+
+    def _maybe_apply_ban_lease(self, provider_key: str) -> bool:
+        """[OPT-027] 证据达阈值即施加**自动**租约（仅当当前没有任何租约时）。"""
+        count = self._fresh_credential_rejected.get(provider_key, 0)
+        if count < self._ban_inference_min_failures():
+            return False
+        try:
+            if self.quarantine.source(provider_key):
+                # 已持有租约（自动或运维）：封禁已被避让，无需重复施加。
+                # 运维租约的语义更高，绝不被自动标记覆盖或改写。
+                return False
+        except Exception:  # noqa: BLE001 - 查询失败按「已有租约」处理（保守）
+            return False
+        try:
+            current = self.renewal.current_fingerprint(provider_key)
+        except Exception:  # noqa: BLE001
+            current = None
+        duration = self._auto_quarantine_seconds()
+        reason = (
+            f"auto:ban-inferred 新凭证仍被拒 {count} 次 -> 账号级封禁推断；"
+            "重登已被证伪（封禁绑定账号而非令牌），请勿重试。"
+            "可用 DELETE /v1/admin/quarantine 解除，或 GATEWAY_DISABLE_BAN_INFERENCE=1 关闭推断"
+        )
+        try:
+            self.quarantine.set_lease(
+                provider_key, duration_seconds=duration, reason=reason, source="auto"
+            )
+        except Exception:  # noqa: BLE001
+            return False
+        if current:
+            self._auto_lease_fingerprint[provider_key] = current
+        self._ban_stats["auto_leases_applied"] += 1
+        logger.error(
+            "[封禁推断] 节点 [%s] 在**已更新的凭证**上仍连续 %d 次 401 —— 凭证过期这一解释已被排除，"
+            "判定为账号级封禁。已施加 %.1f 小时自动租约，停止一切上游触碰（对该类封禁重登无效）。",
+            provider_key, count, duration / 3600.0,
+        )
+        return True
+
+    def _lift_stale_auto_lease(self, provider_key: str) -> bool:
+        """[OPT-027] 若该节点的**自动**租约所依据的凭证已被再次更新，则解除它。
+
+        自动租约的正当性完全来自「我们已经试过一次新凭证且仍被拒」。若之后又出现
+        更新的凭证（运维执行了第二次重登），这条证据只针对**旧**凭证，自动租约便失去
+        依据——必须解除并让新凭证重新接受验证，否则一次错误的推断会永久冻结一个
+        其实已经修好的节点。运维租约（人类声明）永不走这条路径。
+        """
+        try:
+            if self.quarantine.source(provider_key) != "auto":
+                # 无租约或已被运维接管：自动指纹记录已无意义
+                self._auto_lease_fingerprint.pop(provider_key, None)
+                self._fresh_credential_rejected.pop(provider_key, None)
+                return False
+            expected = self._auto_lease_fingerprint.get(provider_key)
+            try:
+                current = self.renewal.current_fingerprint(provider_key)
+            except Exception:  # noqa: BLE001
+                current = None
+            if not expected or current is None or current == expected:
+                return False  # 没有「更新的凭证」证据 -> 保守：维持租约
+            if not self.quarantine.release_auto_lease(provider_key, time.time()):
+                return False
+        except Exception:  # noqa: BLE001 - 任何异常都不改变既有状态（保守）
+            return False
+        self._auto_lease_fingerprint.pop(provider_key, None)
+        self._fresh_credential_rejected.pop(provider_key, None)
+        self._ban_stats["auto_leases_lifted"] += 1
+        logger.warning(
+            "[封禁推断] 节点 [%s] 出现更新的凭证，自动租约的推断依据失效，已解除并重新验证",
+            provider_key,
+        )
+        # 解除自动租约同样是「解封」：进入恢复观察期，避免需求瞬间涌出
+        self._enter_probation(provider_key, time.time())
+        return True
+
+    def ban_inference_report(self, now: Optional[float] = None) -> Dict[str, Any]:
+        """[OPT-027] 「新凭证仍被拒」证据与自动租约的诊断视图。"""
+        now = time.time() if now is None else now
+        auto_leases: Dict[str, Any] = {}
+        for pk, fp in self._auto_lease_fingerprint.items():
+            try:
+                source = self.quarantine.source(pk)
+                remaining = self.quarantine.remaining(pk, now)
+            except Exception:  # noqa: BLE001
+                source, remaining = "", 0.0
+            auto_leases[pk] = {
+                "lease_source": source,
+                "remaining_hours": round(remaining / 3600.0, 2),
+                "fingerprint_at_inference": fp[:12],
+            }
+        return {
+            "enabled": not self.is_ban_inference_disabled(),
+            "min_failures": self._ban_inference_min_failures(),
+            "auto_lease_hours": round(self._auto_quarantine_seconds() / 3600.0, 2),
+            "rejections_after_renewal": {k: v for k, v in self._fresh_credential_rejected.items()},
+            "auto_leases": auto_leases,
+            "stats": dict(self._ban_stats),
+            "hint": (
+                "这些节点在**已更新的凭证**上仍被 401 拒绝：凭证过期已被排除，判定为账号级封禁。"
+                "重登对该类封禁无效（封禁绑定账号而非令牌），网关已自动停止触碰；"
+                "若已确认平台解除封禁，可用 DELETE /v1/admin/quarantine 提前解除自动租约。"
+            ) if auto_leases else "",
+        }
 
     # -------------------------------------------------------- [OPT-026] 认证级避让复位
 
@@ -774,10 +967,16 @@ class CooldownTracker:
         """
         now = time.time()
         released: List[str] = []
+        lifted: List[str] = []
         for raw in providers or []:
             provider_key = (raw or "").strip().lower()
             if not provider_key:
                 continue
+            # 0. [OPT-027] 先处理**自动**租约：若其推断依据（当初那枚凭证）已被再次
+            #    更新，租约理由不再成立，必须先行解除，新凭证才能接受验证。
+            #    运维租约不在此路径内（`_lift_stale_auto_lease` 自行判定来源）。
+            if self._lift_stale_auto_lease(provider_key):
+                lifted.append(provider_key)
             # 1. 租约是账号级封禁的表达，与「凭证过期」无关，绝不因续期释放
             try:
                 if self.quarantine.remaining(provider_key, now) > 0.0:
@@ -798,10 +997,10 @@ class CooldownTracker:
             self._cooldowns.pop(provider_key, None)
             self._cooldown_severity.pop(provider_key, None)
             self._failure_counts[provider_key] = 0
-            try:
-                self.renewal.clear_provider(provider_key)
-            except Exception:  # noqa: BLE001
-                pass
+            # 注意：**不**清除凭证指纹记录。释放只是「假设凭证已修好」，而不是
+            # 「确认修好」——指纹记录必须保留，否则下一次失败的比对基准被抹掉，
+            # OPT-027 赖以判定的「本次失败是否发生在一枚更新的凭证上」将永远为假，
+            # 封禁推断会彻底失效（这正是修复过程中被测试抓到的一处逻辑反转）。
             try:
                 self.credential_watch.note_success(provider_key)
             except Exception:  # noqa: BLE001
@@ -813,7 +1012,7 @@ class CooldownTracker:
                 "[凭证续期] 节点 [%s] 认证级避让已复位 (原因: %s)：请以串行探路方式重新进入",
                 provider_key, reason,
             )
-        if released:
+        if released or lifted:
             self._persist_state()
         return released
 
@@ -908,6 +1107,14 @@ class CooldownTracker:
         self._last_call_time.clear()
         # [OPT-026] 冷却成因记录一并重置（否则会与后续用例的冷却串扰）
         self._cooldown_severity.clear()
+        # [OPT-027] 封禁推断证据一并重置，确保用例之间零串扰
+        self._fresh_credential_rejected.clear()
+        self._auto_lease_fingerprint.clear()
+        self._ban_stats = {
+            "rejections_after_renewal": 0,
+            "auto_leases_applied": 0,
+            "auto_leases_lifted": 0,
+        }
         # [OPT-022] 观察期状态一并重置，确保用例之间零串扰
         self._episode_ends.clear()
         self._probation_successes.clear()

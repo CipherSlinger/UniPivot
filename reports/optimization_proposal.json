@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-14 12:31:56",
+  "generated_at": "2026-10-14 12:50:45",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -306,6 +306,16 @@
       "priority": "P0",
       "description": "OPT-025 解决了风暴**期间**的重复派发，却没有解决风暴**之后**的冻结，这是同一条因果链的下半段。record_failure 对认证失效按 GATEWAY_AUTH_COOLDOWN_BASE(1800s) × 2ⁿ 长效升级、封顶 GATEWAY_AUTH_COOLDOWN_MAX(86400s)；真实台账里五个节点的认证失败次数是 54/54/54/87/60——**全部撞到 24 小时上限**，且该状态随台账持久化、跨重启恢复。于是风暴结束后五个节点各自被冻结整整一天。这个惩罚本身并非错误：它惩罚的是「拿着**同一个失效凭证**反复打」，而每次重试确实都是一次「自动化凭证尝试」。但凭证一旦续期，惩罚对象即消失——继续冻结惩罚的不再是坏行为而是**已经修好的系统**：get_remaining_cooldown() 仍返回 24h，导致健康探针跳过、自愈大脑选举排除、路由降级；最直接的问题是 server.py:_deferred_refresh_after_cooldown ——**令牌静默刷新本身也被冷却门控挡住、最多推迟 24 小时**，即「凭证失效」制造的状态正好锁死了唯一能自动修复它的机制。反向验证：OPT-023 档案对 auth 类的结论是 recoverable_by_relogin = True，系统一面告诉运维「重登可恢复」，一面在重登之后继续避让 24 小时，结论与行为自相矛盾。本次新增 providers/credential_renewal.py：在记录认证失败的那一刻对凭证来源（session/<provider>.json）取**内容指纹**（sha256(token|cookie|captured_at|user_id|device_id)，不可解析时退化为 meta:mtime_ns:size），指纹随冷却一并持久化，因此「先重登、再重启」同样可识别（Session.save() 以 os.replace 原子落盘且每次捕获刷新 captured_at，任何真实重登必然改变指纹）。复位动作由 CooldownTracker.release_auth_avoidance() 执行，与只读的判定路径分离。复位严格**成因限定且 fail-closed**：仅最近一次失败严重度为 auth 时才复位（成因随冷却持久化；记录缺失时退化为**只读**查询风控台账该节点最近一次拦截的成因，仍保持成因限定），持有运维封禁租约的节点永不释放（账号级封禁重登无效），waf/频控成因绝不被代为释放，无记录/凭证不可读/指纹相同一律判定「未续期」；复位后经 OPT-022 恢复观察期重新进入，因为被压制数日的需求会在凭证刚更新时集中释放。",
       "expected_impact": "打通修复闭环并与 OPT-023 的运维结论取得一致：复位使 get_remaining_cooldown() 归零，从而解除 OPT-013 令牌静默刷新的冷却门控（唯一自动修复路径），并解除探针/自愈选举/路由层的连带避让——「重登即恢复」不再被网关自己制造的 24 小时冻结抵消。启动时自动扫描（await cooldown_tracker.release_renewed_credentials()）以匹配「重登 + 重启」这一最常见运维流程。遥测：/v1/diagnostics 暴露 credential_renewal，GET /v1/admin/credential-renewal 查看指纹记录与判定，POST /v1/admin/credential-renewal/scan 触发复位（请求体 providers 供环境变量凭证的部署显式指定），DELETE /v1/admin/credential-outage 在清除全环失效态时连带复位认证级避让。GATEWAY_DISABLE_CREDENTIAL_RENEWAL=1 可关闭，GATEWAY_DISABLE_RISK_LEDGER=1 一并关闭（与封禁租约 / 凭证失效检测同约定，保证纯内存冷却语义的测试套件不受影响）。"
+    },
+    {
+      "id": "OPT-027",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "凭证可用性与风控风暴治理",
+      "title": "账号级封禁推断与自解除自动租约 (Account-Level Ban Inference & Self-Clearing Auto Lease)",
+      "priority": "P0",
+      "description": "OPT-026 修复了「凭证过期造成的 24h 冻结该被复位」，但留下了一个此前无人注意的循环：复位之后如果节点**依然** 401，网关会重新派发、再吃 401、再按 2 的幂次升级回 24h，下一次扫描又复位——循环往复，且每一轮都触碰一次账号。这与本项目「被封节点必须零触碰」的约束直接冲突。根因是 **401 有两种成因而处置完全相反**：(1) 凭证过期 → 正确处置是重登（login.py），OPT-026 已复位；(2) 账号级封禁 → 重登**彻底无效**（封禁绑定账号而非令牌），正确处置是零触碰等待平台解除。把 (2) 当成 (1) 处理，就是用重试循环不断重新触发封禁——这正是运维问题「现在受到风控的 LLM 能不能通过重新登录恢复使用」的答案所在：deepseek 属于 (2)，重登无效。判别式网关本就拥有：**「凭证已被证明地更新过，而节点仍被拒绝」**排除了成因 (1)，只剩成因 (2)。本次扩展 providers/credential_renewal.py 与 providers/failover.py：CredentialRenewalTracker.note_auth_failure() 额外返回「本次失败所依据的凭证是否与上次记录的不同」，且判定发生在**覆盖旧记录之前**（否则证据每次调用自毁）；CooldownTracker 以 _fresh_credential_rejected[provider] 计数，每当出现更新的凭证即**重置为 1 而非累加**（每枚续期过的凭证都获得属于自己的机会，不把上一枚的失败累加到从未被真正试过的新凭证头上），累计达 GATEWAY_BAN_INFERENCE_MIN_FAILURES（默认 2）即施加自动租约。租约在 QuarantineStore 中标记 source=\"auto\" 并随租约持久化（目录 0o700 / 文件 0o600），重启无法把「自动」洗成「不可解除」；release_auto_lease() 在结构上**不可能**解除运维租约，优先级单向（运维声明永远覆盖自动标记，反之绝不；来源缺失一律按运维租约保守处理），时长 GATEWAY_AUTO_QUARANTINE_DURATION（默认 259200s = 72h）短于人工租约——推断得到的结论不应拥有与人类声明同等的权威。自动租约**必然自解除**：其全部正当性来自「我们试过一枚新凭证且仍被拒」，出现更新的凭证即证据失效，租约解除、证据清零，节点经 OPT-022 恢复观察期重新验证——否则一次错误推断会把已修好的账号冻结 72 小时。派发侧复用 OPT-021 硬阻断，被封节点零上游调用（含故障转移候选）。OPT-023 档案新增 quarantine.source 字段使「推断封禁」与「运维声明封禁」对运维可区分。",
+      "expected_impact": "堵住 OPT-026 复位机制与其后 401 之间的循环：账号级封禁不再被当作凭证过期反复重试（每轮都触碰一次被封账号、持续加重封禁），而是在证据成立后自动转入零触碰的长时避让，且**无需人工介入**即可完成判定——这是对运维问题「受风控的 LLM 能否通过重登恢复」的机器化回答（凭证过期→重登有效并自动复位；账号级封禁→重登无效，网关自行推断并退避）。误判可自愈：一次错误推断会在下一枚新凭证出现时自动解除并重新验证，绝不永久冻结好节点。遥测：/v1/diagnostics 暴露 ban_inference（含 rejections_after_renewal 与 auto_leases），GET /v1/admin/ban-inference 查看报告，DELETE /v1/admin/ban-inference 供运维确认平台解封后提前解除自动租约（对运维租约返回空集，绝不误伤）。GATEWAY_DISABLE_BAN_INFERENCE=1 可关闭，并与租约/台账开关联动关闭；证据与自动租约指纹跨重启存活，重启不构成绕过入口。"
     }
   ],
   "system_health": "good"

@@ -36,6 +36,11 @@
    - 指纹相同 → 不复位。
    任何不确定都选择「继续避让」，宁可多等，不可误放。
 
+[OPT-027] 本模块还提供「新凭证仍被拒」这一**关键判别证据**：
+`note_auth_failure()` 额外返回「本次失败是否发生在一枚**已更新过**的凭证上」。
+这排除了「凭证只是过期」这一唯一解释——凭证已经换过了，仍被上游 401 拒绝，
+那么问题不在凭证上。该证据由 `CooldownTracker` 用于推断账号级封禁（见 failover.py）。
+
 开关：`GATEWAY_DISABLE_CREDENTIAL_RENEWAL=1` 关闭；`GATEWAY_DISABLE_RISK_LEDGER=1`
 一并关闭（与封禁租约 / 凭证失效检测同约定，保证纯内存冷却语义的测试套件不受影响）。
 """
@@ -131,6 +136,9 @@ class CredentialRenewalTracker:
             "renewals_recorded": 0,
             "renewals_detected": 0,
             "records_cleared": 0,
+            # [OPT-027] 发生在「已更新过的凭证」上的认证失败次数——即
+            # 「新凭证仍被拒」证据的出现次数（账号级封禁的判决依据）。
+            "rejections_after_renewal": 0,
         }
         self._load()
 
@@ -188,26 +196,42 @@ class CredentialRenewalTracker:
 
     # ------------------------------------------------------------ 记录
 
-    def note_auth_failure(self, provider_key: str, now: Optional[float] = None) -> None:
+    def note_auth_failure(self, provider_key: str, now: Optional[float] = None) -> bool:
         """记录一次认证失败：**此刻**的凭证指纹即为「失效凭证」的指纹。
 
         之所以在失败时刻取指纹而非在复位时反推：只有这样才能回答
         「与我失败时相比，凭证是否已经被换掉了」。
+
+        [OPT-027] 返回一个额外事实：**本次失败是否发生在一枚已经更新过的凭证上**
+        （即与上次记录的指纹不同）。这是「新凭证仍被拒」这一关键证据的唯一来源：
+        它排除了「凭证只是过期」这一解释——凭证已经换过了，仍被上游以 401 拒绝，
+        那么问题就不在凭证上。判定必须在**覆盖旧记录之前**完成，否则证据每次都自毁。
         """
         if self.is_disabled():
-            return
+            return False
         pk = (provider_key or "").strip().lower()
         if not pk:
-            return
+            return False
         fp = credential_fingerprint(pk)
         if fp is None:
             # 凭证文件不可读：不记录，从而永远无法据此复位（保守）
-            return
+            return False
+        renewed_since_last = False
         now = time.time() if now is None else now
         with self._lock:
+            previous = self._records.get(pk)
+            if previous is not None and previous.get("fingerprint") != fp:
+                renewed_since_last = True
             self._records[pk] = {"fingerprint": fp, "at": now}
             self._stats["renewals_recorded"] += 1
+            if renewed_since_last:
+                self._stats["rejections_after_renewal"] += 1
             self._save_locked()
+        return renewed_since_last
+
+    def current_fingerprint(self, provider_key: str) -> Optional[str]:
+        """返回该节点凭证的当前指纹（供调用方比对历史指纹，只读）。"""
+        return credential_fingerprint(provider_key)
 
     def clear_provider(self, provider_key: str) -> None:
         """清除某节点的指纹记录（节点已恢复可用，无需再判定续期）。"""
@@ -282,6 +306,7 @@ class CredentialRenewalTracker:
                 "renewals_recorded": 0,
                 "renewals_detected": 0,
                 "records_cleared": 0,
+                "rejections_after_renewal": 0,
             }
 
 

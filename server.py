@@ -1255,6 +1255,8 @@ async def get_diagnostics():
         "credential_outage": credential_watch.get_diagnostics(),
         # [OPT-026] 凭证续期检测（认证级避让的复位依据）
         "credential_renewal": credential_renewal.get_diagnostics(),
+        # [OPT-027] 账号级封禁推断（新凭证仍被拒 -> 自动租约停触）
+        "ban_inference": failover_router.cooldown_tracker.ban_inference_report(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }
@@ -1422,6 +1424,46 @@ async def clear_credential_outage(reason: Optional[str] = None):
 @app.get("/admin/credential-renewal")
 async def get_credential_renewal_report():
     return JSONResponse(get_credential_renewal().get_diagnostics())
+
+
+@app.get("/v1/admin/ban-inference")
+@app.get("/admin/ban-inference")
+async def get_ban_inference():
+    """[OPT-027] 查看「新凭证仍被拒」证据与自动推断租约。"""
+    return JSONResponse(failover_router.cooldown_tracker.ban_inference_report())
+
+
+@app.delete("/v1/admin/ban-inference")
+@app.delete("/admin/ban-inference")
+async def clear_ban_inference(provider: Optional[str] = None):
+    """[OPT-027] 解除自动推断租约并清除证据。
+
+    仅解除**自动**租约：运维租约必须走 DELETE /v1/admin/quarantine，本接口
+    在结构上不可能解除人类声明。`provider` 省略时处理全部自动租约。
+    """
+    tracker = failover_router.cooldown_tracker
+    before = tracker.ban_inference_report()
+    targets = [provider] if provider else list(before["auto_leases"].keys())
+    cleared: List[str] = []
+    for pk in targets:
+        key = (pk or "").strip().lower()
+        if not key:
+            continue
+        try:
+            if tracker.quarantine.release_auto_lease(key, time.time()):
+                cleared.append(key)
+        except Exception:  # noqa: BLE001
+            continue
+        tracker._auto_lease_fingerprint.pop(key, None)
+        tracker._fresh_credential_rejected.pop(key, None)
+    if cleared:
+        tracker._persist_state()
+    return JSONResponse({
+        "status": "ok",
+        "cleared": cleared,
+        "candidates": targets,
+        "ban_inference": tracker.ban_inference_report(),
+    })
 
 
 @app.post("/v1/admin/credential-renewal/scan")

@@ -20,6 +20,12 @@
 
 设计约束：租约只会**延长**避让窗口，绝不缩短既有冷却（读取端取 max），
 因此不可能因误操作而提前放行一个正在封禁的节点。
+
+[OPT-027] 租约来源（source）：运维声明的租约（默认）与**推断得来的**自动租约
+（`source="auto"`，见 `providers/failover.py` 的「新凭证仍被拒 -> 账号级封禁」推断）
+在语义上必须可区分——自动租约的正当性完全来自「我们已经试过一次新凭证且仍被拒」，
+因此一旦出现**更新的**凭证，这条证据即告失效，自动租约必须能被自动解除并重新验证；
+而运维租约是人类声明，永不被自动解除。任何来源不明的租约一律按运维租约处理（保守）。
 """
 
 from __future__ import annotations
@@ -83,6 +89,9 @@ class QuarantineStore:
         self._lock = threading.RLock()
         self._leases: Dict[str, float] = {}
         self._reasons: Dict[str, str] = {}
+        # [OPT-027] provider -> 租约来源（"operator" | "auto"）。缺省/未知一律视为
+        # 运维租约（保守）：只有确知来源为 auto 的租约才允许被自动解除。
+        self._sources: Dict[str, str] = {}
         # [OPT-022] provider -> 最近一次租约解除（显式清除或自然到期）的时间戳。
         # 供 CooldownTracker 在封禁解除后启动「恢复观察期」，避免解封瞬间的并发洪峰
         # 立刻把账号二次打进封禁。仅保留近期记录，避免无界增长。
@@ -125,7 +134,11 @@ class QuarantineStore:
         with self._lock:
             payload = {
                 "leases": {
-                    pk: {"until": round(until, 3), "reason": self._reasons.get(pk, "")}
+                    pk: {
+                        "until": round(until, 3),
+                        "reason": self._reasons.get(pk, ""),
+                        "source": self._sources.get(pk, "operator"),
+                    }
                     for pk, until in self._leases.items()
                 },
                 "releases": {pk: round(ts, 3) for pk, ts in self._releases.items()},
@@ -185,6 +198,9 @@ class QuarantineStore:
                     key = str(pk).lower()
                     self._leases[key] = float(until)
                     self._reasons[key] = str(entry.get("reason", ""))
+                    # 未知来源按运维租约处理（保守：绝不被自动解除）
+                    source = str(entry.get("source", "operator") or "operator").lower()
+                    self._sources[key] = "auto" if source == "auto" else "operator"
                 # [OPT-022] 恢复租约解除时间（供解封后的恢复观察期判定）
                 releases = data.get("releases")
                 if isinstance(releases, dict):
@@ -223,6 +239,7 @@ class QuarantineStore:
                 if until > self._leases.get(provider, 0.0):
                     self._leases[provider] = until
                     self._reasons.setdefault(provider, "env:GATEWAY_QUARANTINE")
+                self._sources[provider] = "operator"
         if applied:
             logger.warning(
                 "[封禁租约] 已应用环境变量租约: %s",
@@ -273,11 +290,16 @@ class QuarantineStore:
         duration_seconds: Optional[float] = None,
         until: Optional[float] = None,
         reason: str = "",
+        source: str = "operator",
     ) -> float:
         """设定/延长某节点的封禁租约，返回绝对到期时间戳。
 
         `until` 优先；否则由 `duration_seconds` 计算。租约只延长不缩短：
         新到期时间早于现有租约时不生效。
+
+        [OPT-027] `source` 区分运维声明（"operator"）与推断得来的自动租约（"auto"）。
+        来源优先级：运维声明**永远**覆盖自动标记（即便未延长到期时间），
+        自动标记绝不覆盖运维声明——否则一次自动推断会让运维的正式声明变成可被自动解除。
         """
         key = (provider or "").strip().lower()
         if not key:
@@ -286,12 +308,19 @@ class QuarantineStore:
             if duration_seconds is None:
                 raise ValueError("必须提供 duration_seconds 或 until")
             until = time.time() + max(0.0, float(duration_seconds))
+        normalized = "auto" if str(source).strip().lower() == "auto" else "operator"
         with self._lock:
             if float(until) > self._leases.get(key, 0.0):
                 self._leases[key] = float(until)
                 if reason:
                     self._reasons[key] = str(reason)[:300]
                 self._stats["set"] += 1
+            # 来源优先级：运维声明永远覆盖自动标记；自动标记只在**尚无运维声明**时生效。
+            # 注意这里必须区分「没有记录」与「记录为 operator」——用默认值 "operator"
+            # 会让自动标记永远写不进去（曾因此让自动租约被误判成运维租约）。
+            existing = self._sources.get(key)
+            if normalized == "operator" or existing in (None, "auto"):
+                self._sources[key] = normalized
             effective = self._leases[key]
         logger.warning(
             "[封禁租约] 节点 %s 进入长期封禁避让，剩余 %.1f 小时 (原因: %s)",
@@ -311,10 +340,12 @@ class QuarantineStore:
                 self._note_release_all(list(self._leases.keys()))
                 self._leases.clear()
                 self._reasons.clear()
+                self._sources.clear()
             else:
                 key = provider.strip().lower()
                 count = 1 if self._leases.pop(key, None) is not None else 0
                 self._reasons.pop(key, None)
+                self._sources.pop(key, None)
                 if count:
                     self._note_release(key)
             self._stats["cleared"] += count
@@ -327,6 +358,42 @@ class QuarantineStore:
         """批量记录解除时刻（须持锁调用）。"""
         for pk in providers:
             self._note_release(pk)
+
+    def source(self, provider: str) -> str:
+        """返回租约来源（无租约时返回空串）：`"operator"` 或 `"auto"`。"""
+        key = (provider or "").strip().lower()
+        if not key:
+            return ""
+        with self._lock:
+            if key not in self._leases:
+                return ""
+            return self._sources.get(key, "operator")
+
+    def release_auto_lease(self, provider: str, now: Optional[float] = None) -> bool:
+        """[OPT-027] 仅当租约来源为 `"auto"` 时解除它，返回是否真的解除。
+
+        这是自动租约唯一的解除入口：运维租约（含来源不明的租约）一律返回 False，
+        因此「自动推断」在结构上不可能解除任何人类声明。
+        """
+        key = (provider or "").strip().lower()
+        if not key:
+            return False
+        with self._lock:
+            if key not in self._leases:
+                return False
+            if self._sources.get(key, "operator") != "auto":
+                return False
+            until = self._leases.pop(key, 0.0)
+            self._reasons.pop(key, None)
+            self._sources.pop(key, None)
+            self._stats["cleared"] += 1
+            # 记录解除时刻，使解封后同样进入恢复观察期（与运维解除一致）
+            self._note_release(key, until)
+        logger.warning(
+            "[封禁租约] 已解除节点 %s 的**自动推断**租约（出现更新的凭证，推断依据失效）", key
+        )
+        self._persist()
+        return True
 
     def remaining(self, provider: str, now: Optional[float] = None) -> float:
         """返回节点剩余租约秒数（无租约或已到期返回 0.0）。"""
@@ -343,6 +410,7 @@ class QuarantineStore:
                 # [OPT-022] 同时记录解除时刻，供解封后的恢复观察期判定。
                 self._leases.pop(key, None)
                 self._reasons.pop(key, None)
+                self._sources.pop(key, None)
                 self._note_release(key, until)
                 self._stats["expired"] += 1
                 return 0.0
@@ -360,6 +428,7 @@ class QuarantineStore:
                     "remaining_hours": round(rem / 3600.0, 2),
                     "until": round(self._leases.get(pk, 0.0), 3),
                     "reason": self._reasons.get(pk, ""),
+                    "source": self._sources.get(pk, "operator"),
                 }
         return result
 
@@ -382,6 +451,7 @@ class QuarantineStore:
             self._leases.clear()
             self._reasons.clear()
             self._releases.clear()
+            self._sources.clear()
             self._stats = {"set": 0, "cleared": 0, "expired": 0, "persist_failures": 0}
             try:
                 self.path.unlink(missing_ok=True)
