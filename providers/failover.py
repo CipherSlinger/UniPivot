@@ -64,6 +64,10 @@ from .risk_ledger import (
 
 logger = logging.getLogger("gateway.failover")
 
+# [OPT-028] 观察期的**证据积累期**下限（秒）：即便 `GATEWAY_PROBATION_WINDOW=0`
+# 也必须保留这么长的记录，否则「零证据仍在门控」的节点永远无法通过后续成功毕业。
+_PROBATION_EVIDENCE_FLOOR = 300.0
+
 
 # ---------------------------------------------------------------- [OPT-014] 风控证据驱动的自适应步调
 
@@ -411,9 +415,11 @@ class CooldownTracker:
         # 使「避让期间重启」不会绕过惊群保护。仅保留观察期窗口内仍有意义的记录。
         episode_ends = state.get("episode_ends") or {}
         if isinstance(episode_ends, dict):
-            window = self._probation_window()
+            # [OPT-028] 保留期限必须覆盖**续期后**的完整视野：否则一次「解封后重启」
+            # 会把仍在门控中的观察期记录整体丢弃，节点立即以全并发回到环内。
+            retention = self._probation_retention()
             for pk, end in episode_ends.items():
-                if isinstance(end, (int, float)) and now < float(end) + window:
+                if isinstance(end, (int, float)) and now < float(end) + retention:
                     self._episode_ends[str(pk)] = float(end)
         if restored_cd:
             logger.warning(
@@ -506,6 +512,45 @@ class CooldownTracker:
         except ValueError:
             return 2.0
 
+    def _probation_max_renewals(self) -> int:
+        """观察期窗口的续期次数上限。
+
+        [OPT-028] 窗口原先是**硬截止**：到点即放开全并发，无论是否拿到过证据。
+        但低流量节点（尤其夜间）在 300 秒里往往连一次握手都没有，于是这个保护
+        在最需要它的场景下静默失效——解封瞬间被压制的需求随后以全并发抵达一个
+        **仍可能处于封禁中**的账号。改为按窗口续期：每耗尽一个窗口即自动续期
+        一次，最多 `GATEWAY_PROBATION_MAX_RENEWALS`（默认 3，即最多门控
+        `窗口 × 4`）次，之后按证据决定是否毕业（见 `is_in_probation`）。
+        `GATEWAY_PROBATION_MAX_RENEWALS=0` 恢复正常。
+        """
+        try:
+            return max(0, int(os.getenv("GATEWAY_PROBATION_MAX_RENEWALS", "3")))
+        except ValueError:
+            return 3
+
+    def _probation_horizon(self, last_release: float, now: float) -> float:
+        """[OPT-028] 返回观察期的**有效截止时刻**，含依时间自动续期。
+
+        纯函数、无副作用、无需持久化：续期次数由「已流逝的窗口数」推导，
+        因此重启、乱序查询都不会改变结论，也不存在读路径写放大的问题。
+        """
+        window = self._probation_window()
+        if window <= 0.0:
+            return last_release
+        elapsed = max(0.0, now - last_release)
+        renewals = min(int(elapsed // window), self._probation_max_renewals())
+        return last_release + window * (1 + renewals)
+
+    def _probation_retention(self) -> float:
+        """观察期记录的保留时长（须覆盖续期后的完整视野，否则重启即抹掉观察期）。
+
+        [OPT-028] 窗口为 0（「不给时间宽限」）时仍须保留一段**证据积累期**：观察期
+        的毕业条件已是证据而非时间，若保留期随窗口一起归零，则零证据仍在门控的节点
+        将永远无法通过后续成功毕业（成功握手连记录都不被接受），门控变成死锁。
+        """
+        window = max(self._probation_window(), _PROBATION_EVIDENCE_FLOOR)
+        return window * (1 + self._probation_max_renewals())
+
     def is_probation_disabled(self) -> bool:
         return os.getenv("GATEWAY_DISABLE_PROBATION", "").strip().lower() in ("1", "true", "yes")
 
@@ -538,8 +583,15 @@ class CooldownTracker:
 
         因此避让一旦解除，节点先进入观察期：串行放行单个「探路」请求（握手阶段
         独占），并以放大的步调间隔发送；累计达到 `GATEWAY_PROBATION_MIN_SUCCESSES`
-        次连续成功（或观察期 `GATEWAY_PROBATION_WINDOW` 秒自然结束）后毕业，恢复
-        常规并发与步调。`GATEWAY_DISABLE_PROBATION=1` 可关闭。
+        次连续成功后方可毕业，恢复常规并发与步调。`GATEWAY_DISABLE_PROBATION=1`
+        可关闭。
+
+        [OPT-028] 毕业条件必须**基于证据**，而不是「时间到了就算毕业」：窗口只
+        作为续期单位（`GATEWAY_PROBATION_MAX_RENEWALS`，默认 3），耗尽续期预算后
+        仍要求至少一次成功握手才放行——零证据的节点（自 episode 结束以来从未被
+        成功验证过，包括从未被触达的情形）保持串行门控。对从未被触达的节点而言
+        继续门控**不产生任何代价**（没有请求到来就无所谓洪峰），而放开则等于把
+        一个完全未经验证的账号直接交给全并发，恰是本观察期存在的理由所反对的。
         """
         if self.is_probation_disabled():
             return False
@@ -553,9 +605,11 @@ class CooldownTracker:
         last_release = self._last_release_ts(provider_key, now)
         if last_release is None:
             return False
-        if now >= last_release + self._probation_window():
-            return False
-        return self._probation_successes.get(provider_key, 0) < self._probation_min_successes()
+        successes = self._probation_successes.get(provider_key, 0)
+        if now >= self._probation_horizon(last_release, now):
+            # 续期预算耗尽 -> 仅凭证据毕业：有正面证据即放行，零证据继续门控。
+            return successes <= 0
+        return successes < self._probation_min_successes()
 
     def probation_lock(self, provider_key: str) -> Optional[asyncio.Lock]:
         """观察期内返回串行闸门（握手阶段独占），否则返回 None。
@@ -595,7 +649,10 @@ class CooldownTracker:
             return
         if provider_key not in self._episode_ends:
             return
-        if now >= self._episode_ends[provider_key] + self._probation_window():
+        # [OPT-028] 成功握手是**证据**，因此在 episode 记录的整个保留期内都应被计入，
+        # 而不能像旧语义那样过了窗口就丢弃：否则「窗口耗尽、零证据、仍在门控」的
+        # 节点永远无法通过后续成功毕业（续期预算耗尽后的门控必须以证据为出口）。
+        if now >= self._episode_ends[provider_key] + self._probation_retention():
             return
         self._probation_successes[provider_key] = self._probation_successes.get(provider_key, 0) + 1
         self._probation_stats["canary_successes"] += 1
@@ -615,17 +672,44 @@ class CooldownTracker:
             if not self.is_in_probation(pk):
                 continue
             last_release = self._last_release_ts(pk, now)
+            release = last_release or now
+            window = self._probation_window()
+            # [OPT-028] 已续期次数与「尚无任何证据」标记：运维需要能区分
+            # 「正在被验证且进展顺利」与「一直没能被验证」这两种观察期。
+            renewals = 0
+            if window > 0.0:
+                renewals = min(
+                    int(max(0.0, now - release) // window), self._probation_max_renewals()
+                )
+            successes = self._probation_successes.get(pk, 0)
             result[pk] = {
-                "successes": self._probation_successes.get(pk, 0),
+                "successes": successes,
                 "required_successes": self._probation_min_successes(),
+                "renewals": renewals,
+                "max_renewals": self._probation_max_renewals(),
+                "awaiting_first_handshake": successes <= 0,
                 "remaining_seconds": round(
-                    max(0.0, (last_release or now) + self._probation_window() - now), 1
+                    max(0.0, self._probation_horizon(release, now) - now), 1
                 ),
             }
         return result
 
     def get_probation_stats(self) -> Dict[str, Any]:
-        return dict(self._probation_stats)
+        stats = dict(self._probation_stats)
+        # [OPT-028] 派生指标（只读）：续期与「零证据仍被门控」的规模，
+        # 使「观察期是否真的在起作用」可被观测，而非只能看到「进入了多少次」。
+        try:
+            states = self.get_probation_states()
+            stats["renewing"] = sum(1 for s in states.values() if s["renewals"] > 0)
+            stats["awaiting_first_handshake"] = sum(
+                1 for s in states.values() if s["awaiting_first_handshake"]
+            )
+            stats["budget_exhausted"] = sum(
+                1 for s in states.values() if s["renewals"] >= s["max_renewals"]
+            )
+        except Exception:  # noqa: BLE001 - 派生指标失败绝不阻断诊断
+            pass
+        return stats
 
     def get_all_cooldowns(self) -> Dict[str, float]:
         """获取所有当前处于冷却状态的节点及剩余冷却时间（秒）"""
