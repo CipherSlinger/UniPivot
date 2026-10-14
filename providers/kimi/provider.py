@@ -28,7 +28,18 @@ from ..base import (
     last_user_content,
     parse_cookie_header,
 )
+from ..device_identity import stable_device_id
 from ..http_client import get_http_client
+
+
+def _new_kimi_device_id() -> str:
+    """Kimi 设备标识的格式：19 位十进制（首位 7）。仅在首次生成时调用一次。"""
+    return str(random.randint(7000000000000000000, 7999999999999999999))
+
+
+def _new_kimi_session_id() -> str:
+    """Kimi 会话标识的格式：19 位十进制（首位 1）。仅在首次生成时调用一次。"""
+    return str(random.randint(1700000000000000000, 1799999999999999999))
 
 BASE_URL = "https://kimi.moonshot.cn"
 REFRESH_ENDPOINT = "/api/auth/token/refresh"
@@ -82,8 +93,14 @@ class KimiProvider:
         else:
             self.user_agent = user_agent
 
-        self.device_id = device_id or str(random.randint(7000000000000000000, 7999999999999999999))
-        self.session_id = str(random.randint(1700000000000000000, 1799999999999999999))
+        # [OPT-030] 设备标识必须**跨进程/跨请求恒定**：Provider 是在每次派发尝试时
+        # 才实例化的（failover.execute_chat 内 provider_factory），而 session 文件里
+        # 的 device_id 为空，因此原先的 `random.randint(...)` 意味着**每一次上游请求
+        # 都自称一台新设备**——「同一账号 + 同一令牌 + 每次请求换设备」是反爬系统能
+        # 拿到的最强自动化特征。改为生成一次并持久化复用（不随重登改变）。
+        self.device_id = device_id or stable_device_id("kimi", _new_kimi_device_id)
+        # 会话标识同理：每次请求换会话比换设备更荒谬，同样固化。
+        self.session_id = stable_device_id("kimi/session", _new_kimi_session_id)
         self._cookies = parse_cookie_header(self.cookie)
 
     def _fake_headers(self, access_token: Optional[str] = None) -> dict[str, str]:

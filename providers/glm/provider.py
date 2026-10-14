@@ -16,6 +16,7 @@ import asyncio
 import hashlib
 import json
 import random
+import re
 import time
 import uuid
 from typing import AsyncIterator, Dict, List, Optional, Tuple
@@ -29,6 +30,7 @@ from ..base import (
     last_user_content,
     parse_cookie_header,
 )
+from ..device_identity import stable_device_id
 from ..http_client import get_http_client
 
 BASE_URL = "https://chatglm.cn/chatglm"
@@ -95,8 +97,41 @@ class GLMProvider:
         else:
             self.user_agent = user_agent
 
-        self.device_id = device_id or uuid.uuid4().hex
+        # [OPT-030] 设备标识必须跨请求恒定，理由同 Kimi：Provider 每次派发尝试才实例化，
+        # 原先的 `uuid.uuid4().hex` 使**每一次上游请求都自称一台新设备**。
+        self.device_id = device_id or stable_device_id("glm", lambda: uuid.uuid4().hex)
         self._cookies = parse_cookie_header(self.cookie)
+
+    def _client_hints(self) -> dict[str, str]:
+        """按**实际 User-Agent** 派生 Sec-Ch-Ua 客户端提示 [OPT-030]。
+
+        原先这三个字段是写死的常量（`"Chromium";v="130"` / `"macOS"`）。今天它
+        「恰好」与登录捕获的 UA 一致，只是因为 Playwright 内置 Chromium 恰好是 130
+        ——一旦浏览器升级，UA 会变成 Chrome/141 而提示仍自称 130，形成**自相矛盾**
+        的指纹（现代反爬会交叉校验 Sec-Ch-Ua 与 UA 的主版本）。改为从 UA 派生，
+        该矛盾在结构上不可能出现。若 UA 不是 Chromium 系（真实 Firefox/Safari 从
+        不发送这些字段），则**整体省略**——这才是与 UA 自洽的行为。
+        """
+        ua = self.user_agent or ""
+        m = re.search(r"Chrome/(\d+)", ua)
+        if not m:
+            return {}
+        major = m.group(1)
+        if re.search(r"Android", ua):
+            platform, mobile = '"Android"', "?1"
+        elif re.search(r"iPhone|iPad", ua):
+            platform, mobile = '"iOS"', "?1"
+        elif re.search(r"Windows", ua):
+            platform, mobile = '"Windows"', "?0"
+        elif re.search(r"Linux|X11", ua):
+            platform, mobile = '"Linux"', "?0"
+        else:
+            platform, mobile = '"macOS"', "?0"
+        return {
+            "Sec-Ch-Ua": f'"Chromium";v="{major}", "Google Chrome";v="{major}", "Not?A_Brand";v="99"',
+            "Sec-Ch-Ua-Mobile": mobile,
+            "Sec-Ch-Ua-Platform": platform,
+        }
 
     def _headers(self, access_token: Optional[str] = None) -> dict[str, str]:
         timestamp, nonce, sign = build_glm_sign()
@@ -110,9 +145,6 @@ class GLMProvider:
             "Content-Type": "application/json",
             "Origin": "https://chatglm.cn",
             "Pragma": "no-cache",
-            "Sec-Ch-Ua": '"Chromium";v="130", "Google Chrome";v="130", "Not?A_Brand";v="99"',
-            "Sec-Ch-Ua-Mobile": "?0",
-            "Sec-Ch-Ua-Platform": '"macOS"',
             "Sec-Fetch-Dest": "empty",
             "Sec-Fetch-Mode": "cors",
             "Sec-Fetch-Site": "same-origin",
@@ -126,6 +158,7 @@ class GLMProvider:
             "X-Request-Id": req_id,
             "X-Sign": sign,
             "X-Timestamp": timestamp,
+            **self._client_hints(),
         }
         if self.cookie:
             headers["Cookie"] = self.cookie

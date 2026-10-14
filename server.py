@@ -114,6 +114,7 @@ from providers.singleflight import (
 )
 from providers.credential_renewal import credential_renewal, get_credential_renewal
 from providers.credential_watch import credential_watch, get_credential_watch
+from providers.device_identity import get_device_identity_store
 from providers.quarantine import get_quarantine_store, parse_quarantine_until, quarantine_store
 from providers.risk_correlation import get_risk_correlation, risk_correlation
 from providers.risk_dossier import get_risk_dossier, risk_dossier
@@ -1257,6 +1258,8 @@ async def get_diagnostics():
         "credential_renewal": credential_renewal.get_diagnostics(),
         # [OPT-027] 账号级封禁推断（新凭证仍被拒 -> 自动租约停触）
         "ban_inference": failover_router.cooldown_tracker.ban_inference_report(),
+        # [OPT-030] 节点设备身份稳定性（同一节点每次请求必须是同一台「设备」）
+        "device_identity": get_device_identity_store().get_diagnostics(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }

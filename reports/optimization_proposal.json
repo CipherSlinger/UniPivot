@@ -1,6 +1,6 @@
 {
   "title": "项目优化空间与迭代需求建议书",
-  "generated_at": "2026-10-14 13:24:29",
+  "generated_at": "2026-10-14 13:44:48",
   "total_tasks_evaluated": 0,
   "model_metrics": {
     "Qwen3.7-Max": {
@@ -336,6 +336,16 @@
       "priority": "P0",
       "description": "record_failure 把 waf 与 ratelimit 放进**同一个**升级分支，共用 base × 1.2 ** min(n-1, 3) 并封顶 GATEWAY_WAF_COOLDOWN_MAX(900s)。实测结果：重复的人机验证在第 4 次即饱和于 ~78s 且**永不再增长**（指数封顶 3 次），于是该节点每 ~78 秒被再次触碰一次、无限循环；反观 auth —— 其恢复手段不过是一次自动重登 —— 却升到 7200s 并继续向 24h 上限增长。这是**语义的完全倒置**：按 OPT-023 档案，waf 是唯一 auto_recovers=False、唯一必须由**人**完成滑块验证的一档，却承受了**最频繁**的自动重试。每一次重试都是一次落在已被人机验证标记的账号上的「自动化尝试」——与 OPT-025 那场整环凭证风暴同源（重试本身就是风控触发器），只是发生在单节点上并自我维持，且与本项目「严禁加重其他厂商风控」的约束直接冲突。修复分两半，缺一不可：(1) **升级**——重复出现的 waf（≥ GATEWAY_WAF_ESCALATION_MIN_FAILURES，默认 3）按 2 的幂次长效避让（GATEWAY_WAF_LONG_COOLDOWN_BASE 3600s × 2ⁿ，封顶 GATEWAY_WAF_LONG_COOLDOWN_MAX 86400s），与认证级同构；单次人机验证绝不升级（避免误伤偶发验证），无法识别为验证码的风控命中保持既有短冷却，**频控有意不动**（瞬时且自愈，「冷却到点后重试」本身就是正确策略，其短冷却与上限与修复前逐值一致）。(2) **解除，缺了它升级就是永久冻结**——长效避让只有**人能解除**才可接受，而「人已介入」的唯一可观测证据就是**凭证文件变了**（login.py 完成滑块验证后令牌必然刷新，Session.save() 每次捕获都刷新 captured_at，指纹必然移动）。因此 WAF 拦截时刻留下凭证基线（CredentialRenewalTracker.note_interception），复位路径的可复位集合扩为 auth **与** waf（_RELEASABLE_BY_RENEWAL），否则升级期就正是 OPT-026 已修过的那类自锁缺陷换了个成因。note_interception **只记基线、不做推断**：它不返回「本次失败是否发生在一枚更新的凭证上」，那是 OPT-027 的判别式且严格限定 401，混入人机验证会在成因完全不同时误触发自动租约。配套修正 OPT-023 档案：冷却姿态原本给出统一建议文本，被升级的 waf 节点会沿用频控的「无需人工介入」，让运维去「等」一个只有人能修的节点；档案现在逐节点暴露 cooldown_cause 并据此分支（waf → 人工重登并**明确禁止**脚本化破解验证码；auth → 重登；ratelimit → 无需人工介入且明确不建议重登）。",
       "expected_impact": "把「最需要人介入的一类却耐心最短」倒置过来：重复的人机验证不再每 78 秒自动触碰一次已被人机验证标记的账号（实测升级序列 45 → 54 → 3600 → 7200 → 14400s），掐断一条自我维持、持续加重上游风控标记的通道，直接服务于「不得让其他厂商也被封」的项目约束；同时通过凭证指纹给出**人工出口**，避免长效避让退化为永久冻结——人工完成一次 login.py 滑块验证即自动解除避让，并进入 OPT-022 恢复观察期以串行探路重新验证，而不是解封即满速。频控行为逐值零回归（本套件第一个用例即为逐值断言），单次人机验证不升级，运维封禁租约优先级仍高于该释放路径，账号级封禁推断不受污染。遥测：档案条目新增 cooldown_cause，新增 GATEWAY_WAF_ESCALATION_MIN_FAILURES / GATEWAY_WAF_LONG_COOLDOWN_BASE / GATEWAY_WAF_LONG_COOLDOWN_MAX 三个可调参数。"
+    },
+    {
+      "id": "OPT-030",
+      "status": "COMPLETED",
+      "status_display": "已落地",
+      "category": "客户端足迹与身份一致性",
+      "title": "节点设备身份的稳定性与 UA 自洽的客户端提示 (Stable Per-Node Device Identity)",
+      "priority": "P0",
+      "description": "OPT-024 判定「多个不同账号在同一突发窗口内被集中拦截 ⇒ 根因在我们自己的客户端足迹上，换节点与按账号避让均无效」，但它的处置只是**全局降速**——那是治标：足迹本身没有被修复。本次修复足迹中一个**可验证、可修复**的根因，并且是用实测证据定位的：`_make_provider` 是在**每次派发尝试**时才被调用的（failover.execute_chat 内的 provider_factory），即每个请求都新建一个 Provider 实例；而 Kimi 的 `X-Msh-Device-Id`（连同 `X-Msh-Session-Id`）与 GLM 的 `X-Device-Id`（还作为 `X-Request-Id` 的前缀）原先写作 `device_id or random.randint(...)` / `device_id or uuid.uuid4().hex`，同时它们的 session 文件里 device_id 为空（登录流程只在豆包分支捕获了字节 TEA web_id）。结果：**Kimi 与 GLM 的每一次上游请求都自称一台新设备**——实测连续三次构造得到 kimi dev=7096601453065518286 → 7884000846302924502 → 7989808143219751393，glm dev=a2b3b407… → a880f09f… → ad3a3b0f…。Qwen 与 Doubao 在**有 cookie** 时稳定，但在「令牌来自环境变量、无 cookie」的部署形态下（凭证续期扫描接口明确支持这种形态）同样每次请求换设备：Qwen 每次重新生成 x-device-id，Doubao 退化为**当前毫秒时间戳**且 _fp 每次重新随机。「同一账号 + 同一 Cookie/令牌 + 每次请求一台新设备」是反爬系统能拿到的最强自动化特征之一：真实浏览器在同一 profile 下设备标识是**恒定**的，它随请求变化只可能来自自动化。而本项目当前约束恰恰是不得让其余四家也被打进风控——Kimi 与 GLM 正在其中。修复新增 providers/device_identity.py：`stable_device_id(key, generate)` 将各节点设备标识持久化到 session/device_identity.json（目录 0o700 / 文件 0o600，POSIX 原子写 os.replace + os.fsync），调用方的随机表达式因此**只执行一次**，此后每个请求复用磁盘上的同一个值；身份与凭证**刻意解耦**（真实设备重登后仍是同一台设备，故令牌刷新/重登绝不改变设备标识），这是与 OPT-026/OPT-029「凭证指纹用于判定人工介入」完全独立的证据链。构造性零回归：显式传入的 device_id（登录捕获真值）与 cookie 中已存在的标识永远优先，本模块只接管「原本要随机生成」的那一格；节点之间互不相同（共用标识会制造跨平台关联线索，正是 OPT-024 警告的共享足迹），节点内不同身份槽位同样独立。存储不可读/损坏时安全退化到调用方生成器且**不抛错**（辅助设施绝不成为请求路径上的单点故障），GATEWAY_DISABLE_DEVICE_IDENTITY=1 精确退化为修复前行为。同源问题一并修复：GLM 原先写死 Sec-Ch-Ua: \"Chromium\";v=\"130\" 而 User-Agent 是动态的，今天「恰好」一致只因 Playwright 内置 Chromium 恰好是 130，浏览器一升级 UA 变成 Chrome/141 而提示仍自称 130，形成自相矛盾的指纹（现代反爬会交叉校验 Sec-Ch-Ua 与 UA 主版本）；现改为按实际 UA 派生，UA 若非 Chromium 系则整体省略（真实 Firefox/Safari 从不发送这些字段）。诊断只暴露 6 字符前缀与年龄及 created/reused/revived_from_disk/bypassed 计数，严禁完整明文。",
+      "expected_impact": "消除一个**持续存在、每次请求都在发生**的自动化特征：Kimi 与 GLM 不再对上游自称「每次请求都是一台新设备」，Qwen/Doubao 在无 cookie 部署下同样恢复稳定，从而在源头降低四家尚未被封厂商被风控标记的概率（直接服务于「不得加重其他厂商风控」的约束），而不是像 OPT-024 那样只能事后降速。设备身份跨进程、跨重启、跨重登恒定且各节点互异，既不引入跨平台关联线索，也不与凭证证据链混淆（重登只改变凭证指纹，不改变设备身份）。既有行为零回归：捕获的真值与 cookie 值优先、损坏存储安全退化、开关可精确回退；test_providers.py 一并补上 TESTING=1，杜绝测试运行向真实 session/ 目录写入设备身份（与 OPT-019 同一类污染）。客户端提示与 UA 的自洽性由结构保证，浏览器升级不再产生自相矛盾的指纹。遥测：/v1/diagnostics 新增 device_identity（前缀与计数），GATEWAY_DISABLE_DEVICE_IDENTITY=1 / GATEWAY_DEVICE_IDENTITY_DIR 可控。"
     }
   ],
   "system_health": "good"

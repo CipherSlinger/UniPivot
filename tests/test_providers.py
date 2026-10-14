@@ -7,10 +7,17 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# [OPT-019/OPT-030] 本套件会构造各节点 Provider，而构造过程会（在无 cookie 时）
+# 生成并**持久化**设备标识。若不隔离，测试运行就会把开发机真实 `session/` 目录里
+# 的生产设备身份「铸造」出来——与 OPT-019 记录的「测试把假冷却写进真实 session/」
+# 是同一类污染。TESTING=1 使设备身份落盘到临时目录。
+os.environ["TESTING"] = "1"
 
 import httpx
 

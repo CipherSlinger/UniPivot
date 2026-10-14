@@ -30,6 +30,7 @@ from ..base import (
     last_user_content,
     parse_cookie_header,
 )
+from ..device_identity import stable_device_id
 
 BASE_URL = "https://www.doubao.com"
 COMPLETION_ENDPOINT = "/chat/completion"
@@ -77,17 +78,23 @@ class DoubaoProvider:
             f"passport_csrf_token={uuid.uuid4().hex}"
         )
         self._cookies: Dict[str, str] = parse_cookie_header(self._cookie_str)
+        # [OPT-030] 身份兜底必须稳定：原先无 `device_id` 时退化为**当前毫秒时间戳**
+        # （每次请求都变，比按进程变更糟），`_fp` 也每次重新随机。Provider 是在每次
+        # 派发尝试时才实例化的，因此这两处都会让「同一账号每次请求自称一台新设备」。
+        # 登录捕获的 `device_id` 与 cookie 中已有的标识仍然**优先**（它们才是真值）。
         self.device_id = (
             device_id
             or self._cookies.get("device_id")
-            or str(int(time.time() * 1000))
+            or stable_device_id("doubao", lambda: str(int(time.time() * 1000)))
         )
         self._csrf_token = (
             self._cookies.get("passport_csrf_token")
             or self._cookies.get("passport_csrf_token_default")
             or ""
         )
-        self._fp = self._cookies.get("s_v_web_id") or f"verify_{uuid.uuid4().hex[:32]}"
+        self._fp = self._cookies.get("s_v_web_id") or stable_device_id(
+            "doubao/fp", lambda: f"verify_{uuid.uuid4().hex[:32]}"
+        )
 
     def _security_params(self) -> Dict[str, str]:
         web_id = self._cookies.get("web_id") or self._cookies.get("tea_uuid") or self.device_id

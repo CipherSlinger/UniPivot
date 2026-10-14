@@ -28,6 +28,7 @@ from ..base import (
     last_user_content,
     parse_cookie_header,
 )
+from ..device_identity import stable_device_id
 
 BASE = "https://chat2.qianwen.com"
 CHAT_ENDPOINT = "/api/v2/chat"
@@ -111,17 +112,22 @@ class QwenProvider:
         if self.cookie:
             self._cookie_str = self.cookie
         else:
+            # [OPT-030] 无 cookie（令牌来自环境变量）时，原先会在**每次实例化**给
+            # 出全新的 `_device_id` 与 `t`，即每次请求都自称一台新设备。设备标识
+            # 改为跨请求持久复用；`t` 同为身份型令牌，一并固化。
             name = "login_aliyunid_ticket" if len(self.ticket) > 100 else "tongyi_sso_ticket"
             self._cookie_str = (
                 f"{name}={self.ticket}; "
                 "aliyun_choice=intl; _samesite_flag_=true; "
-                f"_device_id={uuid.uuid4().hex}; "
-                f"t={uuid.uuid4().hex}"
+                f"_device_id={stable_device_id('qwen', lambda: uuid.uuid4().hex)}; "
+                f"t={stable_device_id('qwen/t', lambda: uuid.uuid4().hex)}"
             )
         self._cookies = parse_cookie_header(self._cookie_str)
 
     def _headers(self) -> dict:
-        device_id = self._cookies.get("_device_id", "") or uuid.uuid4().hex
+        device_id = self._cookies.get("_device_id", "") or stable_device_id(
+            "qwen", lambda: uuid.uuid4().hex
+        )
         b_user_id = self._cookies.get("b-user-id", "")
         uid = self.user_id or b_user_id
         xsrf = self._cookies.get("XSRF-TOKEN", "")
@@ -174,7 +180,11 @@ class QwenProvider:
             acc_thought = ""
             waf_detected = False
             cookies = self._cookies
-            b_user_id = cookies.get("b-user-id", "") or cookies.get("_device_id", "") or uuid.uuid4().hex
+            # [OPT-030] 用户标识的兜底同样必须稳定：原先每次实例化都是新 uuid，
+            # 等于每次请求换一个账号身份（比换设备更致命）。
+            b_user_id = cookies.get("b-user-id", "") or cookies.get("_device_id", "") or stable_device_id(
+                "qwen/b-user-id", lambda: uuid.uuid4().hex
+            )
             nonce = uuid.uuid4().hex[:11]
             ts = int(time.time() * 1000)
 
@@ -356,7 +366,11 @@ class QwenProvider:
             return True
 
         cookies = self._cookies
-        b_user_id = cookies.get("b-user-id", "") or cookies.get("_device_id", "") or uuid.uuid4().hex
+        # [OPT-030] 用户标识的兜底同样必须稳定：原先每次实例化都是新 uuid，
+        # 等于每次请求换一个账号身份（比换设备更致命）。
+        b_user_id = cookies.get("b-user-id", "") or cookies.get("_device_id", "") or stable_device_id(
+            "qwen/b-user-id", lambda: uuid.uuid4().hex
+        )
         nonce = uuid.uuid4().hex[:11]
         ts = int(time.time() * 1000)
         url = (
