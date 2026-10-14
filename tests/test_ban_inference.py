@@ -24,6 +24,8 @@ deepseek 属于第 2 类，重登无效，只能等平台解除。
 8. 自动租约生效后禁止派发该节点（端到端零触碰）
 9. 开关 `GATEWAY_DISABLE_BAN_INFERENCE`；与租约/台账开关联动关闭
 10. 遥测：/v1/diagnostics 的 ban_inference、GET/DELETE /v1/admin/ban-inference
+11. 与 OPT-023 档案的一致性：处置建议必须按租约来源分支，自动租约**不得**
+    沿用运维租约的「不要重登」（对自动租约而言重登正是解除动作）
 
 运行: .venv/bin/python tests/test_ban_inference.py
 """
@@ -482,6 +484,47 @@ def test_diagnostics_and_admin_endpoints():
     print("test_diagnostics_and_admin_endpoints: PASSED")
 
 
+def test_dossier_advice_distinguishes_auto_from_operator_lease():
+    """OPT-023 档案的处置建议必须按租约来源分支，且两种建议**相反**。
+
+    运维租约的正确处置是「不要重登」（重登无效且延长封禁）；自动租约的正确处置
+    恰恰是「重登」（新凭证会解除推断）。若档案对自动租约沿用「不要重登」，就会
+    把一个可自愈的节点锁到租约到期，且与 OPT-027 的自动解除语义自相矛盾。
+    """
+    _install_fake_credentials()
+    _write_credential("deepseek", "A")
+    tracker = _tracker()
+    try:
+        _fail(tracker, "deepseek")
+        _write_credential("deepseek", "B", 1_700_005_000.0)
+        _fail(tracker, "deepseek", 2)
+        assert tracker.quarantine.source("deepseek") == "auto"
+
+        dossier = srv.risk_dossier
+        dossier.set_cooldown_tracker(tracker)
+        entry = dossier.provider_entry("deepseek")
+        assert entry["posture"] == "quarantined"
+        assert entry["dispatchable"] is False
+        assert entry["quarantine"]["source"] == "auto"
+        assert "自动推断" in entry["avoidance"]["reason"]
+        advice = " ".join(entry["recommended_actions"])
+        assert "login.py deepseek" in advice, advice
+        assert "自动解除" in advice, advice
+        assert "**不要**尝试重新登录" not in advice, "自动租约不得沿用运维租约的「禁止重登」建议"
+
+        # 运维租约则必须给相反的建议，且不得出现「重登即可解除」
+        tracker.quarantine.set_lease("glm", 3600.0, reason="人工封禁")
+        op = dossier.provider_entry("glm")
+        assert op["quarantine"]["source"] == "operator"
+        op_advice = " ".join(op["recommended_actions"])
+        assert "**不要**尝试重新登录" in op_advice, op_advice
+        assert "自动解除" not in op_advice, op_advice
+        assert "运维长期封禁租约" in op["avoidance"]["reason"]
+    finally:
+        _teardown(tracker)
+    print("test_dossier_advice_distinguishes_auto_from_operator_lease: PASSED")
+
+
 def run_all():
     test_plain_expiry_never_infers_a_ban()
     test_first_failure_after_relogin_is_not_yet_enough()
@@ -497,6 +540,7 @@ def run_all():
     test_co_disabled_with_quarantine_and_ledger()
     test_auto_lease_blocks_dispatch_end_to_end()
     test_diagnostics_and_admin_endpoints()
+    test_dossier_advice_distinguishes_auto_from_operator_lease()
     print("\n✅ All ban-inference tests (OPT-027) passed!")
 
 

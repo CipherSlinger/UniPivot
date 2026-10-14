@@ -221,10 +221,17 @@ class RiskDossier:
 
     def _avoidance(self, provider_key: str, stats: Dict[str, Any]) -> Dict[str, Any]:
         """按主要严重度给出规避研判；有租约时一律按账号级封禁研判。"""
-        quarantined = self._quarantine_state(provider_key)["active"]
-        if quarantined:
+        quarantine = self._quarantine_state(provider_key)
+        if quarantine["active"]:
             verdict_key = "ban"
-            reason = "该节点处于运维长期封禁租约，按平台侧账号级封禁研判"
+            # [OPT-027] 自动租约是**网关推断**的封禁，其唯一依据是「已试过一枚更新的
+            # 凭证且仍被拒」。措辞必须区分，否则运维会误以为它是人类声明而不敢重登
+            # ——而对自动租约来说，重登恰恰是唯一正确的解除动作。
+            if quarantine.get("source") == "auto":
+                reason = ("该节点持有**自动推断**的封禁租约（依据：凭证已被证明更新过之后"
+                          "仍被 401 拒绝）；重新登录取新令牌即可自动解除并重新验证")
+            else:
+                reason = "该节点处于运维长期封禁租约，按平台侧账号级封禁研判"
         else:
             # 取出现次数最多的严重度作为主要症结；无记录则按最轻的 ratelimit。
             by_sev = stats.get("by_severity") or {}
@@ -342,6 +349,22 @@ class RiskDossier:
         if posture == POSTURE_QUARANTINED:
             q = entry["quarantine"]
             hours = q.get("remaining_hours", 0.0)
+            # [OPT-027] 自动租约与运维租约的处置**相反**，提示必须分开给：
+            # 自动租约的依据是「更新的凭证仍被拒」，因此重登正是解除它的正确动作；
+            # 对运维租约而言重登毫无意义且会延长封禁。混用会让运维按其一的建议
+            # 去处理另一种，两种情况下都是错的。
+            if q.get("source") == "auto":
+                return [
+                    f"该封禁由**网关自动推断**而来（剩余约 {hours} 小时）：依据是「凭证已被"
+                    f"证明更新过之后仍被 401 拒绝」，即凭证过期这一成因已被排除",
+                    f"若平台封禁确实已解除，执行 `.venv/bin/python login.py {provider_key}` "
+                    f"重新登录取新令牌即可——出现更新的凭证时该租约会**自动解除**并进入恢复观察期",
+                    "若确认平台仍在封禁，则无需任何动作：租约到期或平台解封后再次重登即可自愈",
+                    "注意：账号级封禁本身重登无效。此处重登之所以有效，是因为它同时充当"
+                    "「解除推断」与「重新验证」双重角色，网关不会因此去触碰仍被封的账号",
+                    "运维也可在确认解封后直接执行 `DELETE /v1/admin/ban-inference` 提前解除"
+                    "（该接口绝不动用运维租约）",
+                ]
             return [
                 f"零误触等待平台自然解封（租约剩余约 {hours} 小时）；此期间网关已在派发路径硬阻断该节点",
                 "**不要**尝试重新登录或更换令牌：账号级封禁作用在账号本身，重登无效且会延长封禁",
