@@ -492,6 +492,10 @@ _ERR_TYPE_MAP = {
     # 本次请求零上游调用拒绝派发：与 quarantined 同源（服务当下无法承接该请求），
     # 故映射到 overloaded_error，客户端可按「稍后重试/改用其他模型」处理。
     "ring_exhausted": "overloaded_error",
+    # [OPT-033] 节点被运维通过 DISABLED_PROVIDERS 显式禁用、且环内已无其他可用节点，
+    # 本次请求零上游调用拒绝派发：与 quarantined 同属「服务当下无法承接该请求」，
+    # 故同样映射到 overloaded_error。
+    "disabled": "overloaded_error",
 }
 
 

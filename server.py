@@ -800,9 +800,16 @@ def _make_disconnect_headers() -> dict[str, str]:
 
 
 def _is_provider_healthy(pkey: str) -> bool:
-    """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。"""
-    disabled = os.getenv("DISABLED_PROVIDERS", "").split(",")
-    if pkey in [d.strip() for d in disabled if d.strip()]:
+    """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。
+
+    [OPT-033] 禁用判定改由 `cooldown_tracker.is_disabled()` 提供，不再在此处**另读一次**
+    `DISABLED_PROVIDERS` 环境变量。此前本函数与 `CooldownTracker` 各自解析同一份配置：
+    tracker 在构造/reset 时快照成集合，本函数每次现读环境变量，两者在「进程内改配置」
+    （测试、或任何不经进程重启的配置变更）时会给出不一致的答案——而「同一份配置被两处
+    各自解读」正是本项目反复出现的缺陷类型。现在只有一份解读，会话亲和与派发边界因此
+    对「哪些节点被禁用」永远同答。
+    """
+    if failover_router.cooldown_tracker.is_disabled(pkey):
         return False
     if failover_router.cooldown_tracker.is_in_cooldown(pkey):
         return False
@@ -1271,6 +1278,8 @@ async def get_diagnostics():
         "device_identity": get_device_identity_store().get_diagnostics(),
         # [OPT-031] 长效避让门控（整环长效避让时零上游快速失败，短冷却仍保留最后一搏）
         "long_avoidance": failover_router.cooldown_tracker.long_avoidance_report(),
+        # [OPT-033] 禁用门控与闸门拒载分布（哪一道闸门在承担拒载，可观测）
+        "dispatch_gates": failover_router.cooldown_tracker.disabled_gate_report(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }

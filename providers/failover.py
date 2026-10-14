@@ -370,6 +370,24 @@ class CooldownTracker:
             "last_fast_fail_cause": "",
             "last_redirect": "",
         }
+        # [OPT-033] 禁用门控统计：`DISABLED_PROVIDERS` 是运维关于「这个节点不属于本次
+        # 部署」的显式声明，此前派发边界并不理会它（只有负载均衡与会话亲和会避让），
+        # 于是「绕开负载均衡的那条路」可以把请求送进被显式禁用的节点。本统计即为
+        # 「被禁用的节点确实没被触碰」这条声明的可观测证据。
+        self._disabled_gate_stats: Dict[str, Any] = {
+            "fast_fails": 0,
+            "redirects": 0,
+            "last_fast_fail_provider": "",
+            "last_redirect": "",
+        }
+        # 闸门拒绝计数：blocked_by -> 次数。使「哪一道闸门在承担拒载」可观测，
+        # 而不是只能从日志里翻。
+        self._dispatch_gate_stats: Dict[str, int] = {
+            "credential_outage": 0,
+            "disabled": 0,
+            "quarantine": 0,
+            "long_avoidance": 0,
+        }
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
         self._episode_ends: Dict[str, float] = {}
@@ -466,8 +484,30 @@ class CooldownTracker:
             pass
 
     def is_disabled(self, provider_key: str) -> bool:
-        """检查指定 Provider 是否被配置主动禁用"""
-        return (provider_key or "").lower() in self.disabled_providers
+        """[OPT-033] 检查指定 Provider 是否被运维显式禁用。
+
+        这是「该节点是否被禁用」的**唯一**判读处：派发闸门、候选过滤、负载均衡、会话亲和
+        的可用性检查全部经由本方法。此前 `server._is_provider_healthy` 另行现读一次
+        `DISABLED_PROVIDERS` 环境变量，而本类在构造/reset 时把同一份配置快照成集合——
+        同一份配置被两处各自解读，进程内改配置时两者会给出不同答案（本项目反复出现的
+        缺陷类型）。
+
+        判读 = **程序集合 ∪ 环境变量现读**：
+        - 集合承载程序化声明（测试、以及任何不经进程重启的运行时变更），并由 `reset()`
+          用当时的环境变量刷新；
+        - 环境变量现读保证「改了 `DISABLED_PROVIDERS` 就立刻生效」，与旧行为逐值一致
+          （旧 `_is_provider_healthy` 就是现读环境变量的，改成快照会让既有行为退化）。
+
+        两者取并集而不是二选一：禁用是**声明**，多一条声明只会更保守，不会更激进——
+        这正是这类运维声明应有的合并方向（对照 OPT-020 租约只取 max() 的同一考虑）。
+        """
+        key = (provider_key or "").lower()
+        if key in self.disabled_providers:
+            return True
+        raw = os.getenv("DISABLED_PROVIDERS", "")
+        if not raw:
+            return False
+        return key in {p.strip().lower() for p in raw.split(",") if p.strip()}
 
     def is_in_cooldown(self, provider_key: str) -> bool:
         """检查指定 Provider 是否处于冷却避让期（含运维封禁租约）"""
@@ -607,6 +647,34 @@ class CooldownTracker:
         """[OPT-031] 记一次「长效避让节点被改派到健康节点」（未触碰避让节点）。"""
         self._long_avoidance_stats["redirects"] += 1
         self._long_avoidance_stats["last_redirect"] = f"{from_key}->{to_key}"
+
+    def note_disabled_gate_fast_fail(self, provider_key: str) -> None:
+        """[OPT-033] 记一次「环内已无未被禁用节点 → 零上游调用拒绝派发」。"""
+        self._disabled_gate_stats["fast_fails"] += 1
+        self._disabled_gate_stats["last_fast_fail_provider"] = provider_key
+
+    def note_disabled_gate_redirect(self, from_key: str, to_key: str) -> None:
+        """[OPT-033] 记一次「被禁用节点被改派到可用节点」（未触碰被禁用节点）。"""
+        self._disabled_gate_stats["redirects"] += 1
+        self._disabled_gate_stats["last_redirect"] = f"{from_key}->{to_key}"
+
+    def note_dispatch_gate_block(self, blocked_by: str) -> None:
+        """[OPT-033] 记一次派发闸门拒载（按闸门名分类），使「谁在承担拒载」可观测。"""
+        if not blocked_by:
+            return
+        self._dispatch_gate_stats[blocked_by] = self._dispatch_gate_stats.get(blocked_by, 0) + 1
+
+    def disabled_gate_report(self) -> Dict[str, Any]:
+        """[OPT-033] 禁用门控与闸门拒载分布诊断。"""
+        effective = set(self.disabled_providers)
+        raw = os.getenv("DISABLED_PROVIDERS", "")
+        if raw:
+            effective |= {p.strip().lower() for p in raw.split(",") if p.strip()}
+        return {
+            "disabled_providers": sorted(effective),
+            "gate_blocks": dict(self._dispatch_gate_stats),
+            "stats": dict(self._disabled_gate_stats),
+        }
 
     def long_avoidance_report(self) -> Dict[str, Any]:
         """[OPT-031] 长效避让门控诊断。"""
@@ -1422,6 +1490,21 @@ class CooldownTracker:
             "last_fast_fail_cause": "",
             "last_redirect": "",
         }
+        # [OPT-033] 禁用门控与闸门拒载分布一并重置。注意 `disabled_providers` 是**紧随
+        # 其后**从环境变量重读的，因此测试里改环境变量后调用 reset() 即可生效；反过来，
+        # 直接改 `disabled_providers` 集合的用例必须自己恢复，不能依赖 reset()。
+        self._disabled_gate_stats = {
+            "fast_fails": 0,
+            "redirects": 0,
+            "last_fast_fail_provider": "",
+            "last_redirect": "",
+        }
+        self._dispatch_gate_stats = {
+            "credential_outage": 0,
+            "disabled": 0,
+            "quarantine": 0,
+            "long_avoidance": 0,
+        }
         disabled_str = os.getenv("DISABLED_PROVIDERS", "")
         self.disabled_providers = {
             p.strip().lower() for p in disabled_str.split(",") if p.strip()
@@ -1655,6 +1738,118 @@ class FailoverRouter:
         candidates.sort(key=sort_key)
         return candidates
 
+    # [OPT-033] 派发闸门的**唯一定义**
+    def evaluate_dispatch_gate(
+        self,
+        provider_key: str,
+        outage_active: Optional[bool] = None,
+    ) -> Dict[str, Any]:
+        """回答「此刻这个节点能不能被派发、若不能是被哪一道闸门拦住」。
+
+        这是派发闸门的**唯一**定义处：`execute_chat` 的派发循环与 `audit_dispatch` 的
+        预演都只经由本函数取答案。OPT-032 的零漂移是靠**测试**保证的（预演说改派到 X，
+        真实派发就必须派发到 X）——那已经比两处代码各自正确前进了一步，但测试只能覆盖
+        它想到的场景：实测就漏掉了 `disabled` 这一格，`execute_chat` 当时对
+        `DISABLED_PROVIDERS` 毫无门控，而预演却把该节点报成 `blocked_by="disabled"` 并
+        预测改派到 glm，真实派发却直接把请求送进了被运维显式禁用的节点。把谓词收束到
+        一处后，「预演 == 派发」变成**结构性**成立：只有一份闸门顺序可以偏离。
+
+        与 `get_fallback_candidates` 的分工：本函数回答「这个**已知**节点现在能不能用」，
+        候选选择回答「环里还有谁可以用」。两者都读同一组谓词，但前者是硬阻断判据
+        （含环级凭证失效），后者只做排序与可用性过滤。
+
+        闸门顺序即语义，且**必须与 `execute_chat` 逐条一致**：
+
+        1. `credential_outage`（环级，OPT-025）——整环无可用凭证时，任何节点都不会被派发，
+           故它必须排在逐节点闸门之前，否则会误导运维去处理某一个节点；
+        2. `disabled`（运维声明，`DISABLED_PROVIDERS`）——「这个节点不属于本次部署」，
+           与租约同属人工声明级，因此同样是硬阻断而非降级。此前它只在负载均衡与会话亲和
+           的可用性检查里生效，派发边界本身不予理会，于是「绕开负载均衡那条路」就能把
+           请求送进被显式禁用的节点；
+        3. `quarantine`（运维/自动租约，OPT-020/021/027）；
+        4. `long_avoidance`（升级后长冷却，OPT-031）。
+
+        长短软冷却**刻意不在此列**：短冷却按 OPT-021 的语义保持 demote-only，环内全冷却时
+        仍允许最后一搏，可用性优先。
+        """
+        if outage_active is None:
+            try:
+                outage_active = bool(self.cooldown_tracker.credential_watch.is_outage_active())
+            except Exception:  # noqa: BLE001
+                outage_active = False
+
+        gate: Dict[str, Any] = {
+            "dispatchable": True,
+            "blocked_by": "",
+            "remaining_seconds": 0.0,
+            "cause": "",
+            "long_avoidance": False,
+            "disabled": False,
+        }
+
+        if outage_active:
+            gate["dispatchable"] = False
+            gate["blocked_by"] = "credential_outage"
+            return gate
+
+        if self.cooldown_tracker.is_disabled(provider_key):
+            gate["dispatchable"] = False
+            gate["blocked_by"] = "disabled"
+            gate["disabled"] = True
+            return gate
+
+        if self.cooldown_tracker.is_quarantined(provider_key):
+            gate["dispatchable"] = False
+            gate["blocked_by"] = "quarantine"
+            gate["cause"] = "ban"
+            try:
+                gate["remaining_seconds"] = float(self.cooldown_tracker.quarantine.remaining(provider_key))
+            except Exception:  # noqa: BLE001
+                gate["remaining_seconds"] = 0.0
+            return gate
+
+        if self.cooldown_tracker.is_in_long_avoidance(provider_key):
+            gate["dispatchable"] = False
+            gate["blocked_by"] = "long_avoidance"
+            gate["long_avoidance"] = True
+            gate["cause"] = self.cooldown_tracker.long_avoidance_cause(provider_key)
+            try:
+                gate["remaining_seconds"] = float(self.cooldown_tracker.get_remaining_cooldown(provider_key))
+            except Exception:  # noqa: BLE001
+                gate["remaining_seconds"] = 0.0
+            return gate
+
+        return gate
+
+    def evaluate_dispatch_gate_full(
+        self, provider_key: str, outage_active: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """`evaluate_dispatch_gate` 的补充视图：即使某节点已可派发，也一并报告它**是否**
+        命中 disabled / 租约 / 长效避让这类「本可阻断但现在被前置闸门盖住」的状态。
+
+        `audit_dispatch` 的逐节点备注用它，使运维在环级凭证失效掩盖了逐节点状态时，
+        仍能看到「这个节点其实还在被封禁租约里」，而不是只看到一句环级成因。
+        """
+        info = self.evaluate_dispatch_gate(provider_key, outage_active=outage_active)
+        try:
+            info["disabled"] = bool(self.cooldown_tracker.is_disabled(provider_key))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            info["quarantined"] = bool(self.cooldown_tracker.is_quarantined(provider_key))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            info["in_long_avoidance"] = bool(self.cooldown_tracker.is_in_long_avoidance(provider_key))
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            cooldown = float(self.cooldown_tracker.get_remaining_cooldown(provider_key))
+        except Exception:  # noqa: BLE001
+            cooldown = 0.0
+        info["remaining_cooldown_seconds"] = round(cooldown, 1)
+        return info
+
     def audit_dispatch(self, provider_key: str, wire_model: str) -> Dict[str, Any]:
         """[OPT-032] 零上游派发预演：此刻这个请求会被谁承接、谁被排除、被**哪一道**闸门排除。
 
@@ -1674,8 +1869,10 @@ class FailoverRouter:
         温床。因此字段以 `predicted_` 命名，`scope_note` 显式声明该边界——宁可说清它不管
         什么，也不要给一个看起来更完整、实则会错的承诺。
 
-        闸门顺序与 `execute_chat` 派发循环**逐条一致**（全环凭证失效 → 运维租约 →
-        长效避让），因为「哪一道闸门先开火」正是运维需要知道的信息。
+        闸门顺序与 `execute_chat` 派发循环**逐条一致**（全环凭证失效 → 运维禁用
+        `DISABLED_PROVIDERS` → 运维/自动租约 → 长效避让），因为「哪一道闸门先开火」正是
+        运维需要知道的信息。**[OPT-033] 该顺序不再靠两处代码各自维护：逐节点状态一律向
+        `evaluate_dispatch_gate_full()` 求值，只有一份闸门定义可以偏离。**
         """
         ring = classify_capability_ring(provider_key, wire_model)
         member_keys = {p_key for p_key, _ in RING_DEFINITIONS.get(ring, [])}
@@ -1699,25 +1896,11 @@ class FailoverRouter:
 
         members: List[Dict[str, Any]] = []
         for p_key, w_model in RING_DEFINITIONS.get(ring, []):
-            blocked_by = ""
-            remaining = 0.0
-            cause = ""
-            if self.cooldown_tracker.is_disabled(p_key):
-                blocked_by = "disabled"
-            elif outage_active:
-                # 环级闸门：此刻无论哪个节点都不会被派发
-                blocked_by = "credential_outage"
-            elif self.cooldown_tracker.is_quarantined(p_key):
-                blocked_by = "quarantine"
-                try:
-                    remaining = self.cooldown_tracker.quarantine.remaining(p_key)
-                except Exception:  # noqa: BLE001
-                    remaining = 0.0
-                cause = "ban"
-            elif self.cooldown_tracker.is_in_long_avoidance(p_key):
-                blocked_by = "long_avoidance"
-                remaining = self.cooldown_tracker.get_remaining_cooldown(p_key)
-                cause = self.cooldown_tracker.long_avoidance_cause(p_key)
+            # [OPT-033] 逐节点状态一律向**唯一**的闸门定义处求值，预演不再自带一份
+            # if/elif 副本——副本正是 OPT-032 漏掉 `disabled` 那一格的成因。
+            info = self.evaluate_dispatch_gate_full(p_key, outage_active=outage_active)
+            blocked_by = info["blocked_by"]
+            remaining = float(info["remaining_seconds"])
 
             members.append(
                 {
@@ -1725,9 +1908,15 @@ class FailoverRouter:
                     "wire_model": w_model,
                     "dispatchable": not blocked_by,
                     "blocked_by": blocked_by or None,
-                    "blocking_cause": cause or None,
+                    "blocking_cause": info["cause"] or None,
                     "remaining_seconds": round(remaining, 1) if remaining else 0.0,
                     "remaining_hours": round(remaining / 3600.0, 2) if remaining else 0.0,
+                    # 被前置闸门盖住、但客观存在的状态，供运维分辨「环级成因」与「该节点
+                    # 自身也尚未恢复」
+                    "disabled": bool(info.get("disabled")),
+                    "quarantined": bool(info.get("quarantined")),
+                    "in_long_avoidance": bool(info.get("in_long_avoidance")),
+                    "remaining_cooldown_seconds": info.get("remaining_cooldown_seconds", 0.0),
                 }
             )
 
@@ -1748,13 +1937,19 @@ class FailoverRouter:
             if candidates:
                 redirect_target = candidates[0].provider_key
 
-        # 预测的错误类型必须与派发路径**真正会抛出**的那一个一致：租约/长效避让是先改派、
-        # 改派不出去才报错，因此只有整环确实无节点可派时才有 err_type——否则预演就成了谎报
-        # （把一次正常的改派说成会失败）。
+        # 预测的错误类型必须与派发路径**真正会抛出**的那一个一致：租约/禁用/长效避让都是
+        # 先改派、改派不出去才报错，因此只有整环确实无节点可派时才有 err_type——否则预演
+        # 就成了谎报（把一次正常的改派说成会失败）。映射表与 execute_chat 的抛出一一对应。
+        _GATE_ERR_TYPE = {
+            "credential_outage": "credential_outage",
+            "disabled": "disabled",
+            "quarantine": "quarantined",
+            "long_avoidance": "ring_exhausted",
+        }
         if outage_active:
             err_type: Optional[str] = "credential_outage"
         elif not dispatchable and primary is not None and not primary["dispatchable"]:
-            err_type = "quarantined" if primary["blocked_by"] == "quarantine" else "ring_exhausted"
+            err_type = _GATE_ERR_TYPE.get(primary["blocked_by"], "ring_exhausted")
         else:
             err_type = None
 
@@ -1772,8 +1967,9 @@ class FailoverRouter:
             "credential_outage": {"active": outage_active, "failed_providers": sorted(outage_failed)},
             "ring_members": members,
             "scope_note": (
-                "仅预演**闸门**决定（全环凭证失效 / 运维租约 / 长效避让），零上游调用；"
-                "不含负载均衡分流与会话亲和固定，最终承接节点可能与 predicted_redirect_target 不同。"
+                "仅预演**闸门**决定（全环凭证失效 / 运维禁用 DISABLED_PROVIDERS / 运维与自动"
+                "租约 / 长效避让），零上游调用；不含负载均衡分流与会话亲和固定，最终承接节点"
+                "可能与 predicted_redirect_target 不同。"
             ),
         }
 
@@ -1805,16 +2001,25 @@ class FailoverRouter:
         while True:
             tried_providers.add(curr_provider_key)
 
+            # [OPT-033] 闸门顺序的**唯一来源**：本循环不再自带一份 if/elif 副本，而是
+            # 向 evaluate_dispatch_gate() 问一次「此刻这个节点能不能被派发、被哪一道
+            # 闸门拦住」，再按它给出的 blocked_by 选择处置分支。此前循环里手写的那份
+            # 副本与 audit_dispatch 里的另一份副本漂移过：`disabled`（运维显式禁用的
+            # 节点）在预演里被报成硬阻断、在派发路径上却毫无门控，实测能把请求直接
+            # 送进被禁用的节点。收束到一处后，「预演 == 派发」是结构性成立的。
+            gate = self.evaluate_dispatch_gate(curr_provider_key)
+            if gate["blocked_by"]:
+                self.cooldown_tracker.note_dispatch_gate_block(gate["blocked_by"])
+
             # [OPT-025] 全环凭证失效快速失败：当多个不同节点在同一窗口内相继 401，
             # 说明我们没有可用凭证，故障转移不可能成功。此时继续逐个打满五个节点，
             # 恰恰是上游 WAF 眼中的「自动化凭证尝试」流量特征——风暴本身就是风控触发器。
             # 故立即拒绝派发（零上游调用），并给出重登指引；TTL 后自动放行探路。
-            try:
-                outage = self.cooldown_tracker.credential_watch.is_outage_active()
-            except Exception:  # noqa: BLE001
-                outage = False
-            if outage:
-                failed = self.cooldown_tracker.credential_watch.active_failures()
+            if gate["blocked_by"] == "credential_outage":
+                try:
+                    failed = self.cooldown_tracker.credential_watch.active_failures()
+                except Exception:  # noqa: BLE001
+                    failed = []
                 self.cooldown_tracker.credential_watch.note_fast_fail()
                 logger.error(
                     "[凭证失效快速失败] 整环凭证失效 (%s)，拒绝派发以避免无效凭证风暴",
@@ -1831,11 +2036,54 @@ class FailoverRouter:
                     err_type="credential_outage",
                 )
 
+            # [OPT-033] 运维禁用硬阻断：`DISABLED_PROVIDERS` 是运维关于「这个节点不属于
+            # 本次部署」的**显式声明**，与封禁租约同属人工声明级，因此同样是硬阻断而非
+            # 降级。此前它在负载均衡（select_route）与会话亲和（_is_provider_healthy）
+            # 的可用性检查里生效，但**派发边界本身不理会**——于是任何绕过负载均衡到达
+            # execute_chat 的路径（显式指定的主选、亲和重新解析后的结果）都能把请求送进
+            # 被运维禁用的节点，而 OPT-032 的预演却报它是 blocked_by="disabled"。声明与
+            # 事实不一致，正是本项目反复记录的那类缺陷。
+            if gate["blocked_by"] == "disabled":
+                disabled_list = ",".join(sorted(self.cooldown_tracker.disabled_providers)) or "-"
+                logger.error(
+                    "[禁用硬阻断] 节点 [%s] 已被 DISABLED_PROVIDERS 显式禁用，拒绝派发上游请求",
+                    curr_provider_key,
+                )
+                candidates = self.get_fallback_candidates(
+                    primary_provider_key,
+                    primary_wire_model,
+                    excluded_providers=tried_providers,
+                )
+                if not candidates:
+                    self.cooldown_tracker.note_disabled_gate_fast_fail(curr_provider_key)
+                    raise ProviderError(
+                        f"目标节点 [{curr_provider_key}:{curr_wire_model}] 已被运维通过"
+                        f" DISABLED_PROVIDERS 显式禁用（当前禁用集合: {disabled_list}），"
+                        f"且能力环 [{ring.value}] 内已无其他可用节点。为避免派发到被禁用的"
+                        f"节点，本次请求已拒绝派发（零上游调用）—— 请移除该节点的禁用声明"
+                        f"（环境变量 DISABLED_PROVIDERS）或改用其他厂商模型。",
+                        status=503,
+                        err_type="disabled",
+                    )
+                next_cand = candidates[0]
+                self.cooldown_tracker.note_disabled_gate_redirect(
+                    curr_provider_key, next_cand.provider_key
+                )
+                logger.warning(
+                    "[禁用硬阻断] 改派: [%s] -> [%s] (模型: %s)",
+                    curr_provider_key,
+                    next_cand.provider_key,
+                    next_cand.wire_model,
+                )
+                curr_provider_key = next_cand.provider_key
+                curr_wire_model = next_cand.wire_model
+                continue
+
             # [OPT-021] 硬阻断：运维封禁租约节点在任何情况下都不得被派发真实请求。
             # 这是整条冷却门控体系的最后一道闸口 —— 即便调用方显式指定了被封禁的
             # 模型别名，也必须立即改派或快速失败，绝不能因为「环内只剩它」而破例触碰。
-            if self.cooldown_tracker.is_quarantined(curr_provider_key):
-                remaining = self.cooldown_tracker.quarantine.remaining(curr_provider_key)
+            if gate["blocked_by"] == "quarantine":
+                remaining = gate["remaining_seconds"]
                 logger.error(
                     "[封禁硬阻断] 节点 [%s] 处于运维封禁租约 (剩余 %.1f 小时)，拒绝派发上游请求",
                     curr_provider_key,
@@ -1879,9 +2127,9 @@ class FailoverRouter:
             # 与「最后一搏」的边界：短软冷却（频控退避，秒级~两分钟）仍按 OPT-021 的
             # demote-only 语义保留最后一搏，可用性不受影响——`is_in_long_avoidance`
             # 的阈值落在短冷却可达上界与升级下界之间的真空带内，短冷却恒定不越界。
-            if self.cooldown_tracker.is_in_long_avoidance(curr_provider_key):
-                remaining = self.cooldown_tracker.get_remaining_cooldown(curr_provider_key)
-                cause = self.cooldown_tracker.long_avoidance_cause(curr_provider_key)
+            if gate["blocked_by"] == "long_avoidance":
+                remaining = gate["remaining_seconds"]
+                cause = gate["cause"]
                 logger.error(
                     "[长效避让硬阻断] 节点 [%s] 处于长效避让 (成因 %s，剩余 %.1f 小时)，拒绝派发",
                     curr_provider_key,

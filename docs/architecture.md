@@ -327,10 +327,18 @@ PROVIDER_RISK_SPECS = {
 #### 20. 零上游派发预演 (`providers/failover.py:audit_dispatch`)
 
 - **每次运维动作之后的确认成本**：整条避让线（OPT-021…031）让网关**拒绝**向被封禁节点派发，但在 OPT-032 之前，没有任何办法让运维确认「这份声明到底生效了没有」——除非真发一次请求、再看哪些节点被触碰。而这恰恰是本条线一直在消灭的习惯：**用一次上游触碰去买一个答案**。这不是推测，而是实测：声明 DeepSeek 封禁之后，确认它生效需要手写一段脚本——注入假 Provider 工厂、用 `TestClient` 发一次请求、再看被触碰的节点集合。这个确认动作是**日常**的（每次改租约、改环境变量、重启之后都要再问一遍），而五个 admin 端点都回答不了它：它们报的是节点的**姿态**，而问题是「这条请求此刻的派发决定是什么」。
-- **只读、零上游调用，且可被构造性证明**：`audit_dispatch(provider_key, wire_model)` 绝不实例化任何 Provider，只向派发循环**同一组**谓词、按**同一顺序**提问（整环凭证失效 → 运维/自动租约 → 长效避让），因为「哪一道闸门先开火」本身就是运维需要的信息。`GET /v1/admin/dispatch-audit?model=<别名>` 解析别名后返回 `upstream_calls: 0`、逐节点 `blocked_by`（`credential_outage` / `quarantine` / `long_avoidance` / `disabled`）与剩余时长、成因，以及 `predicted_primary_dispatchable` / `predicted_redirect_target` / `predicted_fail_closed` / `predicted_err_type`。零上游调用由 `tests/test_dispatch_audit.py::test_endpoint_never_instantiates_a_provider` **构造性证明**：把 `_make_provider` 换成抛错实现，预演仍必须成功。
+- **只读、零上游调用，且可被构造性证明**：`audit_dispatch(provider_key, wire_model)` 绝不实例化任何 Provider，只向派发循环**同一组**谓词、按**同一顺序**提问（整环凭证失效 → 运维禁用 `DISABLED_PROVIDERS` → 运维/自动租约 → 长效避让），因为「哪一道闸门先开火」本身就是运维需要的信息。`GET /v1/admin/dispatch-audit?model=<别名>` 解析别名后返回 `upstream_calls: 0`、逐节点 `blocked_by`（`credential_outage` / `disabled` / `quarantine` / `long_avoidance`）与剩余时长、成因，以及 `predicted_primary_dispatchable` / `predicted_redirect_target` / `predicted_fail_closed` / `predicted_err_type`。零上游调用由 `tests/test_dispatch_audit.py::test_endpoint_never_instantiates_a_provider` **构造性证明**：把 `_make_provider` 换成抛错实现，预演仍必须成功。
 - **零漂移，既靠构造也靠测试**：改派目标取自真正的 `get_fallback_candidates()`——**不是**「环内第一个可派发成员」。实测两者并不相同：候选按 `(冷却, 风险等级, 失败次数)` 排序，因此 `glm` 会排在环序更靠前的 `qwen` 之前；本功能的第一版预测 `qwen`，而真实派发到了 `glm`。套件现在把预演与 `execute_chat` 的**实际行为**对齐断言——既断言改派目标（取自观测到的被触碰节点集合），也断言抛出的 `err_type` 与状态码——因此一个不再与现实相符的预演会**让构建失败**，而不是退化成一份更有说服力的谎报。同一理由：传入未解析的模型别名时预演**直接报错**，而不是对一个不存在的 provider key 静默作答（那会把封禁节点报成可派发）。
 - **诚实划定边界，而不是假装完整**：它有意**不**模拟负载均衡分流与会话亲和，因此字段一律以 `predicted_` 命名，并在载荷里给出 `scope_note` 明确说明这一点。在这里重写一遍三个协议的派发前管线，正是本项目反复修复的「文档行为与真实行为漂移」缺陷的温床；说清它不管什么，是更好的取舍。
 - 幂等且无副作用（`test_audit_is_read_only` 断言：不改租约、不复位冷却、不追加台账），因此在任何诊断路径上都可以安全调用。
+
+#### 21. 派发闸门的唯一定义与运维禁用硬阻断 (`providers/failover.py:evaluate_dispatch_gate`)
+
+- **OPT-032 的预演自己暴露出来的缺陷：一道闸门有两份副本**。OPT-032 让「预演 == 派发」成为一条由**测试**保证的性质（预演说改派到 X ⇒ 真实派发必须派发到 X）。这已比「两处代码碰巧一致」前进一步，但测试只能覆盖它想到的场景。这一格就被漏掉、并被实测发现：`execute_chat` 对 `DISABLED_PROVIDERS`（运维关于「这个节点不属于本次部署」的显式声明）**毫无门控**，而预演却把该节点报成 `blocked_by="disabled"` 并预测改派到 `glm`。实测复现：`DISABLED_PROVIDERS=deepseek` 时 `execute_chat("deepseek", …)` 真实派发了 **deepseek**（`TOUCHED=['deepseek']`）——请求被直接送进了运维显式禁用的节点。负载均衡与会话亲和都遵守了它，唯独作为最后一道防线、且按 OPT-021 的理由**必须自我保护**的派发边界没有。根因不是漏写一个 `if`，而是闸门**顺序**存在两份副本：一份在派发循环里，一份在 `audit_dispatch` 里。
+- **修复方式是只留一份**：`FailoverRouter.evaluate_dispatch_gate(provider_key, outage_active)` 现在是闸门顺序的**唯一**定义（整环凭证失效 → 运维禁用 → 运维/自动租约 → 长效避让），返回 `dispatchable` / `blocked_by` / `remaining_seconds` / `cause`。`execute_chat` 的派发循环改为按 `gate["blocked_by"]` 选择处置分支，而不是自行重新求值谓词；`audit_dispatch` 向同一个函数提问——于是「预演 == 派发」是**结构性**成立的，而不仅仅是被测试覆盖。`tests/test_dispatch_gate.py::test_dispatch_decision_is_derived_from_the_single_gate_definition` 用唯一能真正证明该结构主张的方式证明它：**篡改那唯一一份闸门定义**（谎报一个健康节点被阻断），断言真实派发随之拒绝该节点——若派发循环哪天退回自带副本，它就会无视篡改照常派发，该用例立即变红。
+- **新增的这道闸门是硬阻断，而非降级**：`DISABLED_PROVIDERS` 是运维声明，与封禁租约同属人工声明级，因此完全遵循 OPT-021 的语义：被禁用的主选被**改派**、被禁用节点从候选集中排除，环内无未被禁用成员时以 `503 / err_type="disabled"`（Anthropic 协议映射 `overloaded_error`，与 `quarantined` / `ring_exhausted` 同族）**零上游调用**拒绝，报文给出**生效**的禁用集合。可用性由构造保证：只有**显式声明**才会阻断，短软冷却仍保留 OPT-021 的 demote-only「最后一搏」。
+- **同一份配置只有一份解读**：`server._is_provider_healthy`（会话亲和的可用性检查）此前**自行**解析 `DISABLED_PROVIDERS`，而 `CooldownTracker` 在构造时把同一个变量快照成集合——同一份配置被两处各自解读，进程内一旦改动就会给出不同答案（与本项目反复修复的 OPT-026/029/030 同属一类）。现改为委派给 `CooldownTracker.is_disabled()`，由它作为**唯一**判读处，并取「程序集合 ∪ 环境变量现读」的**并集**——合并方向刻意保守（多一条声明只会禁用更多），同时刻意保留「现读环境变量」这一既有行为（`tests/test_affinity.py` 的换节点用例即依赖它）。
+- **遥测**：`/v1/diagnostics` 新增 `dispatch_gates`（`disabled_providers` 为**生效**的并集；`gate_blocks` 为**逐闸门拒载直方图**，使「哪一道闸门在承担拒载」可观测而非靠翻日志；`stats` 为改派与零上游快速失败计数）。`audit_dispatch` 的逐节点条目另附 `disabled` / `quarantined` / `in_long_avoidance` 三个**备注**标记，使被环级凭证失效掩盖的逐节点状态仍然可见。见 `tests/test_dispatch_gate.py`（10 个用例）。
 
 ---
 
@@ -491,6 +499,7 @@ PROVIDER_RISK_SPECS = {
 │   └── test_device_identity.py # 设备身份稳定性：跨请求/跨重启恒定、节点间互不相同、捕获值优先、与凭证解耦、安全退化与 UA 自洽客户端提示测试
 │   └── test_long_avoidance.py  # 长效避让派发硬阻断：阈值真空带证明、整环混合成因零上游快速失败、短冷却最后一搏零回归、改派零触碰、档案 fail-closed 姿态测试
 │   └── test_dispatch_audit.py  # 零上游派发预演：只读闸门审计、逐节点阻断成因与剩余时长、整环 fail-closed 预测，以及「预演必须与真实派发一致」的零漂移回归测试
+│   └── test_dispatch_gate.py   # 派发闸门唯一定义与运维禁用硬阻断：DISABLED_PROVIDERS 在派发边界生效（实测漏洞：预演报阻断而 execute_chat 直接派发进被禁用节点）、闸门顺序只有一份副本（篡改唯一闸门定义即须改变派发）、同一配置只有一份解读、短冷却最后一搏零回归
 ├── examples/                   # 调用示例
 │   ├── python_client.py        # Python SDK 调用示例
 │   └── curl.sh                 # 常用 curl 请求调用示例
@@ -566,7 +575,8 @@ PROVIDER_RISK_SPECS = {
 .venv/bin/python tests/test_waf_escalation.py && \
 .venv/bin/python tests/test_device_identity.py && \
 .venv/bin/python tests/test_long_avoidance.py && \
-.venv/bin/python tests/test_dispatch_audit.py
+.venv/bin/python tests/test_dispatch_audit.py && \
+.venv/bin/python tests/test_dispatch_gate.py
 ```
 
 ### 测试矩阵要求：
