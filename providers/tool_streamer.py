@@ -46,9 +46,15 @@ _PARTIAL_TRIGGER_PREFIXES = [
 
 
 def tool_names_of(tools: Any) -> Optional[set]:
-    """从客户端声明的 `tools` 里取出所有工具名（兼容 OpenAI / Anthropic 两种形状）。
+    """从客户端声明的 `tools` 里取出所有工具名（兼容 OpenAI / Anthropic / Responses 形状）。
 
     返回 None 表示「调用方没有声明工具」——此时不做白名单裁剪，保持既有解析行为。
+
+    [TOOL-LOOP] Responses 的 custom（freeform）工具声明是
+    `{"type": "custom", "name": "apply_patch"}`：没有 `function` 包装，但顶层有
+    `name`，旧实现靠 `t.get("name")` 恰好覆盖到它。这里显式写出来，是因为白名单
+    决定了「模型写出的调用能不能被回传」——漏掉一个声明过的名字，等于该工具永远
+    不可调用，而症状是客户端侧的「工具没跑起来」，很难追到这一行。
     """
     if not tools:
         return None

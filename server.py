@@ -96,6 +96,9 @@ from providers import (
     ResponsesEventStream,
     convert_responses_to_gateway_messages,
     format_responses_completion,
+    custom_tool_call_item,
+    custom_tool_input_text,
+    freeform_tool_names,
     function_call_item,
     message_item,
     reasoning_item,
@@ -3439,6 +3442,9 @@ async def responses_endpoint(req: ResponsesRequest):
                     tools_enabled=bool(req.tools),
                     allowed=resolve_allowed_tools(req.tools, req.tool_choice),
                 )
+                # [TOOL-LOOP] freeform（custom）工具的出口形状与 function 工具不同，
+                # 在流的起点算一次、全程复用（与 allowed 同源，避免两份判断）。
+                freeform_names = freeform_tool_names(req.tools)
                 # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
                 stop_scan = StopSequenceScanner(stop_seq)
                 yield ev.created()
@@ -3589,13 +3595,26 @@ async def responses_endpoint(req: ResponsesRequest):
                         _tool_healing_stats["healed_tool_calls"] += 1
                     for tool_name, args in tool_list:
                         call_id = _id("call", "_")
-                        args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args)
-                        yield ev.output_item_added(
-                            out_idx, function_call_item(call_id, tool_name, "", status="in_progress")
-                        )
-                        yield ev.function_call_args_delta(call_id, out_idx, call_id, args_str)
-                        yield ev.function_call_args_done(call_id, out_idx, call_id, args_str)
-                        item_fn = function_call_item(call_id, tool_name, args_str)
+                        # [TOOL-LOOP] freeform 工具发 `custom_tool_call` + 原文 input；
+                        # function 工具发 `function_call` + JSON arguments。两者的事件名
+                        # 都不同，客户端按名分派，混用等于丢掉调用。
+                        if tool_name in freeform_names:
+                            tool_text = custom_tool_input_text(args)
+                            yield ev.output_item_added(
+                                out_idx,
+                                custom_tool_call_item(call_id, tool_name, "", status="in_progress"),
+                            )
+                            yield ev.custom_tool_call_input_delta(call_id, out_idx, tool_text, call_id)
+                            yield ev.custom_tool_call_input_done(call_id, out_idx, tool_text, call_id)
+                            item_fn = custom_tool_call_item(call_id, tool_name, tool_text)
+                        else:
+                            args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args)
+                            yield ev.output_item_added(
+                                out_idx, function_call_item(call_id, tool_name, "", status="in_progress")
+                            )
+                            yield ev.function_call_args_delta(call_id, out_idx, call_id, args_str)
+                            yield ev.function_call_args_done(call_id, out_idx, call_id, args_str)
+                            item_fn = function_call_item(call_id, tool_name, args_str)
                         yield ev.output_item_done(out_idx, item_fn)
                         output_items.append(item_fn)
                         out_idx += 1
@@ -3793,6 +3812,8 @@ async def responses_endpoint(req: ResponsesRequest):
         failover=failover_event.to_dict() if failover_event else None,
         reasoning_text=full_reasoning,
         reasoning_tokens=max(1, _est_tokens(full_reasoning)) if full_reasoning else 0,
+        # [TOOL-LOOP] freeform 工具必须以 custom_tool_call 输出（同流式路径）
+        freeform_tools=freeform_tool_names(req.tools),
     )
     # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete（与流式路径同一语义）
     if _stop_matched:

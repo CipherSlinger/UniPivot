@@ -263,6 +263,39 @@ def _tool_choice_directive(tool_choice: Any) -> str:
     return ""
 
 
+# [TOOL-LOOP] Responses 的 **custom / freeform** 工具（Codex CLI 的 `apply_patch`
+# 就是这种）没有 JSON schema，参数是一段自由文本补丁。上游五家网页端都只能看到
+# 提示词里的工具声明，所以这里为它们合成一个**显而易见**的 schema：模型按这个
+# 形状写 ```tool_call，网关再把它还原成客户端的 freeform 形状。
+#
+# 为什么必须合成 schema 而不能只声明名字：`_extract_tools_from_data` 的强校验要求
+# 调用带显式参数键，模型若按提示词写出裸字符串（`{"name":"apply_patch","arguments":"*** Begin Patch…"}`），
+# 字符串会被 `_normalize_tool_args` 折成 `{"input": ...}`——这正好是我们要的形状，
+# 于是「模型怎么理解 freeform」不再是隐式约定。网关契约里没有 freeform 概念：
+# 参数永远是对象，所以统一约定成 `{"input": "<原文>"}`，再在出口处还原。
+FREEFORM_TOOL_INPUT_KEY = "input"
+
+
+def freeform_tool_input_schema() -> dict:
+    """freeform（custom）工具的合成 schema：唯一字段是放原文的 `input`。"""
+    return {
+        "type": "object",
+        "properties": {
+            FREEFORM_TOOL_INPUT_KEY: {
+                "type": "string",
+                "description": "The complete raw text of this freeform tool's input, verbatim.",
+            }
+        },
+        "required": [FREEFORM_TOOL_INPUT_KEY],
+    }
+
+
+# Responses 里「参数是自由文本」的工具声明类型。OpenAI 给 custom 工具的流式事件
+# 与输出项都是 `custom_tool_call*` 这一族；local_shell / shell 同属「没有 function
+# 包装」的工具，回放时同样不能当成未知 JSON 丢给模型（见 responses_compat）。
+_FREEFORM_TOOL_DECL_TYPES = frozenset({"custom"})
+
+
 def format_tools_system_prompt(
     tools: List[dict],
     *,
@@ -303,6 +336,15 @@ def format_tools_system_prompt(
             name = t.get("name", "")
             desc = (t.get("description", "") or "").strip().split("\n")[0][:200]
             schema = t.get("input_schema", {}) or t.get("parameters", {}) or {}
+            # [TOOL-LOOP] Responses 的 custom / freeform 声明（`{"type":"custom",
+            # "name":"apply_patch"}`）**没有 schema**，原先落到这里就是一个空
+            # `{}`，模型被告知「这个工具不接受任何参数」。它于是要么不调用它，要么
+            # 把整段补丁写进 `arguments` 字符串——而 `apply_patch` 需要的正是那段
+            # 原文。合成 schema 让「怎么传原文」变成显式契约，而不是靠模型猜。
+            if not schema and t.get("type") in _FREEFORM_TOOL_DECL_TYPES:
+                schema = freeform_tool_input_schema()
+                if not desc:
+                    desc = "Freeform tool: pass its complete raw input text in the `input` field."
 
         schema_json = _render_schema_json(schema)
         if budget_exhausted or schema_budget_used + len(schema_json) > _TOOL_SCHEMA_TOTAL_BUDGET:

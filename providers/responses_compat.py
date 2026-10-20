@@ -40,7 +40,12 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict
 
-from .anthropic_compat import format_response_format_prompt, format_tools_system_prompt
+from .anthropic_compat import (
+    FREEFORM_TOOL_INPUT_KEY,
+    _FREEFORM_TOOL_DECL_TYPES,
+    format_response_format_prompt,
+    format_tools_system_prompt,
+)
 from .base import _est_tokens, _id, error_response
 
 
@@ -277,6 +282,44 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                         payload["id"] = c_id
                     call_text = f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
                     messages.append({"role": "assistant", "content": call_text})
+                elif item_type in ("custom_tool_call", "local_shell_call", "shell_call"):
+                    # [TOOL-LOOP] Codex CLI 的 `apply_patch` 等 freeform 工具回放的是
+                    # `custom_tool_call`，参数是**纯文本** `input`（不是 JSON
+                    # `arguments`）。原先这一支没有分支，落进最后的兜底，被序列化成
+                    # 一段原始 JSON 当成 **user 输入**：模型看到自己从未写过的补丁
+                    # JSON，既认不出这是自己的调用，也接不上随后的执行结果。
+                    # 现在按网关契约回放成 ```tool_call + {"input": "<原文>"}，与
+                    # 提示词里为 freeform 合成的 schema 严格一致。
+                    name = item.get("name") or item.get("action", {}).get("type") or ""
+                    if not name and item_type in ("local_shell_call", "shell_call"):
+                        name = "local_shell"
+                    raw_input = item.get("input")
+                    if raw_input is None and isinstance(item.get("action"), dict):
+                        raw_input = item["action"]
+                    if isinstance(raw_input, str):
+                        args_obj: dict = {FREEFORM_TOOL_INPUT_KEY: raw_input}
+                    elif isinstance(raw_input, dict):
+                        args_obj = raw_input
+                    elif raw_input is None:
+                        args_obj = {}
+                    else:
+                        args_obj = {FREEFORM_TOOL_INPUT_KEY: json.dumps(raw_input, ensure_ascii=False)}
+                    payload: dict[str, Any] = {"name": name, "arguments": args_obj}
+                    c_id = item.get("call_id") or item.get("id")
+                    if c_id:
+                        payload["id"] = c_id
+                    messages.append({
+                        "role": "assistant",
+                        "content": f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```",
+                    })
+                elif item_type in ("custom_tool_call_output", "local_shell_call_output"):
+                    # freeform 调用的执行结果：`output` 同样可以是字符串或结构。
+                    c_id = item.get("call_id", "")
+                    out = item.get("output", "")
+                    if isinstance(out, (dict, list)):
+                        out = json.dumps(out, ensure_ascii=False)
+                    tag = f"[Tool Result for {c_id}]" if c_id else "[Tool Result]"
+                    messages.append({"role": "user", "content": f"{tag}:\n{out}"})
                 elif item_type == "function_call_output":
                     c_id = item.get("call_id", "")
                     out = item.get("output", "")
@@ -377,6 +420,92 @@ def function_call_item(
     }
 
 
+# [TOOL-LOOP] Responsese 的 custom / freeform 工具族（Codex CLI 的 `apply_patch`
+# 是其中最常用的一个）。它们的输出项 `type` 是 `custom_tool_call`、参数是**一段
+# 自由文本** `input`，而不是 `function_call` + JSON `arguments`。网关若把两者一并
+# 当成 `function_call` 回传，客户端按 `type` 分派时找不到自己声明的工具，本轮调用
+# 被静默丢弃——这正是「Codex 接上网关后不会改文件」的形态。
+_CUSTOM_TOOL_ITEM_TYPE = "custom_tool_call"
+_CUSTOM_TOOL_OUTPUT_ITEM_TYPE = "custom_tool_call_output"
+
+
+def custom_tool_call_item(
+    call_id: str,
+    name: str,
+    tool_input: str = "",
+    *,
+    status: str = "completed",
+) -> dict:
+    """构造 `custom_tool_call` 输出项（freeform 工具的唯一正确出口形状）。"""
+    return {
+        "id": call_id,
+        "type": _CUSTOM_TOOL_ITEM_TYPE,
+        "call_id": call_id,
+        "name": name,
+        "input": tool_input,
+        "status": status,
+    }
+
+
+def freeform_tool_names(tools: Any) -> set:
+    """客户端声明的 freeform（custom）工具名集合。
+
+    只认 `{"type": "custom", "name": ...}` —— 这是 Responses 的 freeform 声明形状。
+    `local_shell` / `shell` 也走自由文本出口（OpenAI 的 `local_shell_call` 项同样
+    不是 `function_call`），但它们没有客户端声明的 `name`，由调用方按 `type` 单独处理。
+    """
+    names: set = set()
+    if not isinstance(tools, list):
+        return names
+    for t in tools:
+        if not isinstance(t, dict):
+            continue
+        if t.get("type") in _FREEFORM_TOOL_DECL_TYPES:
+            name = t.get("name")
+            if isinstance(name, str) and name.strip():
+                names.add(name.strip())
+    return names
+
+
+def custom_tool_input_text(args: Any) -> str:
+    """把网关契约里的参数对象还原成 freeform 工具的原始文本。
+
+    [TOOL-LOOP] 约定是 `{"input": "<原文>"}`（见 `freeform_tool_input_schema`）。
+    模型偶尔会把原文直接写成字符串参数，`_normalize_tool_args` 会折成同样的
+    `{"input": ...}`；再偶尔会把补丁本身写成一个整串 arguments。三种形状都要
+    还原成原文，而不是把一段 JSON 包在字符串里发给客户端（`apply_patch` 收到
+    带引号和 `\\n` 的包装文本会直接解析失败）。
+    """
+    if isinstance(args, str):
+        # [TOOL-LOOP] 非流式路径上 `arguments` 是 JSON 字符串（`{"input": "..."}`），
+        # 直接原样返回会把一段带引号和 `\n` 转义的包装文本交给 apply_patch，它解析
+        # 失败后整轮改动丢失。能解析成对象就按对象契约解包；裸补丁本身不是合法
+        # JSON，解析失败时才是真正的「原文整串」。
+        stripped = args.strip()
+        if stripped.startswith("{"):
+            try:
+                parsed = json.loads(stripped)
+            except (ValueError, TypeError):
+                parsed = None
+            if isinstance(parsed, dict):
+                return custom_tool_input_text(parsed)
+        return args
+    if isinstance(args, dict):
+        if FREEFORM_TOOL_INPUT_KEY in args:
+            val = args[FREEFORM_TOOL_INPUT_KEY]
+            if isinstance(val, str):
+                return val
+            return json.dumps(val, ensure_ascii=False) if val is not None else ""
+        if len(args) == 1:
+            only = next(iter(args.values()))
+            if isinstance(only, str):
+                return only
+        return json.dumps(args, ensure_ascii=False)
+    if args is None:
+        return ""
+    return str(args)
+
+
 def format_responses_completion(
     resp_id: str,
     model: str,
@@ -392,8 +521,13 @@ def format_responses_completion(
     reasoning_text: str = "",
     reasoning_id: Optional[str] = None,
     reasoning_tokens: int = 0,
+    freeform_tools: Optional[set] = None,
 ) -> dict:
-    """构造标准的 Responses API JSON 对象。"""
+    """构造标准的 Responses API JSON 对象。
+
+    `freeform_tools` 是客户端声明的 custom（freeform）工具名集合：命中它们的调用
+    必须以 `custom_tool_call` 输出（参数是纯文本 `input`），而不是 `function_call`。
+    """
     created = created_at or int(time.time())
     m_id = msg_id or _id("msg", "_")
 
@@ -409,6 +543,13 @@ def format_responses_completion(
             fn = tc.get("function", {}) if isinstance(tc.get("function"), dict) else {}
             fn_name = tc.get("name") or fn.get("name", "")
             fn_args = tc.get("arguments") if "arguments" in tc else fn.get("arguments", "")
+            # [TOOL-LOOP] freeform 工具走 `custom_tool_call`：客户端按 `type` 分派，
+            # 把 apply_patch 报成 function_call 会让它找不到工具、静默丢弃本轮调用。
+            if freeform_tools and fn_name in freeform_tools:
+                output_items.append(
+                    custom_tool_call_item(c_id, fn_name, custom_tool_input_text(fn_args))
+                )
+                continue
             if isinstance(fn_args, (dict, list)):
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             elif fn_args is None:
@@ -604,6 +745,39 @@ class ResponsesEventStream:
                 "output_index": output_index,
                 "call_id": call_id,
                 "arguments": arguments,
+            },
+        )
+
+    # -- freeform 工具族（custom_tool_call）----------------------------------
+    def custom_tool_call_input_delta(
+        self, item_id: str, output_index: int, delta: str, call_id: str = ""
+    ) -> str:
+        """`custom_tool_call_input.delta`：freeform 工具的原文增量。
+
+        [TOOL-LOOP] freeform 工具没有 JSON arguments，它的事件名与 `function_call`
+        完全不同。把 apply_patch 的补丁当成 `function_call_arguments.delta` 发出去，
+        客户端会尝试按 JSON 增量解析一段补丁文本并失败，本轮调用丢失。
+        """
+        return self._frame(
+            "response.custom_tool_call_input.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "delta": delta,
+            },
+        )
+
+    def custom_tool_call_input_done(
+        self, item_id: str, output_index: int, tool_input: str, call_id: str = ""
+    ) -> str:
+        return self._frame(
+            "response.custom_tool_call_input.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "input": tool_input,
             },
         )
 
