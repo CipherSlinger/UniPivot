@@ -462,6 +462,99 @@ def test_codex_reasoning_object_enables_thinking():
     print("test_codex_reasoning_object_enables_thinking: PASSED")
 
 
+def test_parallel_tool_calls_false_caps_to_one_everywhere():
+    """客户端声明禁止并行调用时，三个协议都只能回传**一个**工具调用。
+
+    实测修复前：`parallel_tool_calls:false`（OpenAI / Responses）与
+    `tool_choice.disable_parallel_tool_use:true`（Anthropic）完全被忽略，
+    上游回两个 ```tool_call 块就原样回传两个。对无法并行执行或无法合并结果
+    的 agent 客户端，第二个调用是一次它没预期、也不会执行的调用，
+    tool 配对就此错位。这里同时钉住「提示词说出了约束」与「解析端执行了约束」。
+    """
+    two_calls = [
+        ('```tool_call\n{"name": "Read", "arguments": {"file_path": "a"}}\n```\n'
+         '```tool_call\n{"name": "Read", "arguments": {"file_path": "b"}}\n```', {}),
+        ("", {"conversation_id": "c"}),
+    ]
+
+    def _openai():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "x"}],
+                      "tools": TOOLS_OPENAI, "parallel_tool_calls": False},
+            ).json()
+
+        captured = _with_provider(two_calls, post)
+        assert "Do NOT emit more than one tool call" in flatten_messages(captured), (
+            f"禁止并行的约束没有进入提示词:\n{flatten_messages(captured)}"
+        )
+        calls = box["data"]["choices"][0]["message"].get("tool_calls") or []
+        assert len(calls) == 1, f"parallel_tool_calls=false 仍回传 {len(calls)} 个调用: {calls}"
+        assert calls[0]["function"]["arguments"] == '{"file_path": "a"}', "应保留第一个调用"
+
+    def _anthropic():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/messages",
+                json={"model": "claude-3-7-sonnet", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "x"}],
+                      "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                      "tool_choice": {"type": "auto", "disable_parallel_tool_use": True}},
+            ).json()
+
+        captured = _with_provider(two_calls, post)
+        assert "Do NOT emit more than one tool call" in "\n".join(
+            str(m.get("content", "")) for m in captured
+        ), "Anthropic 的 disable_parallel_tool_use 没有进入提示词"
+        uses = [b for b in box["data"]["content"] if b["type"] == "tool_use"]
+        assert len(uses) == 1, f"disable_parallel_tool_use 仍回传 {len(uses)} 个 tool_use"
+
+    def _responses():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/responses",
+                json={"model": "gpt-4o", "input": "x", "tools": TOOLS_OPENAI,
+                      "parallel_tool_calls": False},
+            ).json()
+
+        captured = _with_provider(two_calls, post)
+        prompt = "\n".join(str(m.get("content", "")) for m in captured)
+        assert "Do NOT emit more than one tool call" in prompt, (
+            f"Responses 的 parallel_tool_calls=false 没有进入提示词:\n{prompt}"
+        )
+        calls = [i for i in box["data"]["output"] if i["type"] == "function_call"]
+        assert len(calls) == 1, f"parallel_tool_calls=false 仍回传 {len(calls)} 个调用"
+
+    for fn in (_openai, _anthropic, _responses):
+        fn()
+
+    # 未声明时行为逐值不变（失败开放，零回归）
+    box: dict = {}
+
+    def post_default():
+        box["data"] = _client().post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "x"}],
+                  "tools": TOOLS_OPENAI},
+        ).json()
+
+    captured = _with_provider(two_calls, post_default)
+    assert "Do NOT emit more than one tool call" not in flatten_messages(captured), (
+        "未声明禁止并行时不应注入该约束"
+    )
+    assert len(box["data"]["choices"][0]["message"].get("tool_calls") or []) == 2, (
+        "默认必须允许并行调用"
+    )
+    print("test_parallel_tool_calls_false_caps_to_one_everywhere: PASSED")
+
+
 def test_undeclared_tool_is_not_returned_as_tool_call():
     """模型臆造的工具名不得变成客户端无法执行的 tool_calls。"""
     script = [
@@ -503,6 +596,7 @@ def run_all():
         test_tool_choice_named_tool_filters_other_tools,
         test_reasoning_replay_is_not_a_user_message,
         test_codex_reasoning_object_enables_thinking,
+        test_parallel_tool_calls_false_caps_to_one_everywhere,
         test_undeclared_tool_is_not_returned_as_tool_call,
     ]
     for fn in tests:

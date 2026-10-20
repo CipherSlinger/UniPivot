@@ -263,7 +263,12 @@ def _tool_choice_directive(tool_choice: Any) -> str:
     return ""
 
 
-def format_tools_system_prompt(tools: List[dict], *, tool_choice: Any = None) -> str:
+def format_tools_system_prompt(
+    tools: List[dict],
+    *,
+    tool_choice: Any = None,
+    parallel_allowed: Any = None,
+) -> str:
     """将 tools 声明（支持 Anthropic 规范与 OpenAI 函数规范）转换为供大模型理解的工具使用说明。
 
     [TOOL-SCHEMA] 每个工具以紧凑 JSON 渲染完整输入 schema（嵌套对象、数组、enum、
@@ -330,6 +335,16 @@ def format_tools_system_prompt(tools: List[dict], *, tool_choice: Any = None) ->
     directive = _tool_choice_directive(tool_choice)
     if directive:
         lines.append(f"\n## Tool Choice Constraint\n{directive}")
+
+    # [TOOL-LOOP] 客户端明确禁止并行调用时，提示词里必须**说出**这条约束。
+    # 解析端仍会裁剪（`cap_parallel_tool_calls`），但先让模型少写一个被丢掉的
+    # 调用，比让它写完再被裁掉更省 token，也更少误伤。
+    if parallel_allowed is False:
+        lines.append(
+            "\n## Parallel Tool Calls\n"
+            "Do NOT emit more than one tool call in a turn. Call one tool, stop, "
+            "and wait for its result before calling the next one."
+        )
 
     return "\n".join(lines)
 
@@ -670,6 +685,7 @@ def convert_anthropic_to_gateway_messages(
     system: Optional[Union[str, List[dict]]] = None,
     tools: Optional[List[dict]] = None,
     tool_choice: Any = None,
+    parallel_allowed: Optional[bool] = None,
 ) -> List[dict]:
     """将 Anthropic messages 与顶层 system 提示转为标准网关 messages 列表。"""
     sys_parts: list[str] = []
@@ -679,7 +695,9 @@ def convert_anthropic_to_gateway_messages(
             sys_parts.append(sys_text.strip())
 
     if tools:
-        tools_prompt = format_tools_system_prompt(tools, tool_choice=tool_choice)
+        tools_prompt = format_tools_system_prompt(
+            tools, tool_choice=tool_choice, parallel_allowed=parallel_allowed
+        )
         if tools_prompt:
             sys_parts.append(tools_prompt)
 

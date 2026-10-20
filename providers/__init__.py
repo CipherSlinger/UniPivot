@@ -134,6 +134,8 @@ from .risk_ledger import (
 from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
+    cap_parallel_tool_calls,
+    parallel_calls_disallowed,
     parse_tool_calls_with_healing,
     resolve_allowed_tools,
     tool_names_of,
@@ -240,6 +242,8 @@ __all__ = [
     "StreamAction",
     "parse_tool_calls_with_healing",
     "resolve_allowed_tools",
+    "parallel_calls_disallowed",
+    "cap_parallel_tool_calls",
     "tool_names_of",
     "SessionAffinityManager",
     "AffinityDecision",

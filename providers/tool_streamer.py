@@ -108,6 +108,41 @@ def resolve_allowed_tools(tools: Any, tool_choice: Any = None) -> Optional[set]:
     return names
 
 
+def parallel_calls_disallowed(
+    parallel_tool_calls: Any = None,
+    tool_choice: Any = None,
+) -> bool:
+    """判断客户端是否**禁止**本回合返回多个并行工具调用。
+
+    [TOOL-LOOP] 与 `tool_choice` 同属「客户端约束被静默丢弃」的缺陷类：三个协议
+    都允许客户端声明禁止并行调用（OpenAI/Responses 的 `parallel_tool_calls:false`、
+    Anthropic 的 `tool_choice.disable_parallel_tool_use:true`），而网关此前完全不看
+    这个字段——实测上游回两个 ```tool_call 块时，三个协议都原样回传两个调用。
+    对无法并行执行/无法合并结果的 agent 客户端，第二个调用是一次它没有预期、
+    也不会执行的调用，整个回合的 tool 配对就此错位。
+
+    语义与 `resolve_allowed_tools` 对齐：只有**明确声明**禁止时才收紧；未知形状
+    或未声明一律按允许处理（失败开放，零回归）。
+    """
+    if parallel_tool_calls is False:
+        return True
+    if isinstance(tool_choice, dict) and tool_choice.get("disable_parallel_tool_use") is True:
+        return True
+    return False
+
+
+def cap_parallel_tool_calls(tool_list: Optional[List[Tuple[str, dict]]], disallowed: bool):
+    """客户端禁止并行调用时，只保留**第一个**调用，其余丢弃。
+
+    保留第一个而不是全部丢弃：第一个调用是模型当前最想做的事，客户端执行完它
+    之后发起的下一轮请求会把剩余工作继续推进；而丢弃全部只会得到一个「什么都没
+    发生」的空回合。
+    """
+    if disallowed and tool_list and len(tool_list) > 1:
+        return tool_list[:1]
+    return tool_list
+
+
 def parse_tool_calls_with_healing(
     text: str,
     allowed: Optional[set] = None,

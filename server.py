@@ -74,6 +74,8 @@ from providers import (
     parse_tool_call,
     parse_tool_calls,
     parse_tool_calls_with_healing,
+    cap_parallel_tool_calls,
+    parallel_calls_disallowed,
     resolve_allowed_tools,
     SpeculativeToolStreamer,
     sse_content_block_delta,
@@ -518,6 +520,8 @@ class ChatCompletionRequest(BaseModel):
     stream_options: Optional[dict] = None
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
+    # [TOOL-LOOP] 显式声明而非依赖 extra=allow：客户端禁止并行调用时解析端要据此裁剪
+    parallel_tool_calls: Optional[bool] = None
     # 网页端专属能力，经 extra_body 传入
     thinking: bool = False
     search: bool = False
@@ -1804,8 +1808,14 @@ async def chat_completions(req: ChatCompletionRequest):
         )
 
     messages = [m.model_dump() for m in req.messages]
+    # [TOOL-LOOP] 客户端「禁止并行调用」的声明既要进提示词，也要在解析端执行
+    parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
     if req.tools:
-        tools_prompt = format_tools_system_prompt(req.tools, tool_choice=req.tool_choice)
+        tools_prompt = format_tools_system_prompt(
+            req.tools,
+            tool_choice=req.tool_choice,
+            parallel_allowed=not parallel_disallowed,
+        )
         if tools_prompt:
             if messages and messages[0].get("role") == "system":
                 orig = messages[0].get("content") or ""
@@ -2108,6 +2118,8 @@ async def chat_completions(req: ChatCompletionRequest):
                             first_frame_emitted = True
 
                 rem_text, tool_list, was_healed = streamer.finalize()
+                # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
+                tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
                 if rem_text:
                     chunk = {
                         "id": cid,
@@ -2383,6 +2395,8 @@ async def chat_completions(req: ChatCompletionRequest):
         )
         if parsed:
             prefix, tool_list = parsed
+            # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
+            tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
             if was_healed:
                 _tool_healing_stats["healed_tool_calls"] += 1
@@ -2443,8 +2457,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             status_code=404,
         )
 
+    parallel_disallowed = parallel_calls_disallowed(None, req.tool_choice)
     gateway_messages = convert_anthropic_to_gateway_messages(
-        req.messages, system=req.system, tools=req.tools, tool_choice=req.tool_choice
+        req.messages,
+        system=req.system,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_allowed=not parallel_disallowed,
     )
     # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
     gateway_messages, fold_meta = prompt_optimizer.optimize_chat_messages(gateway_messages)
@@ -2695,6 +2714,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": act.content})
 
                 rem_text, tool_list, was_healed = streamer.finalize()
+                # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
+                tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
                 if in_thinking_block:
                     yield sse_content_block_stop(block_idx)
                     in_thinking_block = False
@@ -2932,6 +2953,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         )
         if parsed:
             prefix, tool_list = parsed
+            # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
+            tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
             if was_healed:
                 _tool_healing_stats["healed_tool_calls"] += 1
@@ -3003,6 +3026,7 @@ async def count_tokens(req: AnthropicCountTokensRequest):
 @app.post("/v1/responses")
 @app.post("/responses")
 async def responses_endpoint(req: ResponsesRequest):
+    parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
     gateway_messages = convert_responses_to_gateway_messages(req)
     if not gateway_messages:
         return JSONResponse(
@@ -3327,6 +3351,8 @@ async def responses_endpoint(req: ResponsesRequest):
                             yield ev.output_text_delta(text_item_id, act.content, out_idx, 0)
 
                 rem_text, tool_list, was_healed = streamer.finalize()
+                # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
+                tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
                 if rem_text:
                     if in_reasoning:
                         async for frame in _close_reasoning():
@@ -3510,6 +3536,8 @@ async def responses_endpoint(req: ResponsesRequest):
         )
     if parsed_res:
         prefix, tool_list = parsed_res
+        # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
+        tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
         _tool_healing_stats["total_tool_calls"] += len(tool_list)
         if was_healed:
             _tool_healing_stats["healed_tool_calls"] += 1

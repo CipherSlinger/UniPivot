@@ -174,7 +174,11 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                 system_parts.append(ins)
 
     if req.tools:
-        tools_prompt = format_tools_system_prompt(req.tools, tool_choice=req.tool_choice)
+        tools_prompt = format_tools_system_prompt(
+            req.tools,
+            tool_choice=req.tool_choice,
+            parallel_allowed=req.parallel_tool_calls is not False,
+        )
         if tools_prompt:
             system_parts.append(tools_prompt)
 
