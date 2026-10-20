@@ -35,6 +35,18 @@ from ..device_identity import stable_device_id
 BASE = "https://chat2.qianwen.com"
 CHAT_ENDPOINT = "/api/v2/chat"
 
+
+def _auto_refresh_on_waf_enabled() -> bool:
+    """[STREAM-AUDIT] WAF 命中后是否允许网关自己发起一次登录刷新。
+
+    默认关闭，因为被拦截之后再发一次凭证请求，正是反爬系统打分的
+    「自动化凭证尝试」特征；重新登录需要人工完成滑块，应当由操作员执行
+    `.venv/bin/python login.py qwen`，而不是由请求路径自动触发。
+    """
+    import os
+
+    return os.getenv("GATEWAY_QWEN_WAF_AUTOREFRESH", "0").strip() == "1"
+
 # 国内版网页端当前模型
 SUPPORTED_MODELS = {
     "Qwen",            # Qwen3.7-千问（默认）
@@ -326,8 +338,12 @@ class QwenProvider:
                                 break
 
                 if waf_detected:
-                    if attempt == 0:
-                        # 尝试静默刷新一次安全 Cookie 并重试
+                    if attempt == 0 and _auto_refresh_on_waf_enabled():
+                        # [STREAM-AUDIT] 默认**关闭**：在被 WAF 拦截之后立刻发起一次
+                        # 新的登录/刷新请求，正是「自动化凭证尝试」的特征签名，会把
+                        # 一次可恢复的人机验证升级成账号级风控。重新登录是**人工**
+                        # 动作（完成滑块），不是网关在请求路径里自己重试的动作。
+                        # 保留开关只为确知自己需要它的部署（GATEWAY_QWEN_WAF_AUTOREFRESH=1）。
                         try:
                             import asyncio
                             from login import refresh_qwen

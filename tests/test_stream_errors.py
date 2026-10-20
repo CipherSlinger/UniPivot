@@ -14,6 +14,10 @@
 本套件用 `httpx.MockTransport` 完整离线地断言：错误响应体在流关闭**之前**被读出、
 原始状态码与 err_type 在 401/403/429 上被如实保留、5xx 仍是 502。
 
+另有一条**策略**用例：被 WAF 拦截之后不得由请求路径自动发起登录刷新。
+「拦截 → 立刻换凭证重试」正是反爬系统打分的自动化凭证签名，会把一次可恢复的
+人机验证升级成账号级风控；重新登录是人工动作（完成滑块），默认不自动重试。
+
 运行: .venv/bin/python tests/test_stream_errors.py
 """
 
@@ -190,6 +194,49 @@ def test_error_body_is_read_inside_the_stream_context():
     print("test_error_body_is_read_inside_the_stream_context: PASSED")
 
 
+# ------------------------------------------------ 策略：WAF 之后不得自动重试
+
+
+def test_qwen_waf_does_not_auto_refresh_by_default():
+    """被 WAF 拦截之后立刻再发一次凭证请求 = 「自动化凭证尝试」签名。
+
+    默认必须不重试：只发一次上游请求，然后带着 429/rate_limit 抛错，由避让线
+    接管（冷却 + 长避让 + 人工重新登录）。
+    """
+    import providers.qwen_provider as m
+
+    calls: list[str] = []
+
+    def handler(request):
+        calls.append(str(request.url))
+        body = (
+            'data: {"ret":["FAIL_SYS_USER_VALIDATE::RGV587_ERROR::SM"],'
+            '"data":{"status":"streaming","messages":[{"content":""}]}}'
+        )
+        return httpx.Response(200, content=(body + "\n\n").encode())
+
+    import login as _login
+
+    refreshed: list[int] = []
+
+    def _fake_refresh(timeout=25):
+        refreshed.append(1)
+        return None
+
+    orig = _login.refresh_qwen
+    _login.refresh_qwen = _fake_refresh
+    try:
+        with _mock(m, handler):
+            err = _error_for(QwenProvider("ticket", timeout=10), "rate_limit_error")
+    finally:
+        _login.refresh_qwen = orig
+
+    assert not refreshed, "默认配置下仍自动发起了登录刷新（会加深风控）"
+    assert len(calls) == 1, f"WAF 之后仍重试了上游请求: {len(calls)} 次"
+    assert "login.py qwen" in err.message, "错误信息必须告诉操作员要人工完成人机校验"
+    print("test_qwen_waf_does_not_auto_refresh_by_default: PASSED")
+
+
 def run_all():
     tests = [
         test_qwen_waf_403_keeps_status_and_body,
@@ -200,6 +247,7 @@ def run_all():
         test_deepseek_auth_401_keeps_status,
         test_deepseek_5xx_stays_generic_502,
         test_error_body_is_read_inside_the_stream_context,
+        test_qwen_waf_does_not_auto_refresh_by_default,
     ]
     for fn in tests:
         fn()
