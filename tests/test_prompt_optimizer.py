@@ -20,6 +20,7 @@ from providers.prompt_optimizer import (
     DEFAULT_MAX_TOKENS,
     FOLDED_TOOL_RESULT_TEMPLATE,
     SUMMARY_MARKER,
+    SUMMARY_MARKER_PREFIX,
     PromptOptimizer,
     compute_prompt_hash,
     estimate_history_tokens,
@@ -122,7 +123,7 @@ class TestPromptOptimizer(unittest.TestCase):
         self.assertTrue(meta["applied"])
         self.assertEqual(meta["phase"], 2)
         self.assertGreater(meta["saved_tokens"], 0)
-        has_summary = any(SUMMARY_MARKER in str(m.get("content")) for m in optimized)
+        has_summary = any(SUMMARY_MARKER_PREFIX in str(m.get("content")) for m in optimized)
         self.assertTrue(has_summary)
 
     def test_prompt_optimizer_empty_and_disabled(self):
@@ -221,7 +222,7 @@ class TestPromptOptimizer(unittest.TestCase):
         self.assertEqual(folded[1]["content"], "First instruction from user")
 
         # 验证出现了统一的折叠摘要标记
-        has_summary = any(SUMMARY_MARKER in str(m.get("content")) for m in folded)
+        has_summary = any(SUMMARY_MARKER_PREFIX in str(m.get("content")) for m in folded)
         self.assertTrue(has_summary, "极端超载对话应当插入紧凑摘要标记")
 
         # 验证尾部保留

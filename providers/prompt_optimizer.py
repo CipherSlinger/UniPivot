@@ -25,8 +25,35 @@ DEFAULT_PRESERVE_RECENT_TURNS = 4
 OVERSIZED_TOOL_RESULT_CHARS = 300
 OVERSIZED_CODE_BLOCK_CHARS = 400
 
-SUMMARY_MARKER = "[前序对话历史已由网关自适应折叠，保留核心结论与上下文]"
-FOLDED_TOOL_RESULT_TEMPLATE = "[已折叠历史执行结果: 原 {orig_len} 字符, 状态正常]"
+# [TOOL-LOOP] 阶段二把中间轮次**整段丢弃**，只剩这一个标记。原文案写的是「保留核心
+# 结论与上下文」——事实上什么都没保留：模型会以为自己继承了前文的结论，于是直接
+# 基于一个空洞的前文继续推理，甚至引用根本不存在的约定。标记必须如实说明「省略了
+# 多少条」，模型才知道该回去重读而不是假装记得。
+SUMMARY_MARKER_PREFIX = "[前序对话历史已由网关截断以适配上下文窗口"
+SUMMARY_MARKER_TEMPLATE = (
+    SUMMARY_MARKER_PREFIX
+    + "：中间 {omitted} 条消息未保留。如需其中的细节，请重新读取或直接询问。]"
+)
+SUMMARY_MARKER = SUMMARY_MARKER_TEMPLATE.format(omitted="N")
+
+# [TOOL-LOOP] 折叠标记必须**如实**描述被折叠的内容，否则折叠本身就是一次上下文投毒：
+# - 成功与失败用不同模板。原实现无条件写「状态正常」，把一次真实的工具失败改写成
+#   「执行正常」，模型据此认为命令成功了，于是不再重试、直接基于错误的结论继续。
+# - 代码块用中性模板。原实现把正文里任何一个超长围栏都标成「历史执行结果」，
+#   于是一条用户消息（或 assistant 的普通代码回答）被重新贴上了「工具输出」的标签，
+#   说话人语义被改写。
+# 三条模板都保留「已折叠历史执行结果 / 已折叠历史代码块」前缀，既有断言不受影响。
+FOLDED_TOOL_RESULT_TEMPLATE = "[已折叠历史执行结果: 原 {orig_len} 字符, 执行成功]"
+FOLDED_TOOL_ERROR_TEMPLATE = "[已折叠历史执行结果: 原 {orig_len} 字符, 执行失败(错误内容已折叠)]"
+# OpenAI 的 `role:"tool"` 消息**不带**成功/失败信号（协议里没有这个字段）。既然读不
+# 出来，就不能猜：写「成功」会让模型放弃一个其实失败了的重试，写「失败」会让它去
+# 重跑一条其实已经成功的命令。中性陈述事实是唯一不投毒的选择。
+FOLDED_TOOL_RESULT_UNKNOWN_TEMPLATE = "[已折叠历史执行结果: 原 {orig_len} 字符, 内容已省略]"
+FOLDED_CODE_BLOCK_TEMPLATE = "[已折叠历史代码块: 原 {orig_len} 字符]"
+
+# 这些围栏承载的是**调用本身**而不是内容：折叠成一句散文，模型看到的将是一个
+# 没有参数的残缺调用，工具循环当场断掉。永远不折叠。
+_PROTECTED_FENCE_LANGS = frozenset({"tool_call", "tool_calls", "function_call", "tool_use"})
 
 # 匹配 Anthropic 风格或文本中的工具执行结果标签
 _TOOL_RESULT_RE = re.compile(
@@ -112,8 +139,27 @@ def _has_tool_call(msg: Dict[str, Any]) -> bool:
     return False
 
 
-def _fold_text_content(text: str) -> Tuple[str, bool]:
-    """折叠文本内容中超长的工具结果标签与超长代码块。"""
+def _is_error_result_text(text: str) -> bool:
+    """文本是否**声明自己**是一次失败的工具执行。
+
+    只认开头的 `[Tool Error ...]` 标签（网关自己回放历史时写的就是这个格式，
+    见 anthropic_compat / responses_compat）。正文里偶然出现该字样不算——把一次
+    成功的输出误标成失败，与把失败标成成功是同一类投毒，只是方向相反。
+    """
+    return text.lstrip().startswith("[Tool Error")
+
+
+def _fence_lang(prefix: str) -> str:
+    """从围栏起始行 ```` ```lang\n ```` 中取出语言标记。"""
+    return prefix.strip().lstrip("`").strip().lower()
+
+
+def _fold_text_content(text: str, fold_code_blocks: bool = True) -> Tuple[str, bool]:
+    """折叠文本内容中超长的工具结果标签与超长代码块。
+
+    `fold_code_blocks=False` 时只折叠**自带标签**的 `[Tool Result]` / `[Tool Error]`
+    段，不碰裸代码块——见 `fold_single_message` 分支 3 的说明。
+    """
     if not text or len(text) < OVERSIZED_TOOL_RESULT_CHARS:
         return text, False
 
@@ -126,11 +172,19 @@ def _fold_text_content(text: str) -> Tuple[str, bool]:
         body = match.group(2)
         if len(body.strip()) > OVERSIZED_TOOL_RESULT_CHARS:
             folded = True
-            marker = FOLDED_TOOL_RESULT_TEMPLATE.format(orig_len=len(body))
-            return f"{prefix}{marker}"
+            # [TOOL-LOOP] 失败结果绝不能折叠成「执行成功」：模型会据此放弃重试。
+            template = (
+                FOLDED_TOOL_ERROR_TEMPLATE
+                if _is_error_result_text(prefix)
+                else FOLDED_TOOL_RESULT_TEMPLATE
+            )
+            return f"{prefix}{template.format(orig_len=len(body))}"
         return match.group(0)
 
     new_text = _TOOL_RESULT_RE.sub(_replace_tool_result, text)
+
+    if not fold_code_blocks:
+        return new_text, folded
 
     # 2. 折叠长代码块 ```... \n <code> \n ```
     def _replace_code_block(match: re.Match) -> str:
@@ -138,10 +192,15 @@ def _fold_text_content(text: str) -> Tuple[str, bool]:
         prefix = match.group(1)
         body = match.group(2)
         suffix = match.group(3)
+        # [TOOL-LOOP] ```tool_call / ```function_call 等围栏里装的是**调用本身**。
+        # 折叠成一句散文后，模型读到的是一个没有参数的残缺调用，工具循环当场断裂。
+        if _fence_lang(prefix) in _PROTECTED_FENCE_LANGS:
+            return match.group(0)
         if len(body) > OVERSIZED_CODE_BLOCK_CHARS:
             folded = True
-            marker = FOLDED_TOOL_RESULT_TEMPLATE.format(orig_len=len(body))
-            return f"{prefix}{marker}{suffix}"
+            # 中性标签：代码块可能来自用户，也可能来自 assistant 的普通回答，
+            # 不能一律贴上「历史执行结果」的标签改写说话人语义。
+            return f"{prefix}{FOLDED_CODE_BLOCK_TEMPLATE.format(orig_len=len(body))}{suffix}"
         return match.group(0)
 
     new_text = _CODE_BLOCK_RE.sub(_replace_code_block, new_text)
@@ -158,11 +217,19 @@ def fold_single_message(msg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
     content = msg.get("content")
 
     # 1. OpenAI 规范的 tool 角色消息
+    #    [TOOL-LOOP] 该协议没有成功/失败字段，模板只能中性陈述（见模板注释）。
     if role == "tool":
         text = _extract_text_robust(content)
         if len(text) > OVERSIZED_TOOL_RESULT_CHARS:
+            # 上游可能把结果写成一段内嵌的 `[Tool Error ...]` 文本（多轮回放时如此），
+            # 能读出失败就如实写失败。
+            template = (
+                FOLDED_TOOL_ERROR_TEMPLATE
+                if _is_error_result_text(text)
+                else FOLDED_TOOL_RESULT_UNKNOWN_TEMPLATE
+            )
             new_msg = dict(msg)
-            new_msg["content"] = FOLDED_TOOL_RESULT_TEMPLATE.format(orig_len=len(text))
+            new_msg["content"] = template.format(orig_len=len(text))
             return new_msg, True
         return msg, False
 
@@ -175,8 +242,15 @@ def fold_single_message(msg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
                 sub_content = block.get("content", "")
                 sub_str = _extract_text_robust(sub_content)
                 if len(sub_str) > OVERSIZED_TOOL_RESULT_CHARS:
+                    # [TOOL-LOOP] Anthropic 的 tool_result **有** is_error 字段：
+                    # 能读到就如实写，别把失败改写成成功。
+                    template = (
+                        FOLDED_TOOL_ERROR_TEMPLATE
+                        if block.get("is_error")
+                        else FOLDED_TOOL_RESULT_TEMPLATE
+                    )
                     new_b = dict(block)
-                    new_b["content"] = FOLDED_TOOL_RESULT_TEMPLATE.format(orig_len=len(sub_str))
+                    new_b["content"] = template.format(orig_len=len(sub_str))
                     new_blocks.append(new_b)
                     folded = True
                     continue
@@ -188,8 +262,13 @@ def fold_single_message(msg: Dict[str, Any]) -> Tuple[Dict[str, Any], bool]:
         return msg, False
 
     # 3. 纯字符串文本
+    #    [TOOL-LOOP] 这里是「文本里内嵌了 [Tool Result] 段」的形态（多轮回放时
+    #    assistant/user 消息体里会带着前一次执行的回显）。只折叠这些**自带标签**的
+    #    段；裸代码块不碰——用户消息里那段超长代码是用户自己的输入，assistant 的
+    #    代码回答也是它自己的输出，把任何一方换成「历史执行结果」都是篡改说话人
+    #    语义。裸代码块若真的撑爆预算，由阶段二的摘要收敛统一处理。
     if isinstance(content, str):
-        new_text, folded = _fold_text_content(content)
+        new_text, folded = _fold_text_content(content, fold_code_blocks=False)
         if folded:
             new_msg = dict(msg)
             new_msg["content"] = new_text
@@ -397,9 +476,10 @@ class PromptOptimizer:
                 }
 
         # 阶段二: 若折叠超长工具输出后依然超载，收敛压缩中间老旧对话为紧凑摘要提示
+        omitted = len(intermediate_msgs)
         summary_msg: Dict[str, Any] = {
             "role": "user",
-            "content": SUMMARY_MARKER,
+            "content": SUMMARY_MARKER_TEMPLATE.format(omitted=omitted),
         }
 
         phase2_messages = messages[:head_end] + [summary_msg] + messages[tail_start:]
