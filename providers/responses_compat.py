@@ -59,6 +59,10 @@ class ResponsesRequest(BaseModel):
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
     reasoning_effort: Optional[str] = None
+    # [AGENT-LOOP] Codex CLI 发的是 `{"reasoning": {"effort": "high", ...}}` 对象，
+    # 而不是 `reasoning_effort` 字符串。此前只认后者，模型名又恰好落在
+    # `gpt-5-codex` 这样的非推理前缀上，于是「想清楚再动手」的意图被静默丢弃。
+    reasoning: Optional[Union[dict, str]] = None
     thinking: Optional[Union[dict, bool]] = None
 
 
@@ -129,6 +133,28 @@ def extract_responses_content(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _reasoning_item_text(item: dict) -> str:
+    """从 Responses 的 reasoning output item 中取出可回放的思考文本。
+
+    Codex 的 summary 形状是 `[{"type": "summary_text", "text": ...}]`，部分客户端
+    用 `content: [{"type": "reasoning_text", "text": ...}]`；`encrypted_content`
+    是密文，上游无法理解，忽略。
+    """
+    parts: list[str] = []
+    for key in ("summary", "content"):
+        blocks = item.get(key)
+        if isinstance(blocks, str):
+            if blocks.strip():
+                parts.append(blocks)
+        elif isinstance(blocks, list):
+            for b in blocks:
+                if isinstance(b, dict) and isinstance(b.get("text"), str) and b["text"].strip():
+                    parts.append(b["text"])
+                elif isinstance(b, str) and b.strip():
+                    parts.append(b)
+    return "\n".join(parts)
+
+
 def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
     """将 instructions, tools 以及多样化格式的 input 转换为网关底层标准消息列表。"""
     system_parts: list[str] = []
@@ -175,6 +201,24 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                     role = item.get("role", "user")
                     c_text = extract_responses_content(item.get("content"))
                     messages.append({"role": role, "content": c_text})
+                elif item_type == "reasoning":
+                    # [AGENT-LOOP] Codex CLI 会在下一轮把上一轮的**全部** output items
+                    # 原样回放，其中包含 `type:"reasoning"`。此前它落进最后的兜底分支，
+                    # 被 `extract_responses_content` 序列化成一段 JSON 当成 **user 输入**
+                    # 发给上游（实测：user 消息内容为
+                    # `{"type": "reasoning", "id": "rs_1", "summary": [...]}`）——模型
+                    # 看到一段自己不认识的 JSON，上下文被污染且每轮白烧 token。
+                    # 思考回放归入 assistant 的 `<thinking>` 块，空思考直接跳过。
+                    think = _reasoning_item_text(item)
+                    if think.strip():
+                        messages.append({
+                            "role": "assistant",
+                            "content": f"<thinking>\n{think.strip()}\n</thinking>",
+                        })
+                elif item_type in ("item_reference", "compaction"):
+                    # 存储型引用（本网关无 responses 存储，无法解析）与压缩占位：
+                    # 它们**不是内容**，跳过远好于把原始 JSON 当成用户输入。
+                    continue
                 elif item_type == "function_call":
                     name = item.get("name") or (
                         item.get("function", {}).get("name")

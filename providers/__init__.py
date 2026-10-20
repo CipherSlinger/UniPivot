@@ -135,6 +135,7 @@ from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
     parse_tool_calls_with_healing,
+    resolve_allowed_tools,
     tool_names_of,
 )
 from .session_affinity import (
@@ -238,6 +239,7 @@ __all__ = [
     "SpeculativeToolStreamer",
     "StreamAction",
     "parse_tool_calls_with_healing",
+    "resolve_allowed_tools",
     "tool_names_of",
     "SessionAffinityManager",
     "AffinityDecision",

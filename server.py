@@ -74,7 +74,7 @@ from providers import (
     parse_tool_call,
     parse_tool_calls,
     parse_tool_calls_with_healing,
-    tool_names_of,
+    resolve_allowed_tools,
     SpeculativeToolStreamer,
     sse_content_block_delta,
     sse_content_block_start,
@@ -2046,7 +2046,10 @@ async def chat_completions(req: ChatCompletionRequest):
                     chat_args=chat_args,
                 )
 
-                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
+                streamer = SpeculativeToolStreamer(
+                    tools_enabled=True,
+                    allowed=resolve_allowed_tools(req.tools, req.tool_choice),
+                )
                 first_frame_emitted = False
 
                 async for delta, meta in stream:
@@ -2375,7 +2378,9 @@ async def chat_completions(req: ChatCompletionRequest):
         })
 
     if req.tools:
-        parsed, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
+        parsed, was_healed = parse_tool_calls_with_healing(
+            full_output, resolve_allowed_tools(req.tools, req.tool_choice)
+        )
         if parsed:
             prefix, tool_list = parsed
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -2633,7 +2638,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     chat_args=chat_args,
                 )
 
-                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
+                streamer = SpeculativeToolStreamer(
+                    tools_enabled=True,
+                    allowed=resolve_allowed_tools(req.tools, req.tool_choice),
+                )
                 yield sse_message_start(msg_id, req.model, input_tokens)
 
                 block_idx = 0
@@ -2919,7 +2927,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         blocks.append({"type": "thinking", "thinking": full_thinking})
 
     if req.tools:
-        parsed, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
+        parsed, was_healed = parse_tool_calls_with_healing(
+            full_output, resolve_allowed_tools(req.tools, req.tool_choice)
+        )
         if parsed:
             prefix, tool_list = parsed
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -3027,8 +3037,17 @@ async def responses_endpoint(req: ResponsesRequest):
             enable_thinking = req.thinking.get("type") == "enabled"
         else:
             enable_thinking = bool(req.thinking)
-    elif req.reasoning_effort and req.reasoning_effort.lower() in ("high", "medium", "low"):
-        enable_thinking = True
+    else:
+        # [AGENT-LOOP] 线上有两种写法：`reasoning_effort:"high"`（旧版 SDK）与
+        # `reasoning:{"effort":"high"}`（Codex CLI 现行）。只认前者会让 Codex 的
+        # 「想清楚再动手」静默失效——尤其代码类模型（gpt-5-codex）不走推理前缀兜底。
+        effort = req.reasoning_effort
+        if not effort and isinstance(req.reasoning, dict):
+            effort = req.reasoning.get("effort")
+        elif not effort and isinstance(req.reasoning, str):
+            effort = req.reasoning
+        if isinstance(effort, str) and effort.lower() in ("high", "medium", "low", "minimal"):
+            enable_thinking = True
 
     # 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
@@ -3203,7 +3222,8 @@ async def responses_endpoint(req: ResponsesRequest):
                 # 两处各自拼装，于是任何一处改动都会与另一处漂移（这正是本仓库反复
                 # 出现的缺陷类型）。现在由 `feed_chunk(tools_enabled=...)` 统一决定。
                 streamer = SpeculativeToolStreamer(
-                    tools_enabled=bool(req.tools), allowed=tool_names_of(req.tools)
+                    tools_enabled=bool(req.tools),
+                    allowed=resolve_allowed_tools(req.tools, req.tool_choice),
                 )
                 yield ev.created()
                 yield ev.in_progress()
@@ -3485,7 +3505,9 @@ async def responses_endpoint(req: ResponsesRequest):
     parsed_res = None
     was_healed = False
     if req.tools:
-        parsed_res, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
+        parsed_res, was_healed = parse_tool_calls_with_healing(
+            full_output, resolve_allowed_tools(req.tools, req.tool_choice)
+        )
     if parsed_res:
         prefix, tool_list = parsed_res
         _tool_healing_stats["total_tool_calls"] += len(tool_list)

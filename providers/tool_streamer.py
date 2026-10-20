@@ -62,6 +62,52 @@ def tool_names_of(tools: Any) -> Optional[set]:
     return names or None
 
 
+def resolve_allowed_tools(tools: Any, tool_choice: Any = None) -> Optional[set]:
+    """结合 `tool_choice` 计算本回合**允许回传**的工具名集合。
+
+    [TOOL-LOOP] `tool_choice` 原先只被翻译成提示词里的一句话（"Do not call any
+    tool in this turn"），解析端却仍然按「全部声明工具」的白名单放行。于是模型
+    一旦没听指令（网页端模型对约束的遵从度本就不稳定），`tool_choice:"none"` 的
+    请求照样收到一个 `tool_calls` / `tool_use` / `function_call`——客户端按契约
+    根本不会去执行它，整个回合就此报废。实测复现（三个协议同样）：
+    `tool_choice:"none"` + 上游回 ```` ```tool_call ```` → 客户端收到 finish_reason
+    `tool_calls`。约束必须落在**解析**上，提示词只是降低发生概率，不能当作保证。
+
+    返回语义与 `tool_names_of` 对齐：
+      - `None`：不做裁剪（未声明工具，或 tool_choice 形状无法识别——失败开放）
+      - 空集合：本回合不允许任何工具调用（`tool_choice: "none"`）
+      - 非空集合：只接受集合内的名字（点名某个工具时即为该工具）
+    """
+    names = tool_names_of(tools)
+    if names is None:
+        return None
+
+    if tool_choice is None:
+        return names
+
+    if isinstance(tool_choice, str):
+        # "auto" / "required" / "any" / 未知字符串：维持全部声明工具
+        return set() if tool_choice.strip().lower() == "none" else names
+
+    if isinstance(tool_choice, dict):
+        c_type = tool_choice.get("type")
+        if c_type == "none":
+            return set()
+        chosen = None
+        if c_type == "tool":
+            chosen = tool_choice.get("name")
+        elif isinstance(tool_choice.get("function"), dict):
+            # OpenAI: {"type": "function", "function": {"name": ...}}
+            chosen = tool_choice["function"].get("name")
+        if isinstance(chosen, str) and chosen.strip():
+            # 点名的工具若根本没声明（客户端自相矛盾），按无法识别处理：
+            # 收紧白名单只会把一个可用的回合变成空回合，失败开放更安全。
+            chosen = chosen.strip()
+            return {chosen} if chosen in names else names
+
+    return names
+
+
 def parse_tool_calls_with_healing(
     text: str,
     allowed: Optional[set] = None,

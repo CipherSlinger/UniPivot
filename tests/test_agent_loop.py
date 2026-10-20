@@ -336,6 +336,132 @@ def test_tool_choice_named_tool_reaches_prompt():
 
 # ---------------------------------------------------------------- F. 伪造防护
 
+def test_reasoning_replay_is_not_a_user_message():
+    """Codex 回放的 reasoning item 不得变成一段 JSON 用户输入。
+
+    实测修复前：`{"type": "reasoning", ...}` 落进兜底分支，被序列化为 JSON 后
+    以 `role:"user"` 发给上游——模型每轮都收到一段自己不认识的 JSON。同时校验
+    `item_reference`（无存储无法解析的引用）被跳过而不是当成内容。
+    """
+    req = ResponsesRequest(
+        model="gpt-5-codex",
+        tools=TOOLS_OPENAI,
+        input=[
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "read /etc/hosts"}]},
+            {"type": "reasoning", "id": "rs_1",
+             "summary": [{"type": "summary_text", "text": "I should read the file."}]},
+            {"type": "item_reference", "id": "msg_prev"},
+            {"type": "function_call", "call_id": "call_z", "name": "Read", "arguments": "{}"},
+            {"type": "function_call_output", "call_id": "call_z", "output": "ok"},
+        ],
+    )
+    msgs = convert_responses_to_gateway_messages(req)
+    for m in msgs:
+        assert '"type": "reasoning"' not in str(m.get("content")), f"思考项被当成内容发给上游: {m}"
+        assert "item_reference" not in str(m.get("content")), f"不可解析的引用被当成内容: {m}"
+    prompt = flatten_messages(msgs)
+    assert "I should read the file." in prompt, f"可读的思考摘要应当回放给模型:\n{prompt}"
+    assert "[Tool Result for call_z]" in prompt
+    print("test_reasoning_replay_is_not_a_user_message: PASSED")
+
+
+def test_tool_choice_none_suppresses_tool_calls_everywhere():
+    """`tool_choice:"none"` 必须落在**解析**上，而不只是提示词里的一句话。
+
+    实测修复前：提示词已写明「不要调用工具」，但解析端仍按全部声明工具放行，
+    模型只要没听指令，三个协议都会把 tool_calls / tool_use / function_call 交给
+    客户端——客户端按契约不会执行，整个回合报废。
+    """
+    script = [
+        ("```tool_call\n", {}),
+        ('{"name": "Read", "arguments": {"file_path": "/a"}}\n```', {"conversation_id": "c"}),
+    ]
+
+    def _openai():
+        data = _client().post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}],
+                  "tools": TOOLS_OPENAI, "tool_choice": "none"},
+        ).json()
+        choice = data["choices"][0]
+        assert choice["finish_reason"] != "tool_calls", f"tool_choice=none 仍返回 tool_calls: {choice}"
+        assert not choice["message"].get("tool_calls"), choice["message"]
+
+    def _anthropic():
+        data = _client().post(
+            "/v1/messages",
+            json={"model": "claude-3-7-sonnet", "max_tokens": 64,
+                  "messages": [{"role": "user", "content": "hi"}],
+                  "tools": [{"name": "Read", "input_schema": {"type": "object"}}],
+                  "tool_choice": {"type": "none"}},
+        ).json()
+        assert data["stop_reason"] != "tool_use", f"tool_choice=none 仍返回 tool_use: {data}"
+        assert all(b["type"] != "tool_use" for b in data["content"]), data["content"]
+
+    def _responses():
+        data = _client().post(
+            "/v1/responses",
+            json={"model": "gpt-4o", "input": "hi",
+                  "tools": [{"type": "function", "name": "Read", "parameters": {"type": "object"}}],
+                  "tool_choice": "none"},
+        ).json()
+        assert all(i["type"] != "function_call" for i in data["output"]), data["output"]
+
+    for fn in (_openai, _anthropic, _responses):
+        _with_provider(script, fn)
+    print("test_tool_choice_none_suppresses_tool_calls_everywhere: PASSED")
+
+
+def test_tool_choice_named_tool_filters_other_tools():
+    """点名某个工具时，模型回传的**其他**已声明工具同样不得透传。"""
+    from providers.tool_streamer import resolve_allowed_tools
+
+    tools = TOOLS_OPENAI + [
+        {"type": "function", "function": {"name": "Write", "parameters": {"type": "object"}}}
+    ]
+    assert resolve_allowed_tools(tools, {"type": "function", "function": {"name": "Read"}}) == {"Read"}
+    assert resolve_allowed_tools(tools, None) == {"Read", "Write"}
+    assert resolve_allowed_tools(tools, "none") == set()
+    assert resolve_allowed_tools(tools, "required") == {"Read", "Write"}
+    # 未知形状 / 未声明的点名：失败开放，不制造空回合
+    assert resolve_allowed_tools(tools, {"type": "bogus"}) == {"Read", "Write"}
+    assert resolve_allowed_tools(tools, {"type": "tool", "name": "Nope"}) == {"Read", "Write"}
+    assert resolve_allowed_tools(None, "none") is None
+    print("test_tool_choice_named_tool_filters_other_tools: PASSED")
+
+
+def test_codex_reasoning_object_enables_thinking():
+    """Codex 的 `reasoning:{"effort": ...}` 必须与 `reasoning_effort` 等价。
+
+    实测修复前只认 `reasoning_effort` 字符串，Codex CLI 现行写法被静默丢弃——
+    `gpt-5-codex` 这类代码模型也不走推理模型前缀兜底，于是「想清楚再动手」
+    整个失效，模型直接抢答。
+    """
+    seen: dict = {}
+
+    class _P:
+        async def chat(self, messages, model, **kw):
+            seen.clear()
+            seen.update(kw)
+            yield "ok", {"conversation_id": "c"}
+
+    srv._make_provider = lambda key: _P()
+    try:
+        client = _client()
+        for extra, expected in [
+            ({"reasoning": {"effort": "high", "summary": "auto"}}, True),
+            ({"reasoning": {"effort": "none"}}, False),
+            ({"reasoning_effort": "medium"}, True),
+            ({}, False),
+        ]:
+            resp = client.post("/v1/responses", json={"model": "gpt-5-codex", "input": "hi", **extra})
+            assert resp.status_code == 200, resp.text
+            assert seen.get("thinking") is expected, f"{extra} -> thinking={seen.get('thinking')}"
+    finally:
+        srv._make_provider = _default_factory
+    print("test_codex_reasoning_object_enables_thinking: PASSED")
+
+
 def test_undeclared_tool_is_not_returned_as_tool_call():
     """模型臆造的工具名不得变成客户端无法执行的 tool_calls。"""
     script = [
@@ -373,6 +499,10 @@ def run_all():
         test_responses_stream_second_round_uses_tool_history,
         test_tool_choice_none_reaches_prompt,
         test_tool_choice_named_tool_reaches_prompt,
+        test_tool_choice_none_suppresses_tool_calls_everywhere,
+        test_tool_choice_named_tool_filters_other_tools,
+        test_reasoning_replay_is_not_a_user_message,
+        test_codex_reasoning_object_enables_thinking,
         test_undeclared_tool_is_not_returned_as_tool_call,
     ]
     for fn in tests:
