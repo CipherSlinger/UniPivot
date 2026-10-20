@@ -103,6 +103,52 @@ def _run(body: dict, provider) -> list[tuple[str, dict]]:
 _default_factory = srv._make_provider
 
 
+def _assert_item_lifecycle(events):
+    """输出项生命周期不变量：索引唯一、按序关闭、内容不串项。
+
+    客户端按 `output_index` 归档内容，因此索引重复或未按序关闭会让内容互相覆盖
+    ——表现为「agent 输出丢了一半」而不是报错，是最难定位的一类故障。
+    """
+    opened: dict[int, str] = {}
+    closed: list[int] = []
+    deltas: dict[int, str] = {}
+    for name, p in events:
+        if name == "response.output_item.added":
+            idx = p["output_index"]
+            assert idx not in opened, f"output_index {idx} 被打开两次: {opened}"
+            assert idx not in closed, f"output_index {idx} 关闭后又被重新打开"
+            opened[idx] = p["item"]["type"]
+        elif name == "response.function_call_arguments.delta":
+            idx = p["output_index"]
+            assert idx in opened and idx not in closed, f"参数增量挂在未打开的项 {idx} 上"
+            assert opened[idx] == "function_call", f"项 {idx} 不是 function_call"
+            deltas[idx] = deltas.get(idx, "") + p.get("delta", "")
+        elif name in ("response.output_text.delta", "response.reasoning_summary_text.delta"):
+            idx = p["output_index"]
+            assert idx in opened and idx not in closed, f"增量挂在未打开的项 {idx} 上"
+            kind = "reasoning" if name == "response.reasoning_summary_text.delta" else "message"
+            assert opened[idx] == kind, f"项 {idx} 是 {opened[idx]}，却收到 {kind} 增量"
+            deltas[idx] = deltas.get(idx, "") + p.get("delta", "")
+        elif name == "response.output_item.done":
+            idx = p["output_index"]
+            assert idx == p.get("output_index")
+            assert idx in opened, f"项 {idx} 未打开就关闭"
+            assert idx not in closed, f"项 {idx} 被关闭两次"
+            item = p["item"]
+            if item["type"] == "reasoning":
+                got = item["summary"][0]["text"] if item.get("summary") else ""
+            elif item["type"] == "message":
+                got = item["content"][0]["text"] if item.get("content") else ""
+            else:
+                got = item.get("arguments", "")
+            assert got == deltas.get(idx, ""), (
+                f"项 {idx} 的 done 内容 {got!r} 与流式增量 {deltas.get(idx, '')!r} 不一致"
+                "（内容串项）"
+            )
+            closed.append(idx)
+    assert closed == sorted(opened), f"项必须按索引顺序关闭: opened={sorted(opened)} closed={closed}"
+
+
 def _assert_envelope(events):
     """所有事件共享的不变量：type 与事件名一致、序号严格递增。"""
     seqs = []
@@ -128,6 +174,7 @@ def test_text_stream_event_contract():
     assert "response.text.delta" not in names, "旧事件名会让按名分派的客户端收不到任何文本"
     assert names[-1] == "done"
     _assert_envelope(events)
+    _assert_item_lifecycle(events)
 
     # 文本内容与顺序
     deltas = [p["delta"] for n, p in events if n == "response.output_text.delta"]
@@ -160,6 +207,7 @@ def test_reasoning_stream_is_emitted():
         ReasoningProvider(),
     )
     _assert_envelope(events)
+    _assert_item_lifecycle(events)
     rs_deltas = [p for n, p in events if n == "response.reasoning_summary_text.delta"]
     assert rs_deltas, "思考流被静默丢弃（客户端会看到长时间无输出）"
     assert "".join(p["delta"] for p in rs_deltas) == "Let me think about it"
@@ -184,6 +232,7 @@ def test_tool_call_stream_contract():
         ToolProvider(),
     )
     _assert_envelope(events)
+    _assert_item_lifecycle(events)
 
     added = [p for n, p in events if n == "response.output_item.added"]
     fn_items = [p for p in added if p["item"]["type"] == "function_call"]
@@ -212,6 +261,7 @@ def test_empty_response_still_has_message_item():
         EmptyProvider(),
     )
     _assert_envelope(events)
+    _assert_item_lifecycle(events)
     completed = [p for n, p in events if n == "response.completed"][0]["response"]
     assert completed["output"], "空回复也必须给出结构完整的 output item"
     assert completed["output"][0]["type"] == "message"
@@ -233,6 +283,49 @@ def test_non_streaming_reasoning_item():
     assert data["output"][1]["content"][0]["type"] == "output_text"
     assert data["output"][1]["content"][0]["text"] == "Answer."
     print("test_non_streaming_reasoning_item: PASSED")
+
+
+class InterleavedProvider:
+    """推理模型在工具循环里的常态：想一点、写一点、再想一点。"""
+
+    async def chat(self, *a, **kw):
+        yield "first thought ", {"reasoning": True}
+        yield "first answer, long enough to flush the lookahead window. ", {}
+        yield "second thought ", {"reasoning": True}
+        yield "second answer", {}
+
+
+def test_interleaved_reasoning_and_text_never_collide():
+    """靶点：四段（思考/正文/思考/正文）曾被压成两个互不匹配的 index。
+
+    实测修复前：reasoning 与 message 同时挂在 index 0，第二段思考的增量被追加上
+    一个已经写过正文的消息项，事件流为
+      added(0,reasoning) → added(0,message) → reasoning_delta(0) → …
+    客户端按 output_index 归档，重复索引互相覆盖，表现为输出丢一半。
+    """
+    events = _run(
+        {"model": "qwen3.7-max", "input": "interleave", "stream": True},
+        InterleavedProvider(),
+    )
+    _assert_envelope(events)
+    _assert_item_lifecycle(events)
+
+    done_items = [p["item"] for n, p in events if n == "response.output_item.done"]
+    assert [i["type"] for i in done_items] == ["reasoning", "message", "reasoning", "message"], (
+        f"四段内容必须各自成为独立输出项: {[i['type'] for i in done_items]}"
+    )
+    assert [i["summary"][0]["text"] for i in done_items if i["type"] == "reasoning"] == [
+        "first thought ",
+        "second thought ",
+    ], "第二段思考串入了第一段内容"
+    assert [i["content"][0]["text"] for i in done_items if i["type"] == "message"] == [
+        "first answer, long enough to flush the lookahead window. ",
+        "second answer",
+    ], "正文内容串项"
+
+    completed = [p for n, p in events if n == "response.completed"][0]["response"]
+    assert len(completed["output"]) == 4
+    print("test_interleaved_reasoning_and_text_never_collide: PASSED")
 
 
 def test_shapes_match_between_tool_and_plain_paths():
@@ -275,6 +368,7 @@ def run_all():
         test_tool_call_stream_contract,
         test_empty_response_still_has_message_item,
         test_non_streaming_reasoning_item,
+        test_interleaved_reasoning_and_text_never_collide,
         test_shapes_match_between_tool_and_plain_paths,
     ]
     for fn in tests:

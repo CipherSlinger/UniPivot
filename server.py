@@ -2661,7 +2661,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         else streamer.feed_text(delta)
                     )
                     for act in actions:
+                        # [ANTHROPIC-STREAM] 两种内容块必须**互斥**且一次只开一个。
+                        # 原实现只在「思考 → 正文」方向关块，反向切换（正文 → 再次思考，
+                        # 推理模型在工具循环里极常见）既不关正文块也不递增 index，于是
+                        # 同一个 index 被 start 两次、没有中间 stop——这是非法的
+                        # Anthropic 事件流，SDK 客户端会拒绝或错位后续内容。实测复现：
+                        # start(1,text) → start(1,thinking) → stop(1) → stop(2)。
                         if act.action_type == "reasoning_delta":
+                            if in_text_block:
+                                yield sse_content_block_stop(block_idx)
+                                in_text_block = False
+                                block_idx += 1
                             if not in_thinking_block:
                                 yield sse_content_block_start(block_idx, {"type": "thinking", "thinking": ""})
                                 in_thinking_block = True
@@ -3198,12 +3208,57 @@ async def responses_endpoint(req: ResponsesRequest):
                 yield ev.created()
                 yield ev.in_progress()
 
+                # [RESPONSES-STREAM] 输出项必须按**到达顺序**逐个关闭，且每个项
+                # 独占一个 index。原实现把所有 index 递增都攒到流末尾，于是
+                # reasoning 与 message 同时挂在 index 0，第二段思考（正文之后再次
+                # 思考，推理模型在工具循环里的常态）还被追加到一个已经写过正文的
+                # 消息项上——实测事件流为
+                #   added(0,reasoning) … added(0,message) … reasoning_delta(0) …
+                # 客户端按 output_index 归档内容，重复索引会互相覆盖，表现为
+                # 「agent 输出丢了一半」。
                 out_idx = 0
                 text_item_id = msg_id
                 reasoning_id = _id("rs", "_")
                 in_text_part = False
                 in_reasoning = False
                 emitted_parts: list[str] = []
+                emitted_reasoning: list[str] = []
+                output_items: list[dict] = []
+
+                async def _close_reasoning():
+                    """关闭当前 reasoning 项并让出 index。
+
+                    缓冲必须**按项清空**：不清空时第二段思考的 done 会带上第一段
+                    内容（实测 'think1 think2'），客户端与 completed.output 不一致。
+                    """
+                    nonlocal out_idx, in_reasoning, reasoning_id
+                    if not in_reasoning:
+                        return
+                    text = "".join(emitted_reasoning)
+                    item = reasoning_item(reasoning_id, text)
+                    yield ev.reasoning_summary_done(reasoning_id, text, out_idx)
+                    yield ev.output_item_done(out_idx, item)
+                    output_items.append(item)
+                    emitted_reasoning.clear()
+                    in_reasoning = False
+                    reasoning_id = _id("rs", "_")
+                    out_idx += 1
+
+                async def _close_text():
+                    """关闭当前 message 项并让出 index（缓冲按项清空，理由同上）。"""
+                    nonlocal out_idx, in_text_part, text_item_id
+                    if not in_text_part:
+                        return
+                    text = "".join(emitted_parts)
+                    yield ev.output_text_done(text_item_id, text, out_idx, 0)
+                    yield ev.content_part_done(text_item_id, text, out_idx, 0)
+                    item = message_item(text_item_id, text)
+                    yield ev.output_item_done(out_idx, item)
+                    output_items.append(item)
+                    emitted_parts.clear()
+                    in_text_part = False
+                    text_item_id = _id("msg", "_")
+                    out_idx += 1
 
                 async for delta, _meta in stream:
                     if not ttft_recorded and delta:
@@ -3228,13 +3283,20 @@ async def responses_endpoint(req: ResponsesRequest):
                         if act.action_type == "reasoning_delta":
                             # 思考流必须以 reasoning output item 呈现。原实现静默丢弃，
                             # Codex 看到的是「想了几十秒然后什么都没有」。
+                            if in_text_part:
+                                async for frame in _close_text():
+                                    yield frame
                             if not in_reasoning:
                                 yield ev.output_item_added(
                                     out_idx, reasoning_item(reasoning_id, "", status="in_progress")
                                 )
                                 in_reasoning = True
+                            emitted_reasoning.append(act.content)
                             yield ev.reasoning_summary_delta(reasoning_id, act.content, out_idx)
                         elif act.action_type == "text_delta":
+                            if in_reasoning:
+                                async for frame in _close_reasoning():
+                                    yield frame
                             if not in_text_part:
                                 yield ev.output_item_added(
                                     out_idx, message_item(text_item_id, "", status="in_progress")
@@ -3246,6 +3308,9 @@ async def responses_endpoint(req: ResponsesRequest):
 
                 rem_text, tool_list, was_healed = streamer.finalize()
                 if rem_text:
+                    if in_reasoning:
+                        async for frame in _close_reasoning():
+                            yield frame
                     if not in_text_part:
                         yield ev.output_item_added(
                             out_idx, message_item(text_item_id, "", status="in_progress")
@@ -3256,25 +3321,10 @@ async def responses_endpoint(req: ResponsesRequest):
                     yield ev.output_text_delta(text_item_id, rem_text, out_idx, 0)
 
                 full_reasoning = "".join(streamer.accumulated_reasoning)
-                if in_reasoning:
-                    yield ev.reasoning_summary_done(reasoning_id, full_reasoning, out_idx)
-                    yield ev.output_item_done(
-                        out_idx, reasoning_item(reasoning_id, full_reasoning)
-                    )
-                    out_idx += 1
-
-                output_items: list[dict] = []
-                if in_reasoning:
-                    output_items.append(reasoning_item(reasoning_id, full_reasoning))
-
-                full_text = "".join(emitted_parts)
-                if in_text_part:
-                    yield ev.output_text_done(text_item_id, full_text, out_idx, 0)
-                    yield ev.content_part_done(text_item_id, full_text, out_idx, 0)
-                    item_msg = message_item(text_item_id, full_text)
-                    yield ev.output_item_done(out_idx, item_msg)
-                    output_items.append(item_msg)
-                    out_idx += 1
+                async for frame in _close_reasoning():
+                    yield frame
+                async for frame in _close_text():
+                    yield frame
 
                 if tool_list:
                     _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -3292,9 +3342,12 @@ async def responses_endpoint(req: ResponsesRequest):
                         yield ev.output_item_done(out_idx, item_fn)
                         output_items.append(item_fn)
                         out_idx += 1
-                elif not in_text_part:
+                elif not output_items:
                     # 既无文本也无工具（空回复）：仍然给出一个结构完整的空消息项，
                     # 否则客户端会认为本轮没有任何输出。
+                    # [RESPONSES-STREAM] 判据必须是「本轮还没有任何 message 项」而非
+                    # `not in_text_part`——后者在每个项关闭后都成立，于是有思考无正文的
+                    # 回复会多出一个 idx=4 的空消息项。
                     yield ev.output_item_added(
                         out_idx, message_item(text_item_id, "", status="in_progress")
                     )
