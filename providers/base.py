@@ -332,3 +332,49 @@ def error_response(
     if code is not None:
         err["code"] = code
     return {"error": err}
+
+
+# ============================================================================
+# [STREAM-AUDIT] 上游流式响应的状态码分类
+# ============================================================================
+
+# 这些状态码本身就是「这个账号被拦下了」，必须交给风控账本分类（auth / waf /
+# ratelimit），而不是塌成一个通用 502。
+_RISK_STATUS_HINTS = {401: "auth_error", 403: "waf_blocked", 429: "rate_limit_error"}
+
+
+def classify_stream_status(status: int) -> tuple[str, bool]:
+    """返回 (err_type, is_risk)。`is_risk` 为真时调用方应保留原始状态码。
+
+    401 / 403 / 429 是风控线的输入：认证失效要触发凭证续期与（可能）封禁推断，
+    403 是 WAF/Cloudflare 拦截，429 是限流或人机验证。把它们统一报成 502 会让
+    账本失去严重度分级——对 DeepSeek（本部署里已被封禁的那一家）尤其致命，
+    因为它的 403 正是避让逻辑存在的理由。
+    """
+    hint = _RISK_STATUS_HINTS.get(status)
+    if hint:
+        return hint, True
+    if status >= 500:
+        return "upstream_error", False
+    return "upstream_error", False
+
+
+async def read_error_body(resp: httpx.Response) -> str:
+    """在 `async with client.stream(...)` **内部**读完错误响应体。
+
+    这是本仓库踩过的真实坑：在流式响应上调用 `raise_for_status()`，异常抛出时
+    `async with` 已经把响应关掉了，异常处理器再去 `e.response.text` 只会拿到
+    `httpx.StreamClosed` / `ResponseNotRead` —— 一个「读不到错误内容」的异常
+    盖住了原始状态码，风控分类随之失效。因此错误体必须在流关闭**之前**读出来，
+    由调用方在最内层抛出携带完整信息的 ProviderError。
+    """
+    try:
+        raw = await resp.aread()
+    except Exception:  # noqa: BLE001 - 读不到时宁可少信息，也不能掩盖状态码
+        return ""
+    if not raw:
+        return ""
+    try:
+        return raw.decode("utf-8", errors="replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""

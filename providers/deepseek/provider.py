@@ -22,7 +22,14 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..base import ProviderError, continuation_content, ensure_async_client, flatten_messages
+from ..base import (
+    ProviderError,
+    classify_stream_status,
+    continuation_content,
+    ensure_async_client,
+    flatten_messages,
+    read_error_body,
+)
 from .pow import DeepSeekPow
 
 BASE = "https://chat.deepseek.com"
@@ -98,11 +105,31 @@ class DeepSeekProvider:
             raise ProviderError(f"DeepSeek 响应结构异常: {data}", status=502)
         return biz
 
+    @staticmethod
+    def _raise_for_status(r: httpx.Response, what: str) -> None:
+        """[STREAM-AUDIT] 预请求失败也要分类，而不是把裸 httpx 异常抛给上层。
+
+        原先 `_create_chat_session` / `_pow_header` 用裸 `raise_for_status()`：
+        Cloudflare 403 会以 `httpx.HTTPStatusError` 逃出 `chat()`，故障转移只看到
+        一个通用异常 —— 既没有 auth/waf/ratelimit 分级，也就进不了风控账本。
+        """
+        if r.status_code < 400:
+            return
+        err_type, is_risk = classify_stream_status(r.status_code)
+        detail = (r.text or "").strip()[:300]
+        if r.status_code == 401:
+            msg = "DeepSeek token 无效或已过期，请重新获取"
+        elif r.status_code == 429:
+            msg = "DeepSeek 网页端限流（429），请稍后再试"
+        else:
+            msg = f"DeepSeek {what}失败: {r.status_code}"
+        if detail:
+            msg += f" {detail}"
+        raise ProviderError(msg, status=r.status_code if is_risk else 502, err_type=err_type)
+
     async def _create_chat_session(self, client: httpx.AsyncClient) -> str:
         r = await client.post(BASE + SESSION_CREATE, json={}, headers=self._headers())
-        if r.status_code == 401:
-            raise ProviderError("DeepSeek token 无效或已过期，请重新获取", status=401, err_type="auth_error")
-        r.raise_for_status()
+        self._raise_for_status(r, "会话创建")
         biz = self._biz(r.json())
         return biz["chat_session"]["id"]
 
@@ -112,7 +139,7 @@ class DeepSeekProvider:
             json={"target_path": COMPLETION_PATH},
             headers=self._headers(),
         )
-        r.raise_for_status()
+        self._raise_for_status(r, "PoW 挑战")
         challenge = self._biz(r.json())["challenge"]
         async with _pow_lock:
             return await asyncio.to_thread(_get_pow().make_header, challenge)
@@ -176,22 +203,38 @@ class DeepSeekProvider:
                     json=body,
                     headers={**self._headers(), "x-ds-pow-response": pow_header},
                 ) as resp:
-                    if resp.status_code == 401:
+                    # [STREAM-AUDIT] 错误响应体必须在流关闭**之前**读完：
+                    # `raise_for_status()` 抛出时 async with 已关闭响应，外层再去
+                    # `e.response.text` 只会得到 StreamClosed —— 一个「读不到内容」的
+                    # 异常盖住原始状态码，风控分类随之失效。对 DeepSeek（本部署里
+                    # 已被封禁的那一家）尤其致命：Cloudflare 403 正是避让逻辑的输入。
+                    if resp.status_code >= 400:
+                        detail = await read_error_body(resp)
+                        err_type, is_risk = classify_stream_status(resp.status_code)
                         raise ProviderError(
-                            "DeepSeek token 无效或已过期，请重新获取",
-                            status=401, err_type="auth_error",
+                            f"DeepSeek 上游请求失败: {resp.status_code}"
+                            + (f" {detail[:300]}" if detail else ""),
+                            status=resp.status_code if is_risk else 502,
+                            err_type=err_type,
                         )
-                    if resp.status_code == 429:
-                        raise ProviderError("DeepSeek 网页端限流（429），请稍后再试", status=429)
-                    resp.raise_for_status()
 
                     state: Dict = {}
                     async for item in self._parse_sse(resp, state):
                         yield item
+            except ProviderError:
+                raise
             except httpx.HTTPStatusError as e:
+                # 同上：流式响应上读错误体不可靠，尽力而为并保证状态码不丢
+                try:
+                    detail = (await e.response.aread()).decode("utf-8", errors="replace")[:300]
+                except Exception:  # noqa: BLE001
+                    detail = ""
+                err_type, is_risk = classify_stream_status(e.response.status_code)
                 raise ProviderError(
-                    f"DeepSeek 上游请求失败: {e.response.status_code} {e.response.text[:300]}",
-                    status=502,
+                    f"DeepSeek 上游请求失败: {e.response.status_code}"
+                    + (f" {detail}" if detail else ""),
+                    status=e.response.status_code if is_risk else 502,
+                    err_type=err_type,
                 )
             except httpx.HTTPError as e:
                 raise ProviderError(f"DeepSeek 网络错误: {e}", status=502)

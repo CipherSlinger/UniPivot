@@ -23,10 +23,12 @@ import httpx
 
 from ..base import (
     ProviderError,
+    classify_stream_status,
     ensure_async_client,
     flatten_messages,
     continuation_content,
     parse_cookie_header,
+    read_error_body,
 )
 from ..device_identity import stable_device_id
 
@@ -227,14 +229,27 @@ class QwenProvider:
                     async with client.stream(
                         "POST", url, headers=self._headers(), json=payload
                     ) as resp:
-                        if resp.status_code == 401:
+                        # [STREAM-AUDIT] 同上（见 DeepSeek）：错误体必须在流关闭前读完。
+                        # 401/403/429 也保持原始状态码，交给风控账本分级。
+                        if resp.status_code >= 400:
+                            detail = await read_error_body(resp)
+                            err_type, is_risk = classify_stream_status(resp.status_code)
+                            if resp.status_code == 401:
+                                msg = (
+                                    "通义千问票据无效或已过期，请运行 "
+                                    ".venv/bin/python login.py qwen 重新扫码登录"
+                                )
+                            elif resp.status_code == 429:
+                                msg = "通义千问网页端限流（429），请稍后再试"
+                            else:
+                                msg = f"通义千问上游请求失败: {resp.status_code}"
+                            if detail:
+                                msg += f" {detail[:300]}"
                             raise ProviderError(
-                                "通义千问票据无效或已过期，请运行 .venv/bin/python login.py qwen 重新扫码登录",
-                                status=401, err_type="auth_error",
+                                msg,
+                                status=resp.status_code if is_risk else 502,
+                                err_type=err_type,
                             )
-                        if resp.status_code == 429:
-                            raise ProviderError("通义千问网页端限流（429），请稍后再试", status=429)
-                        resp.raise_for_status()
 
                         async for line in resp.aiter_lines():
                             if not line:
@@ -344,9 +359,16 @@ class QwenProvider:
             except ProviderError:
                 raise
             except httpx.HTTPStatusError as e:
-                await e.response.aread()
+                try:
+                    detail = (await e.response.aread()).decode("utf-8", errors="replace")[:300]
+                except Exception:  # noqa: BLE001
+                    detail = ""
+                err_type, is_risk = classify_stream_status(e.response.status_code)
                 raise ProviderError(
-                    f"通义千问上游请求失败: {e.response.status_code} {e.response.text[:300]}", status=502
+                    f"通义千问上游请求失败: {e.response.status_code}"
+                    + (f" {detail}" if detail else ""),
+                    status=e.response.status_code if is_risk else 502,
+                    err_type=err_type,
                 )
             except httpx.HTTPError as e:
                 raise ProviderError(f"通义千问网络错误: {e}", status=502)

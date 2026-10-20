@@ -23,10 +23,12 @@ import httpx
 
 from ..base import (
     ProviderError,
+    classify_stream_status,
     ensure_async_client,
     flatten_messages,
     continuation_content,
     parse_cookie_header,
+    read_error_body,
 )
 from ..device_identity import stable_device_id
 from ..http_client import get_http_client
@@ -271,57 +273,75 @@ class KimiProvider:
                 req = client.build_request("POST", stream_url, headers=headers, json=payload)
                 resp = await client.send(req, stream=True)
 
-                if resp.status_code == 401:
-                    _token_cache.pop(self.refresh_token, None)
-                    raise ProviderError(
-                        "Kimi 票据已过期，请运行 .venv/bin/python login.py kimi 重新登录",
-                        status=401,
-                        err_type="auth_error",
-                    )
-                if resp.status_code == 429:
-                    raise ProviderError("Kimi 网页端限流或人机验证阻断", status=429, err_type="rate_limit_error")
-                if resp.status_code != 200:
-                    await resp.aread()
-                    raise ProviderError(f"Kimi 上游请求失败: HTTP {resp.status_code} {resp.text[:300]}", status=502)
+                # [STREAM-AUDIT] `client.send(..., stream=True)` 拿到的是未关闭的
+                # 响应：这里每一个提前退出都必须 `aclose()`，否则连接槽被永久占住。
+                # 健康探针每 5 分钟对每个节点跑一次，泄漏是复发的，共享连接池
+                # （max 100 conns / 40 keep-alive）耗尽后整个网关一起变慢。
+                try:
+                    if resp.status_code == 401:
+                        _token_cache.pop(self.refresh_token, None)
+                        raise ProviderError(
+                            "Kimi 票据已过期，请运行 .venv/bin/python login.py kimi 重新登录",
+                            status=401,
+                            err_type="auth_error",
+                        )
+                    if resp.status_code == 429:
+                        raise ProviderError("Kimi 网页端限流或人机验证阻断", status=429, err_type="rate_limit_error")
+                    if resp.status_code != 200:
+                        detail = (await read_error_body(resp))[:300]
+                        err_type, is_risk = classify_stream_status(resp.status_code)
+                        raise ProviderError(
+                            f"Kimi 上游请求失败: HTTP {resp.status_code}"
+                            + (f" {detail}" if detail else ""),
+                            status=resp.status_code if is_risk else 502,
+                            err_type=err_type,
+                        )
 
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                    else:
-                        data_str = line.strip()
+                    async for line in resp.aiter_lines():
+                        if not line:
+                            continue
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                        else:
+                            data_str = line.strip()
 
-                    if not data_str or data_str == "[DONE]":
-                        continue
+                        if not data_str or data_str == "[DONE]":
+                            continue
 
-                    try:
-                        obj = json.loads(data_str)
-                    except Exception:
-                        continue
+                        try:
+                            obj = json.loads(data_str)
+                        except Exception:
+                            continue
+                        # [STREAM-AUDIT] `data: []` / `null` / 数字 都是合法 JSON，
+                        # 但对它们调 `.get()` 会抛 AttributeError，把一次上游帧异常
+                        # 变成一次 502（并顺带跳过 finally 之外的所有记账）。
+                        if not isinstance(obj, dict):
+                            continue
 
-                    event = obj.get("event")
-                    text_chunk = obj.get("text", "")
+                        event = obj.get("event")
+                        text_chunk = obj.get("text", "")
 
-                    # 错误处理
-                    if event == "error":
-                        err_msg = obj.get("message") or "内容违规或请求受限"
-                        raise ProviderError(f"Kimi 接口报错: {err_msg}", status=502)
+                        # 错误处理
+                        if event == "error":
+                            err_msg = obj.get("message") or "内容违规或请求受限"
+                            raise ProviderError(f"Kimi 接口报错: {err_msg}", status=502)
 
-                    # 思考过程 (k1 事件)
-                    if event == "k1":
-                        full_content += text_chunk
-                        yield text_chunk, {"reasoning": True}
-                        continue
+                        # 思考过程 (k1 事件)
+                        if event == "k1":
+                            full_content += text_chunk
+                            yield text_chunk, {"reasoning": True}
+                            continue
 
-                    # 正式回答完成 (cmpl 事件)
-                    if event == "cmpl":
-                        full_content += text_chunk
-                        yield text_chunk, {}
-                        continue
+                        # 正式回答完成 (cmpl 事件)
+                        if event == "cmpl":
+                            full_content += text_chunk
+                            yield text_chunk, {}
+                            continue
 
-                    if event == "all_done":
-                        break
+                        if event == "all_done":
+                            break
+                finally:
+                    await resp.aclose()
 
             except ProviderError:
                 raise

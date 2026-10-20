@@ -25,10 +25,12 @@ import httpx
 
 from ..base import (
     ProviderError,
+    classify_stream_status,
     ensure_async_client,
     flatten_messages,
     continuation_content,
     parse_cookie_header,
+    read_error_body,
 )
 from ..device_identity import stable_device_id
 from ..http_client import get_http_client
@@ -272,74 +274,88 @@ class GLMProvider:
                 req = client.build_request("POST", STREAM_URL, headers=headers, json=payload)
                 resp = await client.send(req, stream=True)
 
-                if resp.status_code == 401:
-                    _token_cache.pop(self.refresh_token, None)
-                    raise ProviderError(
-                        "智谱 GLM 票据无效或已过期，请运行 .venv/bin/python login.py glm 重新登录",
-                        status=401,
-                        err_type="auth_error",
-                    )
-                if resp.status_code == 429:
-                    raise ProviderError("智谱 GLM 限流或风控阻断", status=429, err_type="rate_limit_error")
-                if resp.status_code != 200:
-                    await resp.aread()
-                    raise ProviderError(f"智谱 GLM 上游请求失败: HTTP {resp.status_code} {resp.text[:300]}", status=502)
+                # [STREAM-AUDIT] 提前退出同样必须 aclose（见 Kimi）
+                try:
+                    if resp.status_code == 401:
+                        _token_cache.pop(self.refresh_token, None)
+                        raise ProviderError(
+                            "智谱 GLM 票据无效或已过期，请运行 .venv/bin/python login.py glm 重新登录",
+                            status=401,
+                            err_type="auth_error",
+                        )
+                    if resp.status_code == 429:
+                        raise ProviderError("智谱 GLM 限流或风控阻断", status=429, err_type="rate_limit_error")
+                    if resp.status_code != 200:
+                        detail = (await read_error_body(resp))[:300]
+                        err_type, is_risk = classify_stream_status(resp.status_code)
+                        raise ProviderError(
+                            f"智谱 GLM 上游请求失败: HTTP {resp.status_code}"
+                            + (f" {detail}" if detail else ""),
+                            status=resp.status_code if is_risk else 502,
+                            err_type=err_type,
+                        )
 
-                async for line in resp.aiter_lines():
-                    if not line:
-                        continue
-                    if line.startswith("data:"):
-                        data_str = line[5:].strip()
-                    else:
-                        data_str = line.strip()
-
-                    if not data_str or data_str == "[DONE]":
-                        continue
-
-                    try:
-                        obj = json.loads(data_str)
-                    except Exception:
-                        continue
-
-                    if not conv_id and obj.get("conversation_id"):
-                        conv_id = str(obj["conversation_id"])
-
-                    # parts 增量解析
-                    parts = obj.get("parts", [])
-                    for part in parts:
-                        if not isinstance(part, dict):
+                    async for line in resp.aiter_lines():
+                        if not line:
                             continue
-                        logic_id = str(part.get("logic_id", "default"))
-                        content_list = part.get("content", [])
+                        if line.startswith("data:"):
+                            data_str = line[5:].strip()
+                        else:
+                            data_str = line.strip()
 
-                        cur_text = ""
-                        cur_reasoning = ""
-                        for c in content_list:
-                            if not isinstance(c, dict):
+                        if not data_str or data_str == "[DONE]":
+                            continue
+
+                        try:
+                            obj = json.loads(data_str)
+                        except Exception:
+                            continue
+                        # [STREAM-AUDIT] 非对象帧（[]/null/数字）是合法 JSON，
+                        # 对它们调 .get() 会抛 AttributeError（见 Kimi 同一处）。
+                        if not isinstance(obj, dict):
+                            continue
+
+                        if not conv_id and obj.get("conversation_id"):
+                            conv_id = str(obj["conversation_id"])
+
+                        # parts 增量解析
+                        parts = obj.get("parts", [])
+                        for part in parts:
+                            if not isinstance(part, dict):
                                 continue
-                            c_type = c.get("type")
-                            if c_type == "text":
-                                cur_text += str(c.get("text", ""))
-                            elif c_type == "reasoning":
-                                cur_reasoning += str(c.get("text", ""))
+                            logic_id = str(part.get("logic_id", "default"))
+                            content_list = part.get("content", [])
 
-                        # 推送思考增量
-                        if cur_reasoning:
-                            sent = part_reasoning_sent.get(logic_id, 0)
-                            if len(cur_reasoning) > sent:
-                                delta = cur_reasoning[sent:]
-                                part_reasoning_sent[logic_id] = len(cur_reasoning)
-                                yield delta, {"reasoning": True}
+                            cur_text = ""
+                            cur_reasoning = ""
+                            for c in content_list:
+                                if not isinstance(c, dict):
+                                    continue
+                                c_type = c.get("type")
+                                if c_type == "text":
+                                    cur_text += str(c.get("text", ""))
+                                elif c_type == "reasoning":
+                                    cur_reasoning += str(c.get("text", ""))
 
-                        # 推送正文增量
-                        if cur_text:
-                            sent = part_text_sent.get(logic_id, 0)
-                            if len(cur_text) > sent:
-                                delta = cur_text[sent:]
-                                part_text_sent[logic_id] = len(cur_text)
-                                yield delta, {}
-                                full_content += delta
+                            # 推送思考增量
+                            if cur_reasoning:
+                                sent = part_reasoning_sent.get(logic_id, 0)
+                                if len(cur_reasoning) > sent:
+                                    delta = cur_reasoning[sent:]
+                                    part_reasoning_sent[logic_id] = len(cur_reasoning)
+                                    yield delta, {"reasoning": True}
 
+                            # 推送正文增量
+                            if cur_text:
+                                sent = part_text_sent.get(logic_id, 0)
+                                if len(cur_text) > sent:
+                                    delta = cur_text[sent:]
+                                    part_text_sent[logic_id] = len(cur_text)
+                                    yield delta, {}
+                                    full_content += delta
+
+                finally:
+                    await resp.aclose()
             except ProviderError:
                 raise
             except httpx.HTTPError as e:
