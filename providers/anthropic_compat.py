@@ -349,6 +349,50 @@ def format_tools_system_prompt(
     return "\n".join(lines)
 
 
+def format_response_format_prompt(response_format: Any) -> str:
+    """[PROTOCOL] 把客户端的 `response_format` 翻译成一条上游能看懂的输出约束。
+
+    网页端模型没有原生结构化输出，`response_format` 此前只是被解析进模型然后丢弃：
+    客户端要求 JSON，网关照旧把模型的大白话回给它，客户端按 JSON 去解，整轮报废。
+    与 `tool_choice` / `stop` 同一条纪律——约束必须让模型**看见**，能在解析端兜的
+    只有「它到底是不是合法 JSON」，而那一步不能替模型决定它该说什么。
+
+    只处理两种有明确语义的取值（`json_object` 与 `json_schema`）；`{"type": "text"}`
+    与任何无法识别的形状都不追加内容（失败开放，零回归）。
+    """
+    if not isinstance(response_format, dict):
+        return ""
+    rf_type = response_format.get("type")
+    if rf_type == "json_object":
+        return (
+            "## Output Format\n"
+            "Respond with a single valid JSON object and nothing else. "
+            "Do not wrap it in a markdown code fence, and do not add prose before or after it."
+        )
+    if rf_type == "json_schema":
+        schema = response_format.get("json_schema")
+        inner = schema.get("schema") if isinstance(schema, dict) else None
+        name = schema.get("name") if isinstance(schema, dict) else None
+        if inner is None:
+            return (
+                "## Output Format\n"
+                "Respond with a single valid JSON object and nothing else. "
+                "Do not wrap it in a markdown code fence, and do not add prose before or after it."
+            )
+        label = f" matching the \"{name}\" schema" if isinstance(name, str) and name else ""
+        try:
+            body = json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
+        except (TypeError, ValueError):
+            return ""
+        return (
+            "## Output Format\n"
+            f"Respond with a single valid JSON object{label} and nothing else. "
+            "Do not wrap it in a markdown code fence, and do not add prose before or after it.\n"
+            f"Schema: {body}"
+        )
+    return ""
+
+
 # [TOOL-LOOP] 围栏语言标签必须落在**可能承载工具调用**的集合内。
 # 原正则是 `[a-zA-Z0-9_.-]*`，不锚定标签，于是 ```python / ```ts / ```typescript
 # 全都命中，任何带 name 键的普通代码块都会被伪造成工具调用。
@@ -855,6 +899,7 @@ def sse_message_delta(
     output_tokens: int,
     cache_creation_input_tokens: Optional[int] = None,
     cache_read_input_tokens: Optional[int] = None,
+    stop_sequence: Optional[str] = None,
 ) -> str:
     usage: dict[str, Any] = {
         "output_tokens": output_tokens,
@@ -870,7 +915,10 @@ def sse_message_delta(
             "type": "message_delta",
             "delta": {
                 "stop_reason": stop_reason,
-                "stop_sequence": None,
+                # [PROTOCOL] stop_reason="stop_sequence" 时本字段必须是被命中的那个
+                # 字符串；写死 None 是线上契约不允许的组合，客户端靠它区分
+                # 「被哪个停用词截断」来决定下一段如何续写。
+                "stop_sequence": stop_sequence,
             },
             "usage": usage,
         },
@@ -891,6 +939,7 @@ def anthropic_message_response(
     conversation_id: Optional[str] = None,
     cache_creation_input_tokens: Optional[int] = None,
     cache_read_input_tokens: Optional[int] = None,
+    stop_sequence: Optional[str] = None,
 ) -> dict:
     """构建非流式 Anthropic Message 响应对象。"""
     blocks = (
@@ -914,7 +963,8 @@ def anthropic_message_response(
         "model": model,
         "content": blocks,
         "stop_reason": stop_reason,
-        "stop_sequence": None,
+        # [PROTOCOL] 与流式同一契约：stop_sequence 终止原因必须携带命中的字符串
+        "stop_sequence": stop_sequence,
         "usage": usage,
     }
     if conversation_id:

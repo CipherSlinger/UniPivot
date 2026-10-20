@@ -10,6 +10,7 @@ from .anthropic_compat import (
     convert_anthropic_to_gateway_messages,
     extract_anthropic_content,
     format_anthropic_models,
+    format_response_format_prompt,
     format_tools_system_prompt,
     parse_tool_call,
     parse_tool_calls,
@@ -131,6 +132,12 @@ from .risk_ledger import (
     get_risk_ledger,
     risk_ledger,
 )
+from .stop_sequences import (
+    StopSequenceScanner,
+    all_stops,
+    normalize_stop,
+    truncate_final,
+)
 from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
@@ -200,6 +207,7 @@ __all__ = [
     "convert_anthropic_to_gateway_messages",
     "extract_anthropic_content",
     "format_anthropic_models",
+    "format_response_format_prompt",
     "format_tools_system_prompt",
     "parse_tool_call",
     "parse_tool_calls",
@@ -246,6 +254,10 @@ __all__ = [
     "parallel_calls_disallowed",
     "cap_parallel_tool_calls",
     "recover_tools_from_reasoning",
+    "StopSequenceScanner",
+    "all_stops",
+    "normalize_stop",
+    "truncate_final",
     "tool_names_of",
     "SessionAffinityManager",
     "AffinityDecision",

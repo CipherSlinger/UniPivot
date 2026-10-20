@@ -9,6 +9,7 @@ from __future__ import annotations
 import re
 from typing import Any, List, Optional, Tuple, NamedTuple
 from .json_repair import safe_loads_with_repair, strip_markdown_fence
+from .stop_sequences import truncate_final
 from .anthropic_compat import (
     extract_balanced_json_objects,
     _extract_tools_from_data,
@@ -425,6 +426,27 @@ class SpeculativeToolStreamer:
             self.emitted_text.append(delta)
             return [StreamAction("text_delta", content=delta)]
         return self.feed_chunk(delta)
+
+    def truncate_at_stop(self, stop: Any) -> bool:
+        """[PROTOCOL] 客户端停用词命中后，把内部累积截断到命中点之前。
+
+        为什么必须在 `finalize()` **之前**做：命中点之后的正文对客户端不存在，而
+        `finalize()` 是对**全部**累积文本做工具解析。若不停用，一个写在停用词之后
+        的 ```tool_call 会被解析出来并作为真实调用回传——客户端明确要求「到此为止」，
+        却收到了一次它没有预期的执行。同时清空工具缓冲与文本窗口，否则 `finalize()`
+        会把这段残料当作普通文本重新吐出来。
+
+        返回是否命中了停用词。
+        """
+        joined = "".join(self.accumulated_text)
+        kept, matched = truncate_final(joined, stop)
+        if matched is None:
+            return False
+        self.accumulated_text = [kept] if kept else []
+        self.accumulated_tool_buffer.clear()
+        self.tool_detected = False
+        self.text_window = ""
+        return True
 
     def finalize(self) -> Tuple[str, Optional[List[Tuple[str, dict]]], bool]:
         """流结束时调用。

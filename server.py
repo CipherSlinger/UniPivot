@@ -69,6 +69,7 @@ from providers import (
     error_response,
     flatten_messages,
     format_anthropic_models,
+    format_response_format_prompt,
     format_tools_system_prompt,
     last_user_content,
     parse_tool_call,
@@ -78,6 +79,8 @@ from providers import (
     parallel_calls_disallowed,
     recover_tools_from_reasoning,
     resolve_allowed_tools,
+    StopSequenceScanner,
+    truncate_final,
     SpeculativeToolStreamer,
     sse_content_block_delta,
     sse_content_block_start,
@@ -523,6 +526,10 @@ class ChatCompletionRequest(BaseModel):
     tool_choice: Optional[Union[str, dict]] = None
     # [TOOL-LOOP] 显式声明而非依赖 extra=allow：客户端禁止并行调用时解析端要据此裁剪
     parallel_tool_calls: Optional[bool] = None
+    # [PROTOCOL] 停用词截断：此前只有 extra=allow 收着，没有任何路径使用它
+    stop: Optional[Union[str, List[str]]] = None
+    # [PROTOCOL] 结构化输出：此前同样只被解析、从未进入提示词
+    response_format: Optional[dict] = None
     # 网页端专属能力，经 extra_body 传入
     thinking: bool = False
     search: bool = False
@@ -1840,6 +1847,9 @@ async def chat_completions(req: ChatCompletionRequest):
     messages = [m.model_dump() for m in req.messages]
     # [TOOL-LOOP] 客户端「禁止并行调用」的声明既要进提示词，也要在解析端执行
     parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
+    # [PROTOCOL] 停用词是硬语义：提示词降低发生率，解析端保证结果（见 stop_sequences.py）
+    stop_seq = req.stop
+    system_additions: list[str] = []
     if req.tools:
         tools_prompt = format_tools_system_prompt(
             req.tools,
@@ -1847,11 +1857,18 @@ async def chat_completions(req: ChatCompletionRequest):
             parallel_allowed=not parallel_disallowed,
         )
         if tools_prompt:
-            if messages and messages[0].get("role") == "system":
-                orig = messages[0].get("content") or ""
-                messages[0]["content"] = f"{orig}\n\n{tools_prompt}".strip()
-            else:
-                messages.insert(0, {"role": "system", "content": tools_prompt})
+            system_additions.append(tools_prompt)
+    # [PROTOCOL] 客户端要求结构化输出时，模型必须**看见**这条要求
+    fmt_prompt = format_response_format_prompt(req.response_format)
+    if fmt_prompt:
+        system_additions.append(fmt_prompt)
+    if system_additions:
+        block = "\n\n".join(system_additions)
+        if messages and messages[0].get("role") == "system":
+            orig = messages[0].get("content") or ""
+            messages[0]["content"] = f"{orig}\n\n{block}".strip()
+        else:
+            messages.insert(0, {"role": "system", "content": block})
 
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_tokens if req.max_tokens is not None else 2048
@@ -1973,6 +1990,9 @@ async def chat_completions(req: ChatCompletionRequest):
                         first_chunk["failover"] = failover_event.to_dict()
                     yield sse_frame(first_chunk)
 
+                    # [PROTOCOL] 正文的停用词截断：命中后不再发送、也不再读上游
+                    stop_scan = StopSequenceScanner(stop_seq)
+
                     async for delta, meta in stream:
                         if not ttft_recorded and delta:
                             load_balancer.record_ttft(
@@ -1986,6 +2006,9 @@ async def chat_completions(req: ChatCompletionRequest):
                             continue
 
                         is_r = bool(meta and meta.get("reasoning"))
+                        if not is_r and stop_scan.hit is not None:
+                            # 已经命中停用词：后续正文一律丢弃（思考流仍照常透传）
+                            continue
                         if is_r:
                             accumulated_reasoning.append(delta)
                             yield sse_frame({
@@ -2000,7 +2023,10 @@ async def chat_completions(req: ChatCompletionRequest):
                                 }],
                             })
                         else:
+                            safe = stop_scan.feed(delta)
                             accumulated_chunks.append(delta)
+                            if not safe:
+                                continue
                             yield sse_frame({
                                 "id": cid,
                                 "object": "chat.completion.chunk",
@@ -2008,13 +2034,27 @@ async def chat_completions(req: ChatCompletionRequest):
                                 "model": req.model,
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {"content": delta},
+                                    "delta": {"content": safe},
                                     "finish_reason": None,
                                 }],
                             })
 
                         if meta and meta.get("conversation_id"):
                             conversation_id = meta["conversation_id"]
+
+                    tail = stop_scan.flush()
+                    if tail:
+                        yield sse_frame({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": tail},
+                                "finish_reason": None,
+                            }],
+                        })
 
                     final = {
                         "id": cid,
@@ -2090,6 +2130,8 @@ async def chat_completions(req: ChatCompletionRequest):
                     tools_enabled=True,
                     allowed=resolve_allowed_tools(req.tools, req.tool_choice),
                 )
+                # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
+                stop_scan = StopSequenceScanner(stop_seq)
                 first_frame_emitted = False
 
                 async for delta, meta in stream:
@@ -2131,6 +2173,9 @@ async def chat_completions(req: ChatCompletionRequest):
                             yield sse_frame(chunk)
                             first_frame_emitted = True
                         elif act.action_type == "text_delta":
+                            safe_act = stop_scan.feed(act.content)
+                            if not safe_act:
+                                continue
                             chunk = {
                                 "id": cid,
                                 "object": "chat.completion.chunk",
@@ -2138,7 +2183,7 @@ async def chat_completions(req: ChatCompletionRequest):
                                 "model": req.model,
                                 "choices": [{
                                     "index": 0,
-                                    "delta": {"role": "assistant", "content": act.content},
+                                    "delta": {"role": "assistant", "content": safe_act},
                                     "finish_reason": None,
                                 }],
                             }
@@ -2147,6 +2192,10 @@ async def chat_completions(req: ChatCompletionRequest):
                             yield sse_frame(chunk)
                             first_frame_emitted = True
 
+                # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
+                # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
+                if streamer.truncate_at_stop(stop_seq):
+                    stop_scan.mark_hit()
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
@@ -2158,6 +2207,8 @@ async def chat_completions(req: ChatCompletionRequest):
                         parallel_disallowed,
                         answer_text="".join(streamer.accumulated_text),
                     )
+                # [PROTOCOL] 终局剩余正文同样要过停用词判定，并把扣住的尾巴放行
+                rem_text = stop_scan.feed(rem_text) + stop_scan.flush()
                 if rem_text:
                     chunk = {
                         "id": cid,
@@ -2403,6 +2454,9 @@ async def chat_completions(req: ChatCompletionRequest):
     prompt = prompt_text
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
+    # [PROTOCOL] 停用词截断必须在工具解析之前：截断点之后的内容对客户端不存在，
+    # 若那里还藏着一个工具调用，把它回传出去就是一次客户端从未预期过的执行。
+    full_output, _stop_matched = truncate_final(full_output, stop_seq)
 
     thinking_duration_ms = None
     thinking_toks = None
@@ -2477,7 +2531,10 @@ async def chat_completions(req: ChatCompletionRequest):
             return JSONResponse(resp_data, headers=resp_headers if resp_headers else None)
 
     resp_data = completion_response(
-        req.model, full_output, prompt, conversation_id, thinking_content=full_reasoning
+        req.model, full_output, prompt, conversation_id, thinking_content=full_reasoning,
+        # [PROTOCOL] OpenAI 的 finish_reason 枚举里没有 stop_sequence（那是 Anthropic 的），
+        # 停用词命中与自然结束在 OpenAI 语义下**都是** "stop"，不能自造枚举值。
+        finish_reason="stop",
     )
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
@@ -2507,6 +2564,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         )
 
     parallel_disallowed = parallel_calls_disallowed(None, req.tool_choice)
+    # [PROTOCOL] Anthropic 的 stop_sequences 是硬语义，网关侧截断（见 stop_sequences.py）
+    stop_seq = req.stop_sequences
     gateway_messages = convert_anthropic_to_gateway_messages(
         req.messages,
         system=req.system,
@@ -2627,6 +2686,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     current_block_type: Optional[str] = None
                     accumulated_chunks: list[str] = []
                     accumulated_thinking: list[str] = []
+                    # [PROTOCOL] 停用词只作用于正文，思考流不受影响
+                    stop_scan = StopSequenceScanner(stop_seq)
 
                     async for delta, _meta in stream:
                         if not ttft_recorded and delta:
@@ -2665,13 +2726,34 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             )
                         else:
                             accumulated_chunks.append(delta)
+                            # [PROTOCOL] 先判定再开块，命中时这一块根本不该存在
+                            safe_delta = stop_scan.feed(delta)
+                            if not safe_delta:
+                                if current_block_type == "text" and current_block_index >= 0:
+                                    yield sse_content_block_stop(current_block_index)
+                                    current_block_type = None
+                                continue
                             yield sse_content_block_delta(
                                 current_block_index,
-                                {"type": "text_delta", "text": delta},
+                                {"type": "text_delta", "text": safe_delta},
                             )
 
                         if _meta and _meta.get("conversation_id"):
                             conv_id = _meta["conversation_id"]
+
+                    tail = stop_scan.flush()
+                    if tail:
+                        if current_block_type != "text":
+                            if current_block_type is not None:
+                                yield sse_content_block_stop(current_block_index)
+                            current_block_index += 1
+                            current_block_type = "text"
+                            yield sse_content_block_start(
+                                current_block_index, {"type": "text", "text": ""}
+                            )
+                        yield sse_content_block_delta(
+                            current_block_index, {"type": "text_delta", "text": tail}
+                        )
 
                     if current_block_type is not None:
                         yield sse_content_block_stop(current_block_index)
@@ -2682,7 +2764,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     output_tokens = max(
                         1, _est_tokens("".join(accumulated_chunks) + "".join(accumulated_thinking))
                     )
-                    yield sse_message_delta("end_turn", output_tokens)
+                    yield sse_message_delta(
+                        "stop_sequence" if stop_scan.hit else "end_turn",
+                        output_tokens,
+                        stop_sequence=stop_scan.hit.matched if stop_scan.hit else None,
+                    )
                     yield sse_message_stop()
 
                     if conv_id or req.conversation_id:
@@ -2710,6 +2796,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     tools_enabled=True,
                     allowed=resolve_allowed_tools(req.tools, req.tool_choice),
                 )
+                # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
+                stop_scan = StopSequenceScanner(stop_seq)
                 yield sse_message_start(msg_id, req.model, input_tokens)
 
                 block_idx = 0
@@ -2757,11 +2845,21 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                                 yield sse_content_block_stop(block_idx)
                                 in_thinking_block = False
                                 block_idx += 1
+                            # [PROTOCOL] 停用词在**开块之前**判定：命中时这一块
+                            # 根本不该存在，先开一个空 text 块再不发内容会在
+                            # 事件流里留下一个没有正文的块。
+                            safe_act = stop_scan.feed(act.content)
+                            if not safe_act:
+                                continue
                             if not in_text_block:
                                 yield sse_content_block_start(block_idx, {"type": "text", "text": ""})
                                 in_text_block = True
-                            yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": act.content})
+                            yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": safe_act})
 
+                # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
+                # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
+                if streamer.truncate_at_stop(stop_seq):
+                    stop_scan.mark_hit()
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
@@ -2778,11 +2876,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     in_thinking_block = False
                     block_idx += 1
 
+                # [PROTOCOL] 流结束前把被扣住的尾巴放行（或确认它已被停用词截掉）
+                rem_text = stop_scan.feed(rem_text) + stop_scan.flush() if rem_text else stop_scan.flush()
                 if rem_text:
                     if not in_text_block:
                         yield sse_content_block_start(block_idx, {"type": "text", "text": ""})
                         in_text_block = True
                     yield sse_content_block_delta(block_idx, {"type": "text_delta", "text": rem_text})
+                hit_stop = stop_scan.hit
 
                 if in_text_block:
                     yield sse_content_block_stop(block_idx)
@@ -2821,7 +2922,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     if block_idx == 0:
                         yield sse_content_block_start(0, {"type": "text", "text": ""})
                         yield sse_content_block_stop(0)
-                    yield sse_message_delta("end_turn", output_tokens)
+                    # [PROTOCOL] Anthropic 有真正的 stop_sequence 终止原因，如实报告；
+                    # OpenAI 没有这个枚举值，那边只能是 "stop"。
+                    yield sse_message_delta(
+                        "stop_sequence" if hit_stop else "end_turn",
+                        output_tokens,
+                        stop_sequence=hit_stop.matched if hit_stop else None,
+                    )
 
                 yield sse_message_stop()
 
@@ -2974,6 +3081,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
     full_output = "".join(chunks)
     full_thinking = "".join(thinking_chunks)
+    # [PROTOCOL] 停用词截断必须在工具解析之前（截断点后的调用对客户端不存在）
+    full_output, _stop_matched = truncate_final(full_output, stop_seq)
     output_tokens = max(1, _est_tokens(full_output + full_thinking))
     msg_id = _id("msg", "_")
 
@@ -3056,7 +3165,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         content=blocks,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
+        # [PROTOCOL] Anthropic 的枚举里有 stop_sequence，如实报告截断原因
+        stop_reason="stop_sequence" if _stop_matched else "end_turn",
         conversation_id=conv_id or req.conversation_id,
+        stop_sequence=_stop_matched or None,
     )
     if failover_event:
         msg_data["failover"] = failover_event.to_dict()
@@ -3095,6 +3207,8 @@ async def count_tokens(req: AnthropicCountTokensRequest):
 @app.post("/responses")
 async def responses_endpoint(req: ResponsesRequest):
     parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
+    # [PROTOCOL] OpenAI 生态通用字段：Responses 客户端同样会带 stop
+    stop_seq = req.stop
     gateway_messages = convert_responses_to_gateway_messages(req)
     if not gateway_messages:
         return JSONResponse(
@@ -3317,6 +3431,8 @@ async def responses_endpoint(req: ResponsesRequest):
                     tools_enabled=bool(req.tools),
                     allowed=resolve_allowed_tools(req.tools, req.tool_choice),
                 )
+                # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
+                stop_scan = StopSequenceScanner(stop_seq)
                 yield ev.created()
                 yield ev.in_progress()
 
@@ -3409,15 +3525,24 @@ async def responses_endpoint(req: ResponsesRequest):
                             if in_reasoning:
                                 async for frame in _close_reasoning():
                                     yield frame
+                            # [PROTOCOL] 停用词在**开项之前**判定：命中时这一项
+                            # 根本不该出现，先开一个空 message 项会污染 output 列表
+                            safe_act = stop_scan.feed(act.content)
+                            if not safe_act:
+                                continue
                             if not in_text_part:
                                 yield ev.output_item_added(
                                     out_idx, message_item(text_item_id, "", status="in_progress")
                                 )
                                 yield ev.content_part_added(text_item_id, out_idx, 0)
                                 in_text_part = True
-                            emitted_parts.append(act.content)
-                            yield ev.output_text_delta(text_item_id, act.content, out_idx, 0)
+                            emitted_parts.append(safe_act)
+                            yield ev.output_text_delta(text_item_id, safe_act, out_idx, 0)
 
+                # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
+                # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
+                if streamer.truncate_at_stop(stop_seq):
+                    stop_scan.mark_hit()
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
@@ -3429,6 +3554,8 @@ async def responses_endpoint(req: ResponsesRequest):
                         parallel_disallowed,
                         answer_text="".join(streamer.accumulated_text),
                     )
+                # [PROTOCOL] 终局剩余正文同样过停用词判定，并把扣住的尾巴放行
+                rem_text = stop_scan.feed(rem_text) + stop_scan.flush()
                 if rem_text:
                     if in_reasoning:
                         async for frame in _close_reasoning():
@@ -3491,6 +3618,8 @@ async def responses_endpoint(req: ResponsesRequest):
                     reasoning_tokens=reasoning_tokens,
                     failover=failover_event.to_dict() if failover_event else None,
                     conversation_id=conv_id or req.conversation_id,
+                    # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete
+                    incomplete_reason="stop" if stop_scan.hit else None,
                 )
                 yield sse_done()
 
@@ -3591,6 +3720,8 @@ async def responses_endpoint(req: ResponsesRequest):
 
     full_output = "".join(chunks)
     full_reasoning = "".join(reasoning_chunks)
+    # [PROTOCOL] 停用词截断必须在工具解析之前（截断点后的调用对客户端不存在）
+    full_output, _stop_matched = truncate_final(full_output, stop_seq)
     output_tokens = max(1, _est_tokens(full_output + full_reasoning))
 
     thinking_duration_ms = None
@@ -3655,6 +3786,10 @@ async def responses_endpoint(req: ResponsesRequest):
         reasoning_text=full_reasoning,
         reasoning_tokens=max(1, _est_tokens(full_reasoning)) if full_reasoning else 0,
     )
+    # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete（与流式路径同一语义）
+    if _stop_matched:
+        resp_data["status"] = "incomplete"
+        resp_data["incomplete_details"] = {"reason": "stop"}
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
     if flight_decision and flight_decision.is_leader:

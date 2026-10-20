@@ -40,7 +40,7 @@ import time
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict
 
-from .anthropic_compat import format_tools_system_prompt
+from .anthropic_compat import format_response_format_prompt, format_tools_system_prompt
 from .base import _est_tokens, _id, error_response
 
 
@@ -55,6 +55,11 @@ class ResponsesRequest(BaseModel):
     tools: Optional[List[dict]] = None
     tool_choice: Optional[Union[str, dict]] = None
     parallel_tool_calls: Optional[bool] = None
+    # [PROTOCOL] OpenAI 生态通用字段：Responses 客户端同样会带 stop
+    stop: Optional[Union[str, List[str]]] = None
+    # [PROTOCOL] Responses 的结构化输出在 `text.format` 里（旧客户端用 response_format）
+    text: Optional[dict] = None
+    response_format: Optional[dict] = None
     max_output_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
@@ -64,6 +69,33 @@ class ResponsesRequest(BaseModel):
     # `gpt-5-codex` 这样的非推理前缀上，于是「想清楚再动手」的意图被静默丢弃。
     reasoning: Optional[Union[dict, str]] = None
     thinking: Optional[Union[dict, bool]] = None
+
+
+def _responses_text_format(req: "ResponsesRequest") -> Optional[dict]:
+    """从 Responses 请求里取出结构化输出约束（`text.format` 优先，兼容 `response_format`）。
+
+    Responses 把 OpenAI 的 `response_format` 搬到了 `text.format`：
+    `{"text": {"format": {"type": "json_schema", "name": ..., "schema": ...}}}`。
+    这里把它改写成 `format_response_format_prompt` 认识的老形状再复用，避免同一套
+    翻译逻辑存在两份（本仓库反复出现的漂移缺陷类型）。
+    """
+    if isinstance(req.text, dict):
+        fmt = req.text.get("format")
+        if isinstance(fmt, dict):
+            f_type = fmt.get("type")
+            if f_type == "json_schema":
+                return {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": fmt.get("name"),
+                        "schema": fmt.get("schema"),
+                    },
+                }
+            if isinstance(f_type, str):
+                return {"type": f_type}
+    if isinstance(req.response_format, dict):
+        return req.response_format
+    return None
 
 
 def extract_responses_content(content: Any) -> str:
@@ -181,6 +213,10 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
         )
         if tools_prompt:
             system_parts.append(tools_prompt)
+    # [PROTOCOL] `text.format` 是 Responses 的 response_format，同样是必须被模型看见的约束
+    fmt_prompt = format_response_format_prompt(_responses_text_format(req))
+    if fmt_prompt:
+        system_parts.append(fmt_prompt)
 
     messages: list[dict] = []
     if system_parts:
@@ -581,8 +617,15 @@ class ResponsesEventStream:
         reasoning_tokens: int = 0,
         failover: Optional[dict] = None,
         conversation_id: Optional[str] = None,
+        incomplete_reason: Optional[str] = None,
     ) -> str:
         resp_obj = self._response_shell("completed", output)
+        if incomplete_reason:
+            # [PROTOCOL] Responses 的 status 枚举里没有 "stop_sequence"：被 client 的
+            # stop 截断属于 "incomplete" + reason "stop"，与"自然说完"必须可区分，
+            # 否则客户端无法判断这一轮是否被网关截短了。
+            resp_obj["status"] = "incomplete"
+            resp_obj["incomplete_details"] = {"reason": incomplete_reason}
         resp_obj["usage"] = _usage(input_tokens, output_tokens, reasoning_tokens)
         if conversation_id:
             resp_obj["conversation_id"] = conversation_id

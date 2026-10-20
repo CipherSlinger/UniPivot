@@ -49,7 +49,7 @@ from typing import (
     Union,
 )
 
-from .base import ProviderError
+from .base import ProviderError, StopSequenceHit
 from .credential_renewal import get_credential_renewal
 from .credential_watch import get_credential_watch
 from .quarantine import get_quarantine_store
@@ -2296,6 +2296,10 @@ class FailoverRouter:
 
                     return wrapped_stream(), failover_event, provider
 
+            except StopSequenceHit:
+                # [PROTOCOL] 停用词命中是客户端要求「到此为止」的正常终止，不是上游
+                # 故障：若落进下面的兜底分支，会被记成 502 并给健康节点上冷却。
+                raise
             except (ProviderError, Exception) as exc:
                 if primary_exc is None:
                     primary_exc = exc

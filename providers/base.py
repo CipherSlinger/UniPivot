@@ -39,6 +39,25 @@ class ProviderError(Exception):
         self.message = message
 
 
+class StopSequenceHit(Exception):
+    """[PROTOCOL] 客户端声明的 `stop` / `stop_sequences` 命中了完成文本。
+
+    **必须是异常而不是哨兵值**：停用词是一个「上游正常、但客户端明确要求到此为止」
+    的终止条件，不是上游故障。若用普通返回值表达，`execute_chat` 的包装流与三个
+    协议的生成器都得各自识别它，而故障转移循环会把任何非空返回当作正常完成；
+    若用 `ProviderError` 表达，它会被当成上游 502 记录进风控账本并触发不必要的
+    节点冷却——一次正常的语义截断会误伤一个健康节点的健康度。
+
+    携带 `text`（命中点之前的文本）与 `matched`（命中的停用词），由收口点转成
+    各协议的 `finish_reason: "stop"` / `stop_reason: "stop_sequence"`。
+    """
+
+    def __init__(self, text: str, matched: str):
+        super().__init__(f"stop sequence matched: {matched!r}")
+        self.text = text
+        self.matched = matched
+
+
 def text_of(content: Union[str, List[dict], None]) -> str:
     """从 OpenAI 消息 content（字符串或多部分列表）中提取纯文本。"""
     if content is None:
