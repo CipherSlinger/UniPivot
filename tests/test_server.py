@@ -86,6 +86,12 @@ def test_upstream_error_json():
 
 
 def test_upstream_error_sse():
+    """[H4] 上游在**首个字节发出前**就失败时，状态行必须如实反映失败。
+
+    这曾经是 200 + 行内 `data: {"error": ...}`：客户端（多数 SDK）把状态码当成功，
+    错误体被丢弃或解析失败，表现为「静默失败」。`/v1/responses` 一直是 503，同一
+    条协议纪律在两条路径上出现两种结果，因此这里断言的是 503。
+    """
     srv._make_provider = lambda key: BoomProvider()
     client = TestClient(srv.app)
     with client.stream(
@@ -93,7 +99,7 @@ def test_upstream_error_sse():
         "/v1/chat/completions",
         json={"model": "deepseek-chat", "messages": [{"role": "user", "content": "hi"}], "stream": True},
     ) as r:
-        assert r.status_code == 200
+        assert r.status_code == 401, r.text
         text = "".join(r.iter_text())
     assert '"error"' in text
     assert "token 无效" in text
@@ -466,15 +472,15 @@ def test_anthropic_error_mapping():
     assert r_401.json()["type"] == "error"
     assert r_401.json()["error"]["type"] == "authentication_error"
 
-    # 4. 上游异常（流式内抛错，吐出 event: error）
+    # 4. 上游在首个事件前就失败：[H4] 状态行必须如实反映失败（此前是 200 + 流内
+    #    `event: error`，客户端按状态码当成功，错误被静默丢弃）。
     with client.stream(
         "POST",
         "/v1/messages",
         json={"model": "claude-3-7-sonnet", "messages": [{"role": "user", "content": "hi"}], "stream": True},
     ) as r_stream_err:
-        assert r_stream_err.status_code == 200
+        assert r_stream_err.status_code == 401, r_stream_err.text
         text = "".join(r_stream_err.iter_text())
-    assert "event: error" in text
     assert "authentication_error" in text
 
 

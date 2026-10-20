@@ -1969,6 +1969,47 @@ async def chat_completions(req: ChatCompletionRequest):
                 headers=stream_headers,
             )
 
+        # [H4] 零上游快速失败必须在**状态行**上体现。`execute_chat` 在派发前就可能
+        # 拒绝（凭证整环失效 / 运维禁用 / 封禁租约 / 长效避让 / 环内耗尽），此时还没
+        # 有任何字节发出。若把它留在生成器里 await，响应头已经以 200 发出，客户端
+        # 只能读到一段 `data: {"error": ...}`——多数 SDK 会把状态码当成功并丢掉错误，
+        # 表现为「静默失败」；而 `/v1/responses` 走的是返回前的非流式分支，能如实
+        # 返回 503。同一条协议纪律在两条路径上有两种结果，是本项目反复记录的那类
+        # 缺陷。这里只提前 **第一个事件之前** 的 await，不是把所有内容缓冲起来：
+        # 一旦拿到上游流，其余一切仍是逐字转发。
+        preopened_stream = None
+        preopened_event = None
+        preopened_provider = None
+        if not (flight_decision and not flight_decision.is_leader):
+            try:
+                preopened_stream, preopened_event, preopened_provider = (
+                    await failover_router.execute_chat(
+                        primary_provider_key=dispatched_provider,
+                        primary_wire_model=dispatched_model,
+                        provider_factory=lambda pkey: _make_provider(pkey),
+                        chat_args=chat_args,
+                    )
+                )
+            except ProviderError as e:
+                is_risk, _ = is_risk_interception(e.message)
+                if is_risk:
+                    await failover_router.cooldown_tracker.record_failure(
+                        dispatched_provider, e.status, e.message
+                    )
+                if flight_decision and flight_decision.is_leader:
+                    await flight_decision.group.finish(error=e)
+                return JSONResponse(
+                    error_response(e.message, e.status, e.err_type),
+                    status_code=e.status,
+                )
+            except Exception as e:
+                if flight_decision and flight_decision.is_leader:
+                    await flight_decision.group.finish(error=e)
+                return JSONResponse(
+                    error_response(f"上游服务异常: {e}", 502, "upstream_error"),
+                    status_code=502,
+                )
+
         async def gen():
             cid = _id("chatcmpl")
             created = int(time.time())
@@ -1986,12 +2027,10 @@ async def chat_completions(req: ChatCompletionRequest):
             # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
             if not req.tools:
                 try:
-                    stream, failover_event, active_provider = await failover_router.execute_chat(
-                        primary_provider_key=dispatched_provider,
-                        primary_wire_model=dispatched_model,
-                        provider_factory=lambda pkey: _make_provider(pkey),
-                        chat_args=chat_args,
-                    )
+                    # [H4] 流已在返回响应之前打开（见 preopened_stream），这里只接管。
+                    stream = preopened_stream
+                    failover_event = preopened_event
+                    active_provider = preopened_provider
 
                     first_chunk = {
                         "id": cid,
@@ -2134,12 +2173,10 @@ async def chat_completions(req: ChatCompletionRequest):
 
             # 2. Tools 模式：推测式流式分发与自愈解析
             try:
-                stream, failover_event, active_provider = await failover_router.execute_chat(
-                    primary_provider_key=dispatched_provider,
-                    primary_wire_model=dispatched_model,
-                    provider_factory=lambda pkey: _make_provider(pkey),
-                    chat_args=chat_args,
-                )
+                # [H4] 同上：流已在返回响应之前打开。
+                stream = preopened_stream
+                failover_event = preopened_event
+                active_provider = preopened_provider
 
                 streamer = SpeculativeToolStreamer(
                     tools_enabled=True,
@@ -2675,6 +2712,40 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 headers=stream_headers,
             )
 
+        # [H4] 与 OpenAI 路径同一条纪律：派发前的拒绝必须体现在状态行上，而不是
+        # 200 + 行内错误。只提前「第一个事件之前」的 await，拿到上游流后仍逐字转发。
+        preopened_stream = None
+        preopened_event = None
+        preopened_provider = None
+        try:
+            preopened_stream, preopened_event, preopened_provider = (
+                await failover_router.execute_chat(
+                    primary_provider_key=dispatched_provider,
+                    primary_wire_model=dispatched_model,
+                    provider_factory=lambda pkey: _make_provider(pkey),
+                    chat_args=chat_args,
+                )
+            )
+        except ProviderError as e:
+            is_risk, _ = is_risk_interception(e.message)
+            if is_risk:
+                await failover_router.cooldown_tracker.record_failure(
+                    dispatched_provider, e.status, e.message
+                )
+            if flight_decision and flight_decision.is_leader:
+                await flight_decision.group.finish(error=e)
+            return JSONResponse(
+                anthropic_error_response(e.message, e.status, e.err_type),
+                status_code=e.status,
+            )
+        except Exception as e:
+            if flight_decision and flight_decision.is_leader:
+                await flight_decision.group.finish(error=e)
+            return JSONResponse(
+                anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error"),
+                status_code=502,
+            )
+
         async def gen():
             msg_id = _id("msg", "_")
             conv_id: Optional[str] = None
@@ -2688,12 +2759,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             try:
                 # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
                 if not req.tools:
-                    stream, failover_event, active_provider = await failover_router.execute_chat(
-                        primary_provider_key=dispatched_provider,
-                        primary_wire_model=dispatched_model,
-                        provider_factory=lambda pkey: _make_provider(pkey),
-                        chat_args=chat_args,
-                    )
+                    # [H4] 流已在返回响应之前打开（见 preopened_stream），这里只接管。
+                    stream = preopened_stream
+                    failover_event = preopened_event
+                    active_provider = preopened_provider
 
                     yield sse_message_start(msg_id, req.model, input_tokens)
 
@@ -2800,12 +2869,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     return
 
                 # 2. Agent / 工具模式：推测式流式分发与容错解析
-                stream, failover_event, active_provider = await failover_router.execute_chat(
-                    primary_provider_key=dispatched_provider,
-                    primary_wire_model=dispatched_model,
-                    provider_factory=lambda pkey: _make_provider(pkey),
-                    chat_args=chat_args,
-                )
+                # [H4] 同上：流已在返回响应之前打开。
+                stream = preopened_stream
+                failover_event = preopened_event
+                active_provider = preopened_provider
 
                 streamer = SpeculativeToolStreamer(
                     tools_enabled=True,
