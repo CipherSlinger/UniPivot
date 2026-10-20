@@ -3,7 +3,34 @@
 支持 Codex CLI 及新版 OpenAI SDK Responses 协议标准：
 - 请求转译（ResponsesRequest -> gateway_messages）
 - 响应格式化（Response 对象、Message Output Item、Function Call Output Item）
-- SSE 事件流生成（response.created -> output_item.added -> content_part.added -> text.delta -> content_part.done -> output_item.done -> response.completed -> [DONE]）
+- SSE 事件流生成
+
+[TOOL-LOOP] 事件流必须与 OpenAI Responses 的**线上形状**逐字段一致，而不是「大致
+相似」：Codex CLI 这类客户端按事件名分派、按 `item_id` 关联增量、按
+`sequence_number` 判断顺序，任何一处不同都会让客户端丢弃整段输出（表现为「agent
+连上了但不说话」或「工具调用没跑起来」）。本模块因此用 `ResponsesEventStream`
+作为**唯一**的事件构造入口：
+
+  response.created
+    -> response.in_progress
+    -> response.output_item.added            (item: message | function_call | reasoning)
+    -> response.content_part.added           (part: {"type": "output_text"})
+    -> response.output_text.delta  ...       (逐字增量)
+    -> response.output_text.done
+    -> response.content_part.done
+    -> response.output_item.done
+    -> response.function_call_arguments.delta / .done   (工具调用)
+    -> response.completed
+    -> [DONE]
+
+历史缺陷（实测）：
+  1. 文本增量事件名是 `response.text.delta`，现行规范是
+     `response.output_text.delta`——按名分派的客户端收不到任何文本。
+  2. 所有事件都缺 `type` 字段，而 SDK 正是按 body 里的 `type`（而非 SSE 的
+     `event:` 行）分派。
+  3. `content_part.added` / 增量事件缺 `item_id`，客户端无法把增量挂到 item 上。
+  4. 消息内容块类型写成 `text`，规范是 `output_text`；`annotations` 缺失。
+  5. 没有任何 `sequence_number`，且思考流（reasoning）被整段丢弃。
 """
 
 from __future__ import annotations
@@ -26,6 +53,8 @@ class ResponsesRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = None
     tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
+    parallel_tool_calls: Optional[bool] = None
     max_output_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
@@ -41,7 +70,7 @@ def extract_responses_content(content: Any) -> str:
         return content
     if isinstance(content, dict):
         b_type = content.get("type", "")
-        if b_type in ("text", "input_text"):
+        if b_type in ("text", "input_text", "output_text"):
             return content.get("text", "")
         if "text" in content:
             return str(content["text"])
@@ -55,7 +84,7 @@ def extract_responses_content(content: Any) -> str:
             parts.append(block)
         elif isinstance(block, dict):
             b_type = block.get("type", "")
-            if b_type in ("text", "input_text"):
+            if b_type in ("text", "input_text", "output_text"):
                 t = block.get("text", "")
                 if t:
                     parts.append(t)
@@ -63,6 +92,10 @@ def extract_responses_content(content: Any) -> str:
                 th = block.get("thinking", "")
                 if th:
                     parts.append(f"<thinking>\n{th}\n</thinking>")
+            elif b_type in ("summary_text", "reasoning_text"):
+                t = block.get("text", "")
+                if t:
+                    parts.append(f"<thinking>\n{t}\n</thinking>")
             elif b_type in ("tool_result", "function_call_output"):
                 sub = block.get("output", "") or block.get("content", "")
                 if isinstance(sub, list):
@@ -84,9 +117,13 @@ def extract_responses_content(content: Any) -> str:
                         args = json.loads(args)
                     except Exception:
                         pass
-                parts.append(
-                    f"```tool_call\n{json.dumps({'name': name, 'arguments': args}, ensure_ascii=False)}\n```"
-                )
+                # [TOOL-LOOP] 带上调用 id：客户端回传的历史里，工具结果只带
+                # call_id，若调用侧不写 id，模型看到的就是一段无主的输出。
+                payload: dict[str, Any] = {"name": name, "arguments": args}
+                c_id = block.get("call_id") or block.get("id")
+                if c_id:
+                    payload["id"] = c_id
+                parts.append(f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```")
             elif "text" in block and block["text"]:
                 parts.append(str(block["text"]))
     return "\n".join(parts)
@@ -111,7 +148,7 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                 system_parts.append(ins)
 
     if req.tools:
-        tools_prompt = format_tools_system_prompt(req.tools)
+        tools_prompt = format_tools_system_prompt(req.tools, tool_choice=req.tool_choice)
         if tools_prompt:
             system_parts.append(tools_prompt)
 
@@ -150,7 +187,11 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                             args = json.loads(args)
                         except Exception:
                             pass
-                    call_text = f"```tool_call\n{json.dumps({'name': name, 'arguments': args}, ensure_ascii=False)}\n```"
+                    payload: dict[str, Any] = {"name": name, "arguments": args}
+                    c_id = item.get("call_id") or item.get("id")
+                    if c_id:
+                        payload["id"] = c_id
+                    call_text = f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
                     messages.append({"role": "assistant", "content": call_text})
                 elif item_type == "function_call_output":
                     c_id = item.get("call_id", "")
@@ -178,8 +219,12 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                                         fn_args = json.loads(fn_args)
                                     except Exception:
                                         pass
+                                tc_payload: dict[str, Any] = {"name": fn_name, "arguments": fn_args}
+                                tc_id = tc.get("id")
+                                if tc_id:
+                                    tc_payload["id"] = tc_id
                                 tc_parts.append(
-                                    f"```tool_call\n{json.dumps({'name': fn_name, 'arguments': fn_args}, ensure_ascii=False)}\n```"
+                                    f"```tool_call\n{json.dumps(tc_payload, ensure_ascii=False)}\n```"
                                 )
                             if tc_parts:
                                 c_text = (c_text + "\n" + "\n".join(tc_parts)).strip()
@@ -190,6 +235,62 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                         messages.append({"role": "user", "content": c_text})
 
     return messages
+
+
+# ---------------------------------------------------------------- 响应对象
+
+def _usage(input_tokens: int, output_tokens: int, reasoning_tokens: int = 0) -> dict:
+    """Responses 规范的 usage：除总数外还带 *_tokens_details 子对象。"""
+    return {
+        "input_tokens": input_tokens,
+        "input_tokens_details": {"cached_tokens": 0},
+        "output_tokens": output_tokens,
+        "output_tokens_details": {"reasoning_tokens": reasoning_tokens},
+        "total_tokens": input_tokens + output_tokens,
+    }
+
+
+def message_item(
+    msg_id: str,
+    text: str = "",
+    *,
+    status: str = "completed",
+) -> dict:
+    """构造 assistant message 输出项（内容块类型为规范的 `output_text`）。"""
+    return {
+        "id": msg_id,
+        "type": "message",
+        "status": status,
+        "role": "assistant",
+        "content": [{"type": "output_text", "text": text, "annotations": []}],
+    }
+
+
+def reasoning_item(rs_id: str, text: str = "", *, status: str = "completed") -> dict:
+    """构造 reasoning 输出项；思考内容以 summary 呈现（Codex 的展示方式）。"""
+    return {
+        "id": rs_id,
+        "type": "reasoning",
+        "status": status,
+        "summary": [{"type": "summary_text", "text": text}] if text else [],
+    }
+
+
+def function_call_item(
+    call_id: str,
+    name: str,
+    arguments: str = "",
+    *,
+    status: str = "completed",
+) -> dict:
+    return {
+        "id": call_id,
+        "type": "function_call",
+        "call_id": call_id,
+        "name": name,
+        "arguments": arguments,
+        "status": status,
+    }
 
 
 def format_responses_completion(
@@ -204,25 +305,19 @@ def format_responses_completion(
     tool_calls: Optional[List[dict]] = None,
     msg_id: Optional[str] = None,
     failover: Optional[dict] = None,
+    reasoning_text: str = "",
+    reasoning_id: Optional[str] = None,
+    reasoning_tokens: int = 0,
 ) -> dict:
     """构造标准的 Responses API JSON 对象。"""
     created = created_at or int(time.time())
     m_id = msg_id or _id("msg", "_")
 
     output_items: list[dict] = []
+    if reasoning_text:
+        output_items.append(reasoning_item(reasoning_id or _id("rs", "_"), reasoning_text))
     if (output_text and output_text.strip()) or not tool_calls:
-        output_items.append({
-            "id": m_id,
-            "type": "message",
-            "status": "completed",
-            "role": "assistant",
-            "content": [
-                {
-                    "type": "text",
-                    "text": output_text or "",
-                }
-            ],
-        })
+        output_items.append(message_item(m_id, output_text or ""))
 
     if tool_calls:
         for tc in tool_calls:
@@ -234,14 +329,7 @@ def format_responses_completion(
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             elif fn_args is None:
                 fn_args = "{}"
-            output_items.append({
-                "id": c_id,
-                "type": "function_call",
-                "call_id": c_id,
-                "name": fn_name,
-                "arguments": str(fn_args),
-                "status": "completed",
-            })
+            output_items.append(function_call_item(c_id, fn_name, str(fn_args)))
 
     resp = {
         "id": resp_id,
@@ -250,11 +338,9 @@ def format_responses_completion(
         "status": status,
         "model": model,
         "output": output_items,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
+        "parallel_tool_calls": True,
+        "tool_choice": "auto",
+        "usage": _usage(input_tokens, output_tokens, reasoning_tokens),
     }
     if conversation_id:
         resp["conversation_id"] = conversation_id
@@ -263,32 +349,234 @@ def format_responses_completion(
     return resp
 
 
-def sse_response_created(resp_id: str, model: str, created_at: Optional[int] = None) -> str:
-    created = created_at or int(time.time())
-    data = {
-        "response": {
-            "id": resp_id,
+# ---------------------------------------------------------------- SSE 事件流
+
+class ResponsesEventStream:
+    """单个 /v1/responses 请求的事件构造器（唯一实现）。
+
+    为什么是类而不是一堆自由函数：`sequence_number` 必须单调递增，`item_id` 必须
+    在 added / delta / done 之间保持一致。这些是**跨事件的状态**，用自由函数实现
+    就只能由调用方各自维护一份，最终必然漂移（本仓库反复出现的缺陷类型）。
+    """
+
+    def __init__(self, resp_id: str, model: str, created_at: Optional[int] = None):
+        self.resp_id = resp_id
+        self.model = model
+        self.created_at = created_at or int(time.time())
+        self.seq = 0
+
+    # -- 内部 ---------------------------------------------------------------
+    def _frame(self, event: str, data: dict) -> str:
+        data["type"] = event
+        data["sequence_number"] = self.seq
+        self.seq += 1
+        return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    def _response_shell(self, status: str, output: Optional[list] = None) -> dict:
+        return {
+            "id": self.resp_id,
             "object": "response",
-            "created_at": created,
-            "status": "in_progress",
-            "model": model,
-            "output": [],
+            "created_at": self.created_at,
+            "status": status,
+            "model": self.model,
+            "output": output or [],
         }
-    }
-    return f"event: response.created\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+
+    # -- 生命周期 -----------------------------------------------------------
+    def created(self) -> str:
+        return self._frame("response.created", {"response": self._response_shell("in_progress")})
+
+    def in_progress(self) -> str:
+        return self._frame("response.in_progress", {"response": self._response_shell("in_progress")})
+
+    def output_item_added(self, output_index: int, item: dict) -> str:
+        return self._frame(
+            "response.output_item.added", {"output_index": output_index, "item": item}
+        )
+
+    def content_part_added(
+        self,
+        item_id: str,
+        output_index: int,
+        content_index: int,
+        part: Optional[dict] = None,
+    ) -> str:
+        return self._frame(
+            "response.content_part.added",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": part or {"type": "output_text", "text": "", "annotations": []},
+            },
+        )
+
+    def output_text_delta(
+        self,
+        item_id: str,
+        delta: str,
+        output_index: int = 0,
+        content_index: int = 0,
+    ) -> str:
+        return self._frame(
+            "response.output_text.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "delta": delta,
+                "logprobs": [],
+            },
+        )
+
+    def output_text_done(
+        self,
+        item_id: str,
+        text: str,
+        output_index: int = 0,
+        content_index: int = 0,
+    ) -> str:
+        return self._frame(
+            "response.output_text.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "text": text,
+                "logprobs": [],
+            },
+        )
+
+    def content_part_done(
+        self,
+        item_id: str,
+        full_text: str,
+        output_index: int = 0,
+        content_index: int = 0,
+    ) -> str:
+        return self._frame(
+            "response.content_part.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "content_index": content_index,
+                "part": {"type": "output_text", "text": full_text, "annotations": []},
+            },
+        )
+
+    def output_item_done(self, output_index: int, item: dict) -> str:
+        return self._frame(
+            "response.output_item.done", {"output_index": output_index, "item": item}
+        )
+
+    # -- 思考流 -------------------------------------------------------------
+    def reasoning_summary_delta(
+        self, item_id: str, delta: str, output_index: int = 0, summary_index: int = 0
+    ) -> str:
+        return self._frame(
+            "response.reasoning_summary_text.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "delta": delta,
+            },
+        )
+
+    def reasoning_summary_done(
+        self, item_id: str, text: str, output_index: int = 0, summary_index: int = 0
+    ) -> str:
+        return self._frame(
+            "response.reasoning_summary_text.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "summary_index": summary_index,
+                "text": text,
+            },
+        )
+
+    # -- 工具调用 -----------------------------------------------------------
+    def function_call_args_delta(
+        self, item_id: str, output_index: int, call_id: str, delta: str
+    ) -> str:
+        return self._frame(
+            "response.function_call_arguments.delta",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "delta": delta,
+            },
+        )
+
+    def function_call_args_done(
+        self, item_id: str, output_index: int, call_id: str, arguments: str
+    ) -> str:
+        return self._frame(
+            "response.function_call_arguments.done",
+            {
+                "item_id": item_id,
+                "output_index": output_index,
+                "call_id": call_id,
+                "arguments": arguments,
+            },
+        )
+
+    # -- 终局 ---------------------------------------------------------------
+    def completed(
+        self,
+        output: list,
+        input_tokens: int,
+        output_tokens: int,
+        *,
+        reasoning_tokens: int = 0,
+        failover: Optional[dict] = None,
+        conversation_id: Optional[str] = None,
+    ) -> str:
+        resp_obj = self._response_shell("completed", output)
+        resp_obj["usage"] = _usage(input_tokens, output_tokens, reasoning_tokens)
+        if conversation_id:
+            resp_obj["conversation_id"] = conversation_id
+        if failover:
+            resp_obj["failover"] = failover
+        data: dict[str, Any] = {"response": resp_obj}
+        if failover:
+            data["failover"] = failover
+        return self._frame("response.completed", data)
+
+    def error(self, message: str, status: int = 502, err_type: str = "upstream_error") -> str:
+        """Responses 规范的错误事件：`type:error` + code/message/param。"""
+        err = error_response(message, status, err_type)["error"]
+        return self._frame(
+            "error",
+            {
+                "code": err.get("type") or err_type,
+                "message": err.get("message") or message,
+                "param": None,
+            },
+        )
 
 
-def sse_response_output_item_added(
-    resp_id: str,
-    output_index: int,
-    item: dict,
-) -> str:
-    data = {
-        "response_id": resp_id,
-        "output_index": output_index,
-        "item": item,
-    }
-    return f"event: response.output_item.added\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+def sse_done() -> str:
+    """Responses 流的终结帧。"""
+    return "data: [DONE]\n\n"
+
+
+# ---------------------------------------------------------------- 兼容层
+# 以下自由函数保留给仍按「单帧」方式调用的外部代码；网关自身只使用
+# `ResponsesEventStream`，避免第二份实现与线上形状漂移。
+
+def _one(response: str) -> str:
+    return response
+
+
+def sse_response_created(resp_id: str, model: str, created_at: Optional[int] = None) -> str:
+    return ResponsesEventStream(resp_id, model, created_at).created()
+
+
+def sse_response_output_item_added(resp_id: str, output_index: int, item: dict) -> str:
+    return ResponsesEventStream(resp_id, "").output_item_added(output_index, item)
 
 
 def sse_response_content_part_added(
@@ -296,14 +584,11 @@ def sse_response_content_part_added(
     output_index: int,
     content_index: int,
     part: Optional[dict] = None,
+    item_id: Optional[str] = None,
 ) -> str:
-    data = {
-        "response_id": resp_id,
-        "output_index": output_index,
-        "content_index": content_index,
-        "part": part or {"type": "text", "text": ""},
-    }
-    return f"event: response.content_part.added\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id, "").content_part_added(
+        item_id or f"msg_{resp_id}", output_index, content_index, part
+    )
 
 
 def sse_response_text_delta(
@@ -311,13 +596,12 @@ def sse_response_text_delta(
     resp_id: Optional[str] = None,
     output_index: int = 0,
     content_index: int = 0,
+    item_id: Optional[str] = None,
 ) -> str:
-    data: dict[str, Any] = {"delta": delta}
-    if resp_id:
-        data["response_id"] = resp_id
-        data["output_index"] = output_index
-        data["content_index"] = content_index
-    return f"event: response.text.delta\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    """文本增量。名字沿用旧名，线上事件名是 `response.output_text.delta`。"""
+    return ResponsesEventStream(resp_id or "", "").output_text_delta(
+        item_id or f"msg_{resp_id}", delta, output_index, content_index
+    )
 
 
 def sse_response_content_part_done(
@@ -325,18 +609,11 @@ def sse_response_content_part_done(
     resp_id: Optional[str] = None,
     output_index: int = 0,
     content_index: int = 0,
+    item_id: Optional[str] = None,
 ) -> str:
-    data: dict[str, Any] = {
-        "part": {
-            "type": "text",
-            "text": full_text,
-        }
-    }
-    if resp_id:
-        data["response_id"] = resp_id
-        data["output_index"] = output_index
-        data["content_index"] = content_index
-    return f"event: response.content_part.done\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id or "", "").content_part_done(
+        item_id or f"msg_{resp_id}", full_text, output_index, content_index
+    )
 
 
 def sse_response_output_item_done(
@@ -344,13 +621,7 @@ def sse_response_output_item_done(
     resp_id: Optional[str] = None,
     output_index: int = 0,
 ) -> str:
-    data: dict[str, Any] = {
-        "item": item,
-    }
-    if resp_id:
-        data["response_id"] = resp_id
-        data["output_index"] = output_index
-    return f"event: response.output_item.done\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id or "", "").output_item_done(output_index, item)
 
 
 def sse_response_completed(
@@ -363,31 +634,13 @@ def sse_response_completed(
     failover: Optional[dict] = None,
     conversation_id: Optional[str] = None,
 ) -> str:
-    created = created_at or int(time.time())
-    resp_obj: dict[str, Any] = {
-        "id": resp_id,
-        "object": "response",
-        "created_at": created,
-        "status": "completed",
-        "model": model,
-        "output": output,
-        "usage": {
-            "input_tokens": input_tokens,
-            "output_tokens": output_tokens,
-            "total_tokens": input_tokens + output_tokens,
-        },
-    }
-    if conversation_id:
-        resp_obj["conversation_id"] = conversation_id
-    if failover:
-        resp_obj["failover"] = failover
-
-    data = {
-        "response": resp_obj,
-    }
-    if failover:
-        data["failover"] = failover
-    return f"event: response.completed\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id, model, created_at).completed(
+        output,
+        input_tokens,
+        output_tokens,
+        failover=failover,
+        conversation_id=conversation_id,
+    )
 
 
 def sse_response_function_call_args_delta(
@@ -396,13 +649,9 @@ def sse_response_function_call_args_delta(
     call_id: str,
     delta: str,
 ) -> str:
-    data = {
-        "response_id": resp_id,
-        "output_index": output_index,
-        "call_id": call_id,
-        "delta": delta,
-    }
-    return f"event: response.function_call_arguments.delta\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id, "").function_call_args_delta(
+        call_id, output_index, call_id, delta
+    )
 
 
 def sse_response_function_call_args_done(
@@ -411,19 +660,14 @@ def sse_response_function_call_args_done(
     call_id: str,
     arguments: str,
 ) -> str:
-    data = {
-        "response_id": resp_id,
-        "output_index": output_index,
-        "call_id": call_id,
-        "arguments": arguments,
-    }
-    return f"event: response.function_call_arguments.done\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream(resp_id, "").function_call_args_done(
+        call_id, output_index, call_id, arguments
+    )
 
 
 def sse_response_done() -> str:
-    return "data: [DONE]\n\n"
+    return sse_done()
 
 
 def sse_response_error(message: str, status: int = 502, err_type: str = "upstream_error") -> str:
-    data = error_response(message, status, err_type)
-    return f"event: error\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return ResponsesEventStream("", "").error(message, status, err_type)

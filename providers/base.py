@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -101,10 +102,18 @@ def _serialize_tool_calls(tool_calls) -> str:
                 args = {}
         elif not isinstance(args, dict):
             args = {}
+        # [AGENT-LOOP] 调用 id 必须随调用一起回放，否则紧随其后的
+        # `role:"tool"` 结果在提示词里无法与任何一次调用对应——模型只看到一段
+        # 无名输出，多轮 agent 循环在第二次往返时就会迷失。无 id 时**不写该键**，
+        # 保持既有精确 JSON 断言与无 id 客户端的输出逐值不变。
+        payload: dict = {}
+        call_id = tc.get("id")
+        if call_id:
+            payload["id"] = call_id
+        payload["name"] = name
+        payload["arguments"] = args
         blocks.append(
-            "```tool_call\n"
-            + json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-            + "\n```"
+            "```tool_call\n" + json.dumps(payload, ensure_ascii=False) + "\n```"
         )
     return "\n\n".join(blocks)
 
@@ -241,6 +250,18 @@ def parse_cookie_header(cookie: str) -> dict[str, str]:
 
 def sse_frame(obj: dict) -> str:
     return f"data: {json.dumps(obj, ensure_ascii=False)}\n\n"
+
+
+def get_stream_keepalive_interval() -> float:
+    """[STREAM-KEEPALIVE] 流式响应在沉默多少秒后插入一帧 SSE 注释。
+
+    默认 15s：低于常见客户端 60s 空闲阈值一个数量级，又不会在正常慢速生成时
+    制造无谓字节。`GATEWAY_STREAM_KEEPALIVE=0` 关闭（零回归）。
+    """
+    try:
+        return float(os.getenv("GATEWAY_STREAM_KEEPALIVE", "15"))
+    except (TypeError, ValueError):
+        return 15.0
 
 
 def completion_response(

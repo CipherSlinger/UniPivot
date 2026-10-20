@@ -166,6 +166,10 @@ class SpeculativeToolStreamer:
         self.text_window: str = ""
         self.accumulated_text: List[str] = []
         self.accumulated_tool_buffer: List[str] = []
+        # [TOOL-LOOP] 思考流单独累积：三个协议都要在终局回报 reasoning
+        # （Responses 的 reasoning output item、Anthropic 的 thinking 统计），
+        # 而思考增量不进 `accumulated_text`——它既不该参与工具解析，也不该计入正文。
+        self.accumulated_reasoning: List[str] = []
         self.emitted_text: List[str] = []
         self.tool_detected = False
 
@@ -220,6 +224,7 @@ class SpeculativeToolStreamer:
 
         # 1. 思考流内容永远零延迟即时发射
         if is_reasoning:
+            self.accumulated_reasoning.append(delta)
             actions.append(StreamAction("reasoning_delta", content=delta))
             return actions
 
@@ -291,6 +296,22 @@ class SpeculativeToolStreamer:
             self.emitted_text.append(safe_chunk)
 
         return actions
+
+    def feed_text(self, delta: str) -> List[StreamAction]:
+        """把一段**已知是正文**的文本送入状态机。
+
+        [TOOL-LOOP] 未声明 tools 时，流仍然是逐字直出的，但终局统计（token 数、
+        正文全文）必须完整。原先无 tools 分支自己维护 `accumulated_chunks`，
+        与 tools 分支的 `accumulated_text` 是两份账；这里让两条路径共用同一份
+        记账，差异只在是否锁存工具调用。
+        """
+        if not self.tools_enabled:
+            if not delta:
+                return []
+            self.accumulated_text.append(delta)
+            self.emitted_text.append(delta)
+            return [StreamAction("text_delta", content=delta)]
+        return self.feed_chunk(delta)
 
     def finalize(self) -> Tuple[str, Optional[List[Tuple[str, dict]]], bool]:
         """流结束时调用。

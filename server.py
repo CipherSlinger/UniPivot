@@ -87,23 +87,19 @@ from providers import (
     get_prompt_cache_manager,
     has_cache_control,
     ResponsesRequest,
+    ResponsesEventStream,
     convert_responses_to_gateway_messages,
     format_responses_completion,
-    sse_response_created,
-    sse_response_output_item_added,
-    sse_response_content_part_added,
-    sse_response_text_delta,
-    sse_response_content_part_done,
-    sse_response_output_item_done,
-    sse_response_completed,
-    sse_response_function_call_args_delta,
-    sse_response_function_call_args_done,
-    sse_response_done,
+    function_call_item,
+    message_item,
+    reasoning_item,
+    sse_done,
     sse_response_error,
 )
 from providers.base import _est_tokens, _id
 from providers import http_client
 from providers.disconnect_guard import disconnect_guard, guard_stream
+from providers.stream_keepalive import sse_keepalive
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
 from providers.session_affinity import AffinityDecision, session_affinity_manager
@@ -323,6 +319,17 @@ OPENAI_ALIASES = {
     "o1-mini": "reasoner",
     "o3": "reasoner",
     "o3-mini": "reasoner",
+    # [AGENT-LOOP] Agent CLI 实际会发的模型名。Codex CLI 默认请求 `gpt-5-codex`
+    # 一类的名字，缺表时 resolve_model 返回 (None, None)，客户端拿到 404 就再也
+    # 不会发起请求——表现正是「网关连上 agent 但一点效果都没有」。
+    "gpt-5": "flagship",
+    "gpt-5-codex": "reasoner",
+    "gpt-5-mini": "fast",
+    "gpt-5-nano": "fast",
+    "codex-mini-latest": "fast",
+    "o3-pro": "reasoner",
+    "o4": "reasoner",
+    "o4-mini": "reasoner",
     # 极速轻量模型 (Fast / Mini)
     "gpt-4o-mini": "fast",
     "gpt-4o-mini-2024-07-18": "fast",
@@ -417,10 +424,18 @@ def resolve_model(model: str) -> tuple[Optional[str], Optional[str]]:
     if not tier:
         if m_lower.startswith("gpt-4o-mini") or m_lower.startswith("gpt-3.5"):
             tier = "fast"
-        elif m_lower.startswith("gpt-4") or m_lower.startswith("gpt-4o"):
+        # [AGENT-LOOP] 未知模型名的失败方向必须是「可服务」而非 404：
+        # 各家 CLI 会随版本引入新的模型 id（gpt-5.1、o5、codex-*），一张固定表
+        # 永远追不上。前缀兜底让新 id 落到最有把握的档位，与下游 upstream_fallback
+        # 一致——宁可降级服务，也不要让客户端在握手阶段就被拒绝。
+        elif m_lower.startswith(("gpt-5", "gpt-6", "chatgpt")):
             tier = "flagship"
-        elif m_lower.startswith("o1") or m_lower.startswith("o3"):
+        elif m_lower.startswith(("gpt-4", "gpt-o", "gpt")):
+            tier = "flagship"
+        elif m_lower.startswith(("o1", "o3", "o4", "o5")):
             tier = "reasoner"
+        elif m_lower.startswith(("codex", "computer-use")):
+            tier = "flagship"
 
     if tier:
         backend = (
@@ -1790,7 +1805,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
     messages = [m.model_dump() for m in req.messages]
     if req.tools:
-        tools_prompt = format_tools_system_prompt(req.tools)
+        tools_prompt = format_tools_system_prompt(req.tools, tool_choice=req.tool_choice)
         if tools_prompt:
             if messages and messages[0].get("role") == "system":
                 orig = messages[0].get("content") or ""
@@ -1865,6 +1880,7 @@ async def chat_completions(req: ChatCompletionRequest):
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(lb_headers)
@@ -1876,7 +1892,7 @@ async def chat_completions(req: ChatCompletionRequest):
 
         if flight_decision and not flight_decision.is_leader:
             return StreamingResponse(
-                stream_follower_gen(flight_decision.group),
+                sse_keepalive(stream_follower_gen(flight_decision.group)),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -2049,7 +2065,11 @@ async def chat_completions(req: ChatCompletionRequest):
                         conversation_id = meta["conversation_id"]
 
                     is_r = bool(meta and meta.get("reasoning"))
-                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
+                    actions = (
+                        streamer.feed_chunk(delta, is_reasoning=True)
+                        if is_r
+                        else streamer.feed_text(delta)
+                    )
                     for act in actions:
                         if act.action_type == "reasoning_delta":
                             chunk = {
@@ -2227,7 +2247,7 @@ async def chat_completions(req: ChatCompletionRequest):
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
-            stream_body,
+            sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
         )
@@ -2419,7 +2439,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         )
 
     gateway_messages = convert_anthropic_to_gateway_messages(
-        req.messages, system=req.system, tools=req.tools
+        req.messages, system=req.system, tools=req.tools, tool_choice=req.tool_choice
     )
     # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
     gateway_messages, fold_meta = prompt_optimizer.optimize_chat_messages(gateway_messages)
@@ -2491,6 +2511,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(lb_headers)
@@ -2502,7 +2523,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
         if flight_decision and not flight_decision.is_leader:
             return StreamingResponse(
-                stream_follower_gen(flight_decision.group),
+                sse_keepalive(stream_follower_gen(flight_decision.group)),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -2634,7 +2655,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         conv_id = _meta["conversation_id"]
 
                     is_r = bool(_meta and _meta.get("reasoning"))
-                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
+                    actions = (
+                        streamer.feed_chunk(delta, is_reasoning=True)
+                        if is_r
+                        else streamer.feed_text(delta)
+                    )
                     for act in actions:
                         if act.action_type == "reasoning_delta":
                             if not in_thinking_block:
@@ -2745,7 +2770,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
-            stream_body,
+            sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
         )
@@ -2944,7 +2969,7 @@ async def count_tokens(req: AnthropicCountTokensRequest):
             return {"input_tokens": cached}
 
     gateway_messages = convert_anthropic_to_gateway_messages(
-        req.messages, system=req.system, tools=req.tools
+        req.messages, system=req.system, tools=req.tools, tool_choice=req.tool_choice
     )
     prompt = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(prompt)
@@ -3055,13 +3080,14 @@ async def responses_endpoint(req: ResponsesRequest):
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(base_headers)
 
         if flight_decision and not flight_decision.is_leader:
             return StreamingResponse(
-                stream_follower_gen(flight_decision.group),
+                sse_keepalive(stream_follower_gen(flight_decision.group)),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -3151,6 +3177,7 @@ async def responses_endpoint(req: ResponsesRequest):
     if req.stream:
         stream_headers = {
             "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
             "X-Accel-Buffering": "no",
         }
         stream_headers.update(resp_headers)
@@ -3158,95 +3185,25 @@ async def responses_endpoint(req: ResponsesRequest):
         async def gen():
             nonlocal ttft_recorded, success, is_rate_limit, error_msg
             conv_id: Optional[str] = None
+            ev = ResponsesEventStream(resp_id, req.model)
             try:
-                # 1. 纯文本模式：无 tools 声明时走零延迟逐字流式
-                if not req.tools:
-                    yield sse_response_created(resp_id, req.model)
-
-                    output_item = {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "in_progress",
-                        "role": "assistant",
-                        "content": [],
-                    }
-                    yield sse_response_output_item_added(resp_id, 0, output_item)
-                    yield sse_response_content_part_added(
-                        resp_id, 0, 0, {"type": "text", "text": ""}
-                    )
-
-                    accumulated_chunks: list[str] = []
-                    accumulated_reasoning: list[str] = []
-
-                    async for delta, _meta in stream:
-                        if not ttft_recorded and delta:
-                            load_balancer.record_ttft(
-                                dispatched_provider, (time.time() - start_time) * 1000.0
-                            )
-                            ttft_recorded = True
-
-                        if not delta:
-                            if _meta and _meta.get("conversation_id"):
-                                conv_id = _meta["conversation_id"]
-                            continue
-
-                        is_r = bool(_meta and _meta.get("reasoning"))
-                        if is_r:
-                            accumulated_reasoning.append(delta)
-                        else:
-                            accumulated_chunks.append(delta)
-                            yield sse_response_text_delta(delta, resp_id=resp_id, output_index=0, content_index=0)
-
-                        if _meta and _meta.get("conversation_id"):
-                            conv_id = _meta["conversation_id"]
-
-                    full_text = "".join(accumulated_chunks)
-                    full_reasoning = "".join(accumulated_reasoning)
-                    out_tokens = max(1, _est_tokens(full_text + full_reasoning))
-
-                    yield sse_response_content_part_done(
-                        full_text, resp_id=resp_id, output_index=0, content_index=0
-                    )
-
-                    done_item = {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": full_text}],
-                    }
-                    yield sse_response_output_item_done(done_item, resp_id=resp_id, output_index=0)
-
-                    yield sse_response_completed(
-                        resp_id,
-                        req.model,
-                        [done_item],
-                        input_tokens,
-                        out_tokens,
-                        failover=failover_event.to_dict() if failover_event else None,
-                        conversation_id=conv_id or req.conversation_id,
-                    )
-                    yield sse_response_done()
-
-                    if conv_id or req.conversation_id:
-                        session_affinity_manager.record_turn(
-                            req.conversation_id or conv_id,
-                            dispatched_provider,
-                            dispatched_model,
-                            conv_id,
-                        )
-
-                    if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
-                        conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
-                    success = True
-                    return
-
-                # 2. Tools 模式：推测式流式分发与自愈解析
-                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
-                yield sse_response_created(resp_id, req.model)
+                # [TOOL-LOOP] 两个分支现在共用同一套事件构造器与同一套流处理逻辑。
+                # 原先「有 tools」与「无 tools」是两份几乎相同的 200 行循环，差异只在
+                # 是否经过工具锁存——推理增量只在无 tools 分支被过滤掉、文本事件在
+                # 两处各自拼装，于是任何一处改动都会与另一处漂移（这正是本仓库反复
+                # 出现的缺陷类型）。现在由 `feed_chunk(tools_enabled=...)` 统一决定。
+                streamer = SpeculativeToolStreamer(
+                    tools_enabled=bool(req.tools), allowed=tool_names_of(req.tools)
+                )
+                yield ev.created()
+                yield ev.in_progress()
 
                 out_idx = 0
+                text_item_id = msg_id
+                reasoning_id = _id("rs", "_")
                 in_text_part = False
+                in_reasoning = False
+                emitted_parts: list[str] = []
 
                 async for delta, _meta in stream:
                     if not ttft_recorded and delta:
@@ -3263,57 +3220,59 @@ async def responses_endpoint(req: ResponsesRequest):
                         conv_id = _meta["conversation_id"]
 
                     is_r = bool(_meta and _meta.get("reasoning"))
-                    actions = streamer.feed_chunk(delta, is_reasoning=is_r)
-                    for act in actions:
-                        if act.action_type == "text_delta":
-                            if not in_text_part:
-                                yield sse_response_output_item_added(resp_id, out_idx, {
-                                    "id": msg_id,
-                                    "type": "message",
-                                    "status": "in_progress",
-                                    "role": "assistant",
-                                    "content": [],
-                                })
-                                yield sse_response_content_part_added(
-                                    resp_id, out_idx, 0, {"type": "text", "text": ""}
+                    for act in (
+                        streamer.feed_chunk(delta, is_reasoning=True)
+                        if is_r
+                        else streamer.feed_text(delta)
+                    ):
+                        if act.action_type == "reasoning_delta":
+                            # 思考流必须以 reasoning output item 呈现。原实现静默丢弃，
+                            # Codex 看到的是「想了几十秒然后什么都没有」。
+                            if not in_reasoning:
+                                yield ev.output_item_added(
+                                    out_idx, reasoning_item(reasoning_id, "", status="in_progress")
                                 )
+                                in_reasoning = True
+                            yield ev.reasoning_summary_delta(reasoning_id, act.content, out_idx)
+                        elif act.action_type == "text_delta":
+                            if not in_text_part:
+                                yield ev.output_item_added(
+                                    out_idx, message_item(text_item_id, "", status="in_progress")
+                                )
+                                yield ev.content_part_added(text_item_id, out_idx, 0)
                                 in_text_part = True
-                            yield sse_response_text_delta(
-                                act.content, resp_id=resp_id, output_index=out_idx, content_index=0
-                            )
+                            emitted_parts.append(act.content)
+                            yield ev.output_text_delta(text_item_id, act.content, out_idx, 0)
 
                 rem_text, tool_list, was_healed = streamer.finalize()
                 if rem_text:
                     if not in_text_part:
-                        yield sse_response_output_item_added(resp_id, out_idx, {
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        })
-                        yield sse_response_content_part_added(
-                            resp_id, out_idx, 0, {"type": "text", "text": ""}
+                        yield ev.output_item_added(
+                            out_idx, message_item(text_item_id, "", status="in_progress")
                         )
+                        yield ev.content_part_added(text_item_id, out_idx, 0)
                         in_text_part = True
-                    yield sse_response_text_delta(
-                        rem_text, resp_id=resp_id, output_index=out_idx, content_index=0
+                    emitted_parts.append(rem_text)
+                    yield ev.output_text_delta(text_item_id, rem_text, out_idx, 0)
+
+                full_reasoning = "".join(streamer.accumulated_reasoning)
+                if in_reasoning:
+                    yield ev.reasoning_summary_done(reasoning_id, full_reasoning, out_idx)
+                    yield ev.output_item_done(
+                        out_idx, reasoning_item(reasoning_id, full_reasoning)
                     )
+                    out_idx += 1
 
                 output_items: list[dict] = []
+                if in_reasoning:
+                    output_items.append(reasoning_item(reasoning_id, full_reasoning))
+
+                full_text = "".join(emitted_parts)
                 if in_text_part:
-                    full_emitted = "".join(streamer.emitted_text) + rem_text
-                    yield sse_response_content_part_done(
-                        full_emitted, resp_id=resp_id, output_index=out_idx, content_index=0
-                    )
-                    item_msg = {
-                        "id": msg_id,
-                        "type": "message",
-                        "status": "completed",
-                        "role": "assistant",
-                        "content": [{"type": "text", "text": full_emitted}],
-                    }
-                    yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=out_idx)
+                    yield ev.output_text_done(text_item_id, full_text, out_idx, 0)
+                    yield ev.content_part_done(text_item_id, full_text, out_idx, 0)
+                    item_msg = message_item(text_item_id, full_text)
+                    yield ev.output_item_done(out_idx, item_msg)
                     output_items.append(item_msg)
                     out_idx += 1
 
@@ -3324,68 +3283,41 @@ async def responses_endpoint(req: ResponsesRequest):
                     for tool_name, args in tool_list:
                         call_id = _id("call", "_")
                         args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args)
-                        item_fn = {
-                            "id": call_id,
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": tool_name,
-                            "arguments": "",
-                            "status": "in_progress",
-                        }
-                        yield sse_response_output_item_added(resp_id, out_idx, item_fn)
-                        yield sse_response_function_call_args_delta(resp_id, out_idx, call_id, args_str)
-                        yield sse_response_function_call_args_done(resp_id, out_idx, call_id, args_str)
-
-                        item_fn_done = {
-                            "id": call_id,
-                            "type": "function_call",
-                            "call_id": call_id,
-                            "name": tool_name,
-                            "arguments": args_str,
-                            "status": "completed",
-                        }
-                        yield sse_response_output_item_done(item_fn_done, resp_id=resp_id, output_index=out_idx)
-                        output_items.append(item_fn_done)
+                        yield ev.output_item_added(
+                            out_idx, function_call_item(call_id, tool_name, "", status="in_progress")
+                        )
+                        yield ev.function_call_args_delta(call_id, out_idx, call_id, args_str)
+                        yield ev.function_call_args_done(call_id, out_idx, call_id, args_str)
+                        item_fn = function_call_item(call_id, tool_name, args_str)
+                        yield ev.output_item_done(out_idx, item_fn)
+                        output_items.append(item_fn)
                         out_idx += 1
-                else:
-                    if not in_text_part:
-                        full_text = "".join(streamer.accumulated_text)
-                        item_msg = {
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "completed",
-                            "role": "assistant",
-                            "content": [{"type": "text", "text": full_text}],
-                        }
-                        yield sse_response_output_item_added(resp_id, 0, {
-                            "id": msg_id,
-                            "type": "message",
-                            "status": "in_progress",
-                            "role": "assistant",
-                            "content": [],
-                        })
-                        yield sse_response_content_part_added(
-                            resp_id, 0, 0, {"type": "text", "text": ""}
-                        )
-                        if full_text:
-                            yield sse_response_text_delta(full_text, resp_id=resp_id, output_index=0, content_index=0)
-                        yield sse_response_content_part_done(
-                            full_text, resp_id=resp_id, output_index=0, content_index=0
-                        )
-                        yield sse_response_output_item_done(item_msg, resp_id=resp_id, output_index=0)
-                        output_items.append(item_msg)
+                elif not in_text_part:
+                    # 既无文本也无工具（空回复）：仍然给出一个结构完整的空消息项，
+                    # 否则客户端会认为本轮没有任何输出。
+                    yield ev.output_item_added(
+                        out_idx, message_item(text_item_id, "", status="in_progress")
+                    )
+                    yield ev.content_part_added(text_item_id, out_idx, 0)
+                    yield ev.output_text_done(text_item_id, "", out_idx, 0)
+                    yield ev.content_part_done(text_item_id, "", out_idx, 0)
+                    item_msg = message_item(text_item_id, "")
+                    yield ev.output_item_done(out_idx, item_msg)
+                    output_items.append(item_msg)
 
-                out_tokens = max(1, _est_tokens("".join(streamer.accumulated_text)))
-                yield sse_response_completed(
-                    resp_id,
-                    req.model,
+                out_tokens = max(
+                    1, _est_tokens("".join(streamer.accumulated_text) + full_reasoning)
+                )
+                reasoning_tokens = max(1, _est_tokens(full_reasoning)) if full_reasoning else 0
+                yield ev.completed(
                     output_items,
                     input_tokens,
                     out_tokens,
+                    reasoning_tokens=reasoning_tokens,
                     failover=failover_event.to_dict() if failover_event else None,
                     conversation_id=conv_id or req.conversation_id,
                 )
-                yield sse_response_done()
+                yield sse_done()
 
                 if conv_id or req.conversation_id:
                     session_affinity_manager.record_turn(
@@ -3401,10 +3333,13 @@ async def responses_endpoint(req: ResponsesRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
-                yield sse_response_error(e.message, e.status, e.err_type)
+                is_risk, _ = is_risk_interception(e.message)
+                if is_risk:
+                    await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
+                yield ev.error(e.message, e.status, e.err_type)
             except Exception as e:
                 error_msg = str(e)
-                yield sse_response_error(f"上游服务异常: {e}", 502, "upstream_error")
+                yield ev.error(f"上游服务异常: {e}", 502, "upstream_error")
             finally:
                 _release_lb()
 
@@ -3416,7 +3351,7 @@ async def responses_endpoint(req: ResponsesRequest):
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
         return StreamingResponse(
-            stream_body,
+            sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
         )
@@ -3494,7 +3429,10 @@ async def responses_endpoint(req: ResponsesRequest):
     resp_headers.update(thinking_headers)
 
     tool_calls_list = None
-    parsed_res, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
+    parsed_res = None
+    was_healed = False
+    if req.tools:
+        parsed_res, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
     if parsed_res:
         prefix, tool_list = parsed_res
         _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -3524,6 +3462,8 @@ async def responses_endpoint(req: ResponsesRequest):
         tool_calls=tool_calls_list,
         msg_id=msg_id,
         failover=failover_event.to_dict() if failover_event else None,
+        reasoning_text=full_reasoning,
+        reasoning_tokens=max(1, _est_tokens(full_reasoning)) if full_reasoning else 0,
     )
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()

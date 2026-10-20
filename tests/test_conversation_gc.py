@@ -274,13 +274,15 @@ def test_server_wiring():
     # resolver 已注入
     assert srv.conversation_gc._resolver is not None, "server 必须注入 provider 构造器"
 
-    # 12 → 9 处调用点全部改为入队调度，且使用 dispatched_provider 作为节点标识
+    # 12 → 8 处调用点全部改为入队调度，且使用 dispatched_provider 作为节点标识。
+    # [TOOL-LOOP] 原为 9 处：/v1/responses 的「有 tools」「无 tools」两个分支合并为
+    # 一个统一的事件流生成器后，两处重复的调度点收敛为一处。
     src = Path(srv.__file__).read_text(encoding="utf-8")
     assert "asyncio.create_task(active_provider.delete_conversation(" not in src, (
         "不得残留历史 fire-and-forget 调用点"
     )
-    assert src.count("conversation_gc.schedule(active_provider, dispatched_provider,") == 9, (
-        "全部 9 处会话删除调用点必须改为持久化队列"
+    assert src.count("conversation_gc.schedule(active_provider, dispatched_provider,") == 8, (
+        "全部 8 处会话删除调用点必须改为持久化队列"
     )
 
     from fastapi.testclient import TestClient

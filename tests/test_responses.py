@@ -7,7 +7,7 @@
    response.created
    -> response.output_item.added
    -> response.content_part.added
-   -> response.text.delta
+   -> response.output_text.delta
    -> response.content_part.done
    -> response.output_item.done
    -> response.completed
@@ -167,7 +167,11 @@ def test_convert_responses_request_tools():
     assert len(messages) == 2
     assert messages[0]["role"] == "system"
     assert "## Tools Available" in messages[0]["content"]
-    assert "list_files(path: string (required))" in messages[0]["content"]
+    # 工具声明已从展平的 `param: type` 摘要改为保真 JSON schema（[TOOL-SCHEMA]），
+    # 本断言只关心「工具名 + 参数名 + required」是否可见，故按新渲染校验。
+    assert "list_files" in messages[0]["content"]
+    assert '"path"' in messages[0]["content"]
+    assert '"required":["path"]' in messages[0]["content"]
     assert messages[1]["role"] == "user"
     assert messages[1]["content"] == "List files"
 
@@ -193,7 +197,7 @@ def test_non_streaming_responses_endpoint():
     out_item = data["output"][0]
     assert out_item["type"] == "message"
     assert out_item["role"] == "assistant"
-    assert out_item["content"][0]["type"] == "text"
+    assert out_item["content"][0]["type"] == "output_text"
     assert out_item["content"][0]["text"] == "Hello! How can I help you?"
     assert data["usage"]["input_tokens"] > 0
     assert data["usage"]["output_tokens"] > 0
@@ -260,10 +264,12 @@ def test_streaming_sse_event_sequence():
     event_names = [e[0] for e in events]
     expected = [
         "response.created",
+        "response.in_progress",
         "response.output_item.added",
         "response.content_part.added",
-        "response.text.delta",
-        "response.text.delta",
+        "response.output_text.delta",
+        "response.output_text.delta",
+        "response.output_text.done",
         "response.content_part.done",
         "response.output_item.done",
         "response.completed",
@@ -277,7 +283,7 @@ def test_streaming_sse_event_sequence():
     assert created_ev["response"]["model"] == "gpt-4o"
     resp_id = created_ev["response"]["id"]
 
-    deltas = [e[1]["delta"] for e in events if e[0] == "response.text.delta"]
+    deltas = [e[1]["delta"] for e in events if e[0] == "response.output_text.delta"]
     assert "".join(deltas) == "Hello! How can I help you?"
 
     part_done = [e[1] for e in events if e[0] == "response.content_part.done"][0]
@@ -474,7 +480,7 @@ def test_responses_failover_streaming():
     assert fo["from_provider"] == "kimi"
     assert fo["to_provider"] == r.headers.get("x-failover-to")
 
-    deltas = [e[1]["delta"] for e in events if e[0] == "response.text.delta"]
+    deltas = [e[1]["delta"] for e in events if e[0] == "response.output_text.delta"]
     full = "".join(deltas)
     assert "fallback node" in full
     srv.failover_router.cooldown_tracker.reset()

@@ -1,0 +1,91 @@
+"""SSE 心跳保活 (STREAM-KEEPALIVE)
+
+问题不在网关，也不在客户端，而在两者之间的**沉默**：上游五家网页接口在
+「收到请求」到「吐出第一个字」之间可能思考几十秒（推理模型尤其如此）。这段时间
+网关没有任何字节可发，而 Codex CLI / Claude Code 这类客户端对「连接建立后长时间
+无字节」有很短的判定窗口——它们会判定连接已死并重连或放弃，用户看到的是
+「网关连上了，但 agent 不说话」，网关日志里却一切正常（请求还在跑）。
+
+此前所有 `StreamingResponse` 都是裸生成器：上游沉默多久，客户端就沉默多久。
+本模块提供 `sse_keepalive()`，在拉取下一帧「迟迟不返回」时插入 SSE 注释帧
+`: keepalive`。
+
+为什么用注释行而不是空 data 帧：
+- 以 `:` 开头的行按 SSE 规范是注释，任何合规客户端都必须忽略，因此不会污染
+  任何协议的事件流（OpenAI/Anthropic/Responses 三种都无法误解析它）。
+- 它仍然是真实字节，会立刻刷新 TCP/TLS 缓冲，从而真正重置客户端的空闲计时器。
+
+为什么**不能**用 `asyncio.wait_for(iterator.__anext__(), ...)`：
+实测该写法会在超时时取消 `__anext__`，而取消会被抛进异步生成器体内、把它整体
+关闭——首个沉默之后的上游数据全部永久丢失（第一版实现把 'a' 之后的 'b'/'c' 静默丢弃，
+由 tests/test_stream_keepalive.py 的首条用例抓到）。因此这里把拉取放进一个
+**不会被取消**的后台任务，
+用 `asyncio.wait` 只观察它是否完成；超时只是多产出一帧，拉取任务继续挂着。
+"""
+
+from __future__ import annotations
+
+import asyncio
+from typing import AsyncGenerator, AsyncIterable, List, TypeVar
+
+from .base import get_stream_keepalive_interval
+
+T = TypeVar("T")
+
+KEEPALIVE_FRAME = ": keepalive\n\n"
+
+
+async def sse_keepalive(
+    source: AsyncIterable[T],
+    interval: float | None = None,
+) -> AsyncGenerator[T | str, None]:
+    """在 `source` 的沉默期插入 SSE 注释帧。
+
+    参数:
+        source: 任意异步可迭代对象（上游增量流、飞行组回放等）。
+        interval: 空闲多少秒后发一帧；None 时读 `GATEWAY_STREAM_KEEPALIVE`，
+                  该值为 0 或负数时完全关闭（零回归，逐值等同旧行为）。
+
+    产出:
+        `source` 的每一项原样产出；沉默期额外产出 `KEEPALIVE_FRAME` 字符串。
+
+    异常:
+        `source` 抛出的异常原样上抛——心跳绝不吞掉上游错误，否则失败转移和
+        错误映射会把一次真正的失败伪装成「一直在想」。
+    """
+    if interval is None:
+        interval = get_stream_keepalive_interval()
+    if interval <= 0:
+        async for item in source:
+            yield item
+        return
+
+    iterator = source.__aiter__()
+    pending: "asyncio.Future | None" = None
+    try:
+        while True:
+            if pending is None:
+                pending = asyncio.ensure_future(iterator.__anext__())
+
+            done, _ = await asyncio.wait({pending}, timeout=interval)
+            if not done:
+                # 上游仍在思考：把沉默变成可观测的字节，让客户端计时器复位。
+                # 注意拉取任务**保持挂起**，不能取消，否则上游生成器会被关闭。
+                yield KEEPALIVE_FRAME
+                continue
+
+            task, pending = pending, None
+            try:
+                item = task.result()
+            except StopAsyncIteration:
+                return
+            yield item
+    finally:
+        # 客户端断连 / 上游出错时，取消仍在等待的拉取，避免泄漏一个持有上游
+        # 流的幽灵任务（与 disconnect_guard 的资源回收语义一致）。
+        if pending is not None and not pending.done():
+            pending.cancel()
+            try:
+                await pending
+            except (asyncio.CancelledError, StopAsyncIteration):
+                pass

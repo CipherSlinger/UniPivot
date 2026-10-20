@@ -5,7 +5,6 @@
 
 from __future__ import annotations
 
-import ast
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -44,6 +43,7 @@ class AnthropicMessagesRequest(BaseModel):
     stream: bool = False
     temperature: Optional[float] = None
     tools: Optional[List[dict]] = None
+    tool_choice: Optional[Union[str, dict]] = None
     thinking: Optional[Union[dict, bool]] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
@@ -60,6 +60,10 @@ class AnthropicCountTokensRequest(BaseModel):
     system: Optional[Union[str, List[dict]]] = None
     tools: Optional[List[dict]] = None
     thinking: Optional[Union[dict, bool]] = None
+    # [TOOL-SCHEMA] Anthropic 的 count_tokens 请求与 messages 请求同构，同样可以
+    # 携带 tool_choice；估算路径必须看到与真实请求相同的工具提示词，否则算出的
+    # token 数在工具循环里系统性偏低，客户端会据此误判上下文预算。
+    tool_choice: Optional[Union[str, dict]] = None
 
 
 def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None]) -> str:
@@ -96,8 +100,16 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
             elif b_type == "tool_use":
                 name = block.get("name", "")
                 inp = block.get("input", {})
+                # [TOOL-LOOP] 带上调用 id，使多轮回程的 `[Tool Result for <id>]`
+                # 能对上是哪一次调用；无 id 时**完全不写该键**，保持既有精确 JSON 断言。
+                payload: dict = {}
+                t_id = block.get("id")
+                if t_id:
+                    payload["id"] = t_id
+                payload["name"] = name
+                payload["arguments"] = inp
                 parts.append(
-                    f"```tool_call\n{json.dumps({'name': name, 'arguments': inp}, ensure_ascii=False)}\n```"
+                    f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
                 )
             elif b_type == "image":
                 source = block.get("source", {})
@@ -108,14 +120,172 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
     return "\n".join(parts)
 
 
-def format_tools_system_prompt(tools: List[dict]) -> str:
-    """将 tools 声明（支持 Anthropic 规范与 OpenAI 函数规范）转换为供大模型理解的紧凑工具使用说明。"""
+# [TOOL-SCHEMA] 工具声明提示词的预算与裁剪常量。
+# 上游五家都没有原生工具调用，这份提示词是模型能看到的**唯一** schema，
+# 所以保真度就是产品本身；但上下文窗口有限，故保留确定性裁剪与整体预算。
+_TOOL_SCHEMA_MAX_DESCRIPTION = 300      # 单个参数/字段 description 的截断长度
+_TOOL_SCHEMA_TOTAL_BUDGET = 12000       # 所有工具 schema 渲染文本的总预算（字符）
+_TOOL_SCHEMA_DROP_KEYS = ("$schema", "title", "definitions", "$defs")
+# 字面量键：其值是**数据**而非子 schema，必须原样保留、不得递归裁剪。
+_TOOL_SCHEMA_LITERAL_KEYS = ("default", "const", "enum", "examples")
+
+
+def _schema_refs(node: Any) -> set:
+    """递归收集 schema 中被 `$ref` 引用的定义名，用于决定 definitions/$defs 是否保留。"""
+    refs: set = set()
+    if isinstance(node, dict):
+        ref = node.get("$ref")
+        if isinstance(ref, str) and "/" in ref:
+            refs.add(ref.rsplit("/", 1)[-1])
+        for v in node.values():
+            refs |= _schema_refs(v)
+    elif isinstance(node, list):
+        for v in node:
+            refs |= _schema_refs(v)
+    return refs
+
+
+def _prune_schema(node: Any, *, keep_defs: bool = False) -> Any:
+    """按确定性规则裁剪 JSON Schema，去掉对模型无信息量的键，保持源顺序。
+
+    保留：type/properties/required/enum/items/default/anyOf/oneOf/format/
+    minimum/maximum/pattern/description（超长截断）、非 true 的 additionalProperties、
+    以及被 `$ref` 实际引用的 definitions/$defs（由 `keep_defs` 控制）。
+    """
+    if isinstance(node, list):
+        return [_prune_schema(v, keep_defs=keep_defs) for v in node]
+    if not isinstance(node, dict):
+        return node
+
+    out: Dict[str, Any] = {}
+    for key, value in node.items():  # 保持源顺序：json.loads 的 dict 顺序即报文顺序
+        if key in _TOOL_SCHEMA_DROP_KEYS:
+            # definitions/$defs 只在被引用时保留（keep_defs 由顶层判定）
+            if key in ("definitions", "$defs") and keep_defs and isinstance(value, dict):
+                out[key] = {k: _prune_schema(v, keep_defs=keep_defs) for k, v in value.items()}
+            continue
+        if key == "additionalProperties":
+            # additionalProperties=true 是默认语义，纯噪声；false / schema 有信息量。
+            if value is True:
+                continue
+            out[key] = _prune_schema(value, keep_defs=keep_defs) if isinstance(value, dict) else value
+            continue
+        if key == "description":
+            text = value if isinstance(value, str) else str(value)
+            if len(text) > _TOOL_SCHEMA_MAX_DESCRIPTION:
+                text = text[:_TOOL_SCHEMA_MAX_DESCRIPTION]
+            out[key] = text
+            continue
+        if key == "properties" and isinstance(value, dict):
+            if not value:
+                continue
+            out[key] = {k: _prune_schema(v, keep_defs=keep_defs) for k, v in value.items()}
+            continue
+        if key == "required" and isinstance(value, list) and not value:
+            continue
+        if key in _TOOL_SCHEMA_LITERAL_KEYS:
+            # default/const/enum/examples 是数据：原样保留（如 enum 里的对象值）。
+            out[key] = value
+            continue
+        if key in ("properties", "patternProperties") and isinstance(value, dict):
+            out[key] = {k: _prune_schema(v, keep_defs=keep_defs) for k, v in value.items()}
+            continue
+        if key in ("anyOf", "oneOf", "allOf", "prefixItems") and isinstance(value, list):
+            out[key] = [_prune_schema(v, keep_defs=keep_defs) for v in value]
+            continue
+        if key in ("items", "not", "contains", "propertyNames", "if", "then", "else"):
+            out[key] = _prune_schema(value, keep_defs=keep_defs)
+            continue
+        if isinstance(value, dict):
+            # 其余形如子 schema 的容器（如 dependentSchemas）也递归裁剪；
+            # 若裁剪后为空则丢弃，避免输出 `"unknown":{}` 这类噪声。
+            sub = _prune_schema(value, keep_defs=keep_defs)
+            if sub != {}:
+                out[key] = sub
+            continue
+        # 标量/数组类约束（format/minimum/pattern/exclusiveMinimum 等）全部原样保留：
+        # 未知键宁可保留也不丢信息——提示词是模型唯一能看到的 schema。
+        out[key] = value
+    return out
+
+
+def _render_schema_json(schema: Any) -> str:
+    """将输入 schema 渲染为紧凑、确定的 JSON（保序、不转义中文）。"""
+    if not isinstance(schema, dict):
+        return "{}"
+    refs = _schema_refs(schema)
+    prune_defs = bool(refs)
+    pruned = _prune_schema(schema, keep_defs=prune_defs)
+    if not isinstance(pruned, dict):
+        pruned = {}
+    # `{"type":"object"}` 这类无属性 schema 不携带任何信息，避免噪声。
+    if pruned in ({"type": "object"}, {}):
+        return "{}"
+    return json.dumps(pruned, separators=(",", ":"), ensure_ascii=False)
+
+
+def _compact_args_summary(schema: Any) -> str:
+    """旧的展平摘要（`param: type (required)`），仅用于超预算时的降级渲染。"""
+    props = schema.get("properties", {}) if isinstance(schema, dict) else {}
+    req_fields = schema.get("required", []) if isinstance(schema, dict) else []
+    args_str_list = []
+    if isinstance(props, dict):
+        for prop_name, prop_val in props.items():
+            prop_type = prop_val.get("type", "any") if isinstance(prop_val, dict) else "any"
+            is_req = prop_name in req_fields
+            args_str_list.append(f"{prop_name}: {prop_type}{' (required)' if is_req else ''}")
+    return ", ".join(args_str_list) if args_str_list else "None"
+
+
+def _tool_choice_directive(tool_choice: Any) -> str:
+    """把客户端的 tool_choice 约束翻译为一句简短指令；无法识别时返回空串（失败开放）。"""
+    if tool_choice is None:
+        return ""
+    if isinstance(tool_choice, str):
+        choice = tool_choice.strip().lower()
+        if choice == "none":
+            return "Do not call any tool in this turn; answer in plain text."
+        if choice in ("required", "any"):
+            return "You MUST call at least one tool in this turn."
+        # "auto" 及未知字符串：默认行为，不追加指令
+        return ""
+    if isinstance(tool_choice, dict):
+        c_type = tool_choice.get("type")
+        if c_type == "any":
+            return "You MUST call at least one tool in this turn."
+        name = None
+        if c_type == "tool":
+            name = tool_choice.get("name")
+        elif isinstance(tool_choice.get("function"), dict):
+            name = tool_choice["function"].get("name")
+        if isinstance(name, str) and name.strip():
+            return f"You MUST call the tool `{name.strip()}` in this turn, with arguments matching its schema."
+    return ""
+
+
+def format_tools_system_prompt(tools: List[dict], *, tool_choice: Any = None) -> str:
+    """将 tools 声明（支持 Anthropic 规范与 OpenAI 函数规范）转换为供大模型理解的工具使用说明。
+
+    [TOOL-SCHEMA] 每个工具以紧凑 JSON 渲染完整输入 schema（嵌套对象、数组、enum、
+    参数描述、required/additionalProperties 等全部保留），只在信息量为零处裁剪：
+    丢弃 `$schema`/`title`/`additionalProperties: true`/未被引用的 `definitions`/`$defs`，
+    截断超过 300 字符的 description、丢弃空 `properties`/`required`。整体渲染文本超过
+    {budget} 字符时，溢出的工具退回旧的 `param: type (required)` 摘要，前 N 个保持保真。
+
+    `tool_choice` 为仅关键字参数，用于追加一条客户端约束指令（none/required/指定工具）；
+    无法识别的形状不追加任何内容，绝不抛错。
+    """
     if not tools:
         return ""
     lines = [
         "## Tools Available\n"
         "You have access to the following tools to accomplish tasks:",
     ]
+
+    rendered: List[str] = []
+    schema_budget_used = 0
+    budget_exhausted = False
+
     for t in tools:
         if not isinstance(t, dict):
             continue
@@ -129,29 +299,38 @@ def format_tools_system_prompt(tools: List[dict]) -> str:
             desc = (t.get("description", "") or "").strip().split("\n")[0][:200]
             schema = t.get("input_schema", {}) or t.get("parameters", {}) or {}
 
-        props = schema.get("properties", {}) if isinstance(schema, dict) else {}
-        req_fields = schema.get("required", []) if isinstance(schema, dict) else []
+        schema_json = _render_schema_json(schema)
+        if budget_exhausted or schema_budget_used + len(schema_json) > _TOOL_SCHEMA_TOTAL_BUDGET:
+            # 预算耗尽后的溢出工具：降级为旧摘要。降级是粘性的——一旦触发，
+            # 后续工具一律走摘要，保证「前 N 个保真」的确定性切分。
+            budget_exhausted = True
+            rendered.append(f"- `{name}({_compact_args_summary(schema)})`: {desc}")
+        else:
+            schema_budget_used += len(schema_json)
+            rendered.append(f"- `{name}`: {desc}\n  Args: {schema_json}")
 
-        args_str_list = []
-        if isinstance(props, dict):
-            for prop_name, prop_val in props.items():
-                prop_type = prop_val.get("type", "any") if isinstance(prop_val, dict) else "any"
-                is_req = prop_name in req_fields
-                args_str_list.append(f"{prop_name}: {prop_type}{' (required)' if is_req else ''}")
+    lines.extend(rendered)
 
-        args_summary = ", ".join(args_str_list) if args_str_list else "None"
-        lines.append(f"- `{name}({args_summary})`: {desc}")
-
-    lines.append(
+    rules = (
         "\n## Tool Calling Rules\n"
         "1. When you need to read files, write files, run commands, or use any tool, you MUST output a tool call block formatted EXACTLY as:\n"
         "```tool_call\n"
         '{"name": "tool_name", "arguments": {"param1": "value1"}}\n'
         "```\n"
-        "2. Only call ONE tool at a time.\n"
-        "3. After outputting a tool call, stop and wait for the tool execution result.\n"
-        "4. When you receive a `[Tool Result for ...]`, use the result to continue the task."
+        "2. Only call ONE tool at a time (one tool per fenced block).\n"
+        "3. Arguments MUST match the declared schema for that tool (`Args:` JSON above) — "
+        "use the exact field names, types, nesting and enum values it declares.\n"
+        "4. After outputting a tool call, stop and wait for the tool execution result.\n"
+        "5. When you receive a `[Tool Result for <id>]` block, continue the task using that result.\n"
+        "6. Never invent tool names that are not listed above; the available tools are exactly those declared in this prompt.\n"
+        "7. Do NOT refuse or claim you lack tools/permissions: the tools above are real and callable."
     )
+    lines.append(rules)
+
+    directive = _tool_choice_directive(tool_choice)
+    if directive:
+        lines.append(f"\n## Tool Choice Constraint\n{directive}")
+
     return "\n".join(lines)
 
 
@@ -490,6 +669,7 @@ def convert_anthropic_to_gateway_messages(
     messages: List[AnthropicMessage],
     system: Optional[Union[str, List[dict]]] = None,
     tools: Optional[List[dict]] = None,
+    tool_choice: Any = None,
 ) -> List[dict]:
     """将 Anthropic messages 与顶层 system 提示转为标准网关 messages 列表。"""
     sys_parts: list[str] = []
@@ -499,7 +679,7 @@ def convert_anthropic_to_gateway_messages(
             sys_parts.append(sys_text.strip())
 
     if tools:
-        tools_prompt = format_tools_system_prompt(tools)
+        tools_prompt = format_tools_system_prompt(tools, tool_choice=tool_choice)
         if tools_prompt:
             sys_parts.append(tools_prompt)
 
@@ -517,20 +697,11 @@ def convert_anthropic_to_gateway_messages(
     if sys_parts:
         result.append({"role": "system", "content": "\n\n".join(sys_parts)})
 
-    # 如果有工具，且最后一条消息是 user 消息，在末尾追加强有力的工具调用指引
-    if tools and other_msgs:
-        for idx in range(len(other_msgs) - 1, -1, -1):
-            if other_msgs[idx]["role"] == "user":
-                tool_hint = (
-                    "\n\n[Important Tool Calling Instruction]\n"
-                    "If you need to read/write/edit files or run terminal commands, you MUST call the tool directly using:\n"
-                    "```tool_call\n"
-                    '{"name": "tool_name", "arguments": {"param1": "value1"}}\n'
-                    "```\n"
-                    "Do NOT refuse or say you lack tools/permissions. Call the tool now!"
-                )
-                other_msgs[idx]["content"] = other_msgs[idx]["content"] + tool_hint
-                break
+    # [TOOL-LOOP] 原先这里会在最后一条 user 消息尾部再追加一段硬编码的
+    # `[Important Tool Calling Instruction]`。它与 `format_tools_system_prompt`
+    # 的规则段是同一套指令的第二份拷贝，必然随规则演进漂移（改一处、漏一处，
+    # 模型就同时看到两条互相矛盾的契约）。现已删除：系统提示词是**唯一**来源，
+    # 防拒答句（Do NOT refuse / lack tools）已并入其 Tool Calling Rules 第 7 条。
 
     result.extend(other_msgs)
     return result
