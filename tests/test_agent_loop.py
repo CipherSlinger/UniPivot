@@ -583,6 +583,104 @@ def test_undeclared_tool_is_not_returned_as_tool_call():
     print("test_undeclared_tool_is_not_returned_as_tool_call: PASSED")
 
 
+def test_tool_call_in_reasoning_channel_is_not_lost():
+    """[TOOL-LOOP] 工具调用整个写在思考通道里时，不能变成一个「什么都没发生」的回合。
+
+    推理模型把计划写在思考流里，网页上游又把思考与正文分开推送。实测：模型把整段
+    ```tool_call 写进 reasoning_content、正文一个字都没有时，三个协议此前都把它当成
+    「正文里没有工具调用」——OpenAI 返回 finish_reason=stop 且 content 是被补成
+    `</think>` 的空壳，Anthropic 返回空 content 数组，客户端既没有答案可读、也没有
+    调用可执行，agent 循环就此停摆。
+    """
+    tool_only = [
+        ('I should read it.\n```tool_call\n'
+         '{"name": "Read", "arguments": {"file_path": "a"}}\n```', {"reasoning": True}),
+        ("", {}),
+    ]
+
+    def _openai():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/chat/completions",
+                json={"model": "gpt-4o", "messages": [{"role": "user", "content": "x"}],
+                      "tools": TOOLS_OPENAI},
+            ).json()
+
+        _with_provider(tool_only, post)
+        choice = box["data"]["choices"][0]
+        msg = choice["message"]
+        assert choice["finish_reason"] == "tool_calls", (
+            f"思考通道里的工具调用被丢弃，finish_reason={choice['finish_reason']!r}"
+        )
+        calls = msg.get("tool_calls") or []
+        assert len(calls) == 1 and calls[0]["function"]["name"] == "Read", msg
+
+    def _anthropic():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/messages",
+                json={"model": "claude-3-7-sonnet", "max_tokens": 64,
+                      "messages": [{"role": "user", "content": "x"}],
+                      "tools": [{"name": "Read", "input_schema": {"type": "object"}}]},
+            ).json()
+
+        _with_provider(tool_only, post)
+        data = box["data"]
+        assert data.get("stop_reason") == "tool_use", (
+            f"Anthropic 思考通道里的工具调用被丢弃: {data.get('content')}"
+        )
+        uses = [b for b in data["content"] if b["type"] == "tool_use"]
+        assert len(uses) == 1 and uses[0]["name"] == "Read", data["content"]
+
+    def _responses():
+        box: dict = {}
+
+        def post():
+            box["data"] = _client().post(
+                "/v1/responses",
+                json={"model": "gpt-4o", "input": "x",
+                      "tools": [{"type": "function", "name": "Read",
+                                 "parameters": {"type": "object"}}]},
+            ).json()
+
+        _with_provider(tool_only, post)
+        calls = [i for i in box["data"]["output"] if i["type"] == "function_call"]
+        assert len(calls) == 1 and calls[0]["name"] == "Read", box["data"]["output"]
+
+    _openai()
+    _anthropic()
+    _responses()
+
+    # 零回归：正文**存在**时，思考里的工具块很可能只是「我本可以这样调用」的举例。
+    # 把它翻成一次真实执行，就把一个正常回答变成了客户端没有预期的工具调用。
+    mixed = [
+        ('```tool_call\n{"name": "Read", "arguments": {"file_path": "a"}}\n```',
+         {"reasoning": True}),
+        ("The answer is 42.", {}),
+    ]
+    box: dict = {}
+
+    def post_mixed():
+        box["data"] = _client().post(
+            "/v1/chat/completions",
+            json={"model": "gpt-4o", "messages": [{"role": "user", "content": "x"}],
+                  "tools": TOOLS_OPENAI},
+        ).json()
+
+    _with_provider(mixed, post_mixed)
+    choice = box["data"]["choices"][0]
+    assert not choice["message"].get("tool_calls"), (
+        f"正文已经给出答案，思考里的工具块不能被翻成真实调用: {choice['message']}"
+    )
+    assert "42" in (choice["message"].get("content") or ""), choice["message"]
+
+    print("test_tool_call_in_reasoning_channel_is_not_lost: PASSED")
+
+
 def run_all():
     tests = [
         test_openai_two_round_loop,
@@ -597,6 +695,7 @@ def run_all():
         test_reasoning_replay_is_not_a_user_message,
         test_codex_reasoning_object_enables_thinking,
         test_parallel_tool_calls_false_caps_to_one_everywhere,
+        test_tool_call_in_reasoning_channel_is_not_lost,
         test_undeclared_tool_is_not_returned_as_tool_call,
     ]
     for fn in tests:

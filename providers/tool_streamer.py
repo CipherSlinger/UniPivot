@@ -143,6 +143,38 @@ def cap_parallel_tool_calls(tool_list: Optional[List[Tuple[str, dict]]], disallo
     return tool_list
 
 
+def recover_tools_from_reasoning(
+    reasoning_text: str,
+    allowed: Optional[set] = None,
+    answer_text: str = "",
+) -> Tuple[Optional[List[Tuple[str, dict]]], bool]:
+    """[TOOL-LOOP] 思考通道兜底：正文为空时，从思考流里找回被吞掉的工具调用。
+
+    推理模型把「该做什么」写在思考通道里，网页端的上游又把思考与正文分开推送。
+    实测：模型把整段 ```tool_call 写进 `reasoning_content`、正文一个字都没有时，
+    网关按「正文里没有工具调用」处理，客户端收到的是 `finish_reason: stop`、没有
+    `tool_calls`、正文是被补成 `…` 的空壳——对 agent 客户端而言这一轮什么都没发生，
+    它既没有答案可读，也没有调用可执行，循环就此停摆。
+
+    **只在正文为空时才兜底**，这是本条的关键取舍：若模型已经给出了正文，那段正文
+    就是它的答案，思考里出现的工具块更可能是「我本可以这样调用」的举例；把它翻成
+    真实调用会让一次正常的回答变成一次没人预期的工具执行。正文为空则不存在这个
+    歧义——模型没有给出任何面向用户的输出，那一轮唯一可执行的内容就在思考流里。
+
+    返回 (tool_list 或 None, was_healed)。前缀文本**故意不返回**：思考流已经逐字
+    发给客户端了，再当正文发一遍就是重复。
+    """
+    if not reasoning_text or (answer_text or "").strip():
+        return None, False
+    parsed, was_healed = parse_tool_calls_with_healing(reasoning_text, allowed)
+    if not parsed:
+        return None, False
+    _, tool_list = parsed
+    if not tool_list:
+        return None, False
+    return tool_list, was_healed
+
+
 def parse_tool_calls_with_healing(
     text: str,
     allowed: Optional[set] = None,

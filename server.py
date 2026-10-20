@@ -76,6 +76,7 @@ from providers import (
     parse_tool_calls_with_healing,
     cap_parallel_tool_calls,
     parallel_calls_disallowed,
+    recover_tools_from_reasoning,
     resolve_allowed_tools,
     SpeculativeToolStreamer,
     sse_content_block_delta,
@@ -790,7 +791,32 @@ def _make_thinking_headers(
 _tool_healing_stats = {
     "total_tool_calls": 0,
     "healed_tool_calls": 0,
+    # [TOOL-LOOP] 思考通道兜底命中次数：正文为空、工具调用只存在于思考流里的回合。
+    "reasoning_recovered_tool_calls": 0,
 }
+
+
+def _recover_reasoning_tools(
+    streamer: "SpeculativeToolStreamer",
+    allowed,
+    parallel_disallowed: bool,
+    answer_text: str,
+):
+    """[TOOL-LOOP] 三个协议的流式收口点共用：正文为空时从思考流找回工具调用。
+
+    收口点的代码几乎逐字重复（它们已经因为别的缺陷各自漂移过一次），所以判定与
+    记账只写一份：先是 `recover_tools_from_reasoning` 的「正文必须为空」规则，
+    再是客户端「禁止并行」的裁剪，最后是诊断计数。返回可直接使用的 tool_list。
+    """
+    tool_list, was_healed = recover_tools_from_reasoning(
+        "".join(streamer.accumulated_reasoning),
+        allowed,
+        answer_text=answer_text,
+    )
+    if not tool_list:
+        return None, False
+    _tool_healing_stats["reasoning_recovered_tool_calls"] += len(tool_list)
+    return cap_parallel_tool_calls(tool_list, parallel_disallowed), was_healed
 
 
 def _make_tool_headers(
@@ -2120,6 +2146,14 @@ async def chat_completions(req: ChatCompletionRequest):
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
+                if not tool_list:
+                    # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+                    tool_list, was_healed = _recover_reasoning_tools(
+                        streamer,
+                        resolve_allowed_tools(req.tools, req.tool_choice),
+                        parallel_disallowed,
+                        answer_text="".join(streamer.accumulated_text),
+                    )
                 if rem_text:
                     chunk = {
                         "id": cid,
@@ -2393,6 +2427,17 @@ async def chat_completions(req: ChatCompletionRequest):
         parsed, was_healed = parse_tool_calls_with_healing(
             full_output, resolve_allowed_tools(req.tools, req.tool_choice)
         )
+        if not parsed:
+            # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+            _rt, _rh = recover_tools_from_reasoning(
+                full_reasoning,
+                resolve_allowed_tools(req.tools, req.tool_choice),
+                answer_text=full_output,
+            )
+            if _rt:
+                _rt = cap_parallel_tool_calls(_rt, parallel_disallowed)
+                _tool_healing_stats["reasoning_recovered_tool_calls"] += len(_rt)
+                parsed, was_healed = ("", _rt), _rh
         if parsed:
             prefix, tool_list = parsed
             # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
@@ -2716,6 +2761,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
+                if not tool_list:
+                    # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+                    tool_list, was_healed = _recover_reasoning_tools(
+                        streamer,
+                        resolve_allowed_tools(req.tools, req.tool_choice),
+                        parallel_disallowed,
+                        answer_text="".join(streamer.accumulated_text),
+                    )
                 if in_thinking_block:
                     yield sse_content_block_stop(block_idx)
                     in_thinking_block = False
@@ -2951,6 +3004,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         parsed, was_healed = parse_tool_calls_with_healing(
             full_output, resolve_allowed_tools(req.tools, req.tool_choice)
         )
+        if not parsed:
+            # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+            _rt, _rh = recover_tools_from_reasoning(
+                full_thinking,
+                resolve_allowed_tools(req.tools, req.tool_choice),
+                answer_text=full_output,
+            )
+            if _rt:
+                _rt = cap_parallel_tool_calls(_rt, parallel_disallowed)
+                _tool_healing_stats["reasoning_recovered_tool_calls"] += len(_rt)
+                parsed, was_healed = ("", _rt), _rh
         if parsed:
             prefix, tool_list = parsed
             # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
@@ -3353,6 +3417,14 @@ async def responses_endpoint(req: ResponsesRequest):
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
+                if not tool_list:
+                    # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+                    tool_list, was_healed = _recover_reasoning_tools(
+                        streamer,
+                        resolve_allowed_tools(req.tools, req.tool_choice),
+                        parallel_disallowed,
+                        answer_text="".join(streamer.accumulated_text),
+                    )
                 if rem_text:
                     if in_reasoning:
                         async for frame in _close_reasoning():
@@ -3534,6 +3606,17 @@ async def responses_endpoint(req: ResponsesRequest):
         parsed_res, was_healed = parse_tool_calls_with_healing(
             full_output, resolve_allowed_tools(req.tools, req.tool_choice)
         )
+    if not parsed_res:
+        # [TOOL-LOOP] 思考通道兜底：正文为空时工具调用可能整个写在思考流里
+        _rt, _rh = recover_tools_from_reasoning(
+            full_reasoning,
+            resolve_allowed_tools(req.tools, req.tool_choice),
+            answer_text=full_output,
+        )
+        if _rt:
+            _rt = cap_parallel_tool_calls(_rt, parallel_disallowed)
+            _tool_healing_stats["reasoning_recovered_tool_calls"] += len(_rt)
+            parsed_res, was_healed = ("", _rt), _rh
     if parsed_res:
         prefix, tool_list = parsed_res
         # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个
