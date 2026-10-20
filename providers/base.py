@@ -58,16 +58,54 @@ class StopSequenceHit(Exception):
         self.matched = matched
 
 
+# [PROTOCOL] 多模态内容块的占位符。上游五家都是纯文本网页接口，图片/文件**无法**
+# 真正送达；问题不在于「送不到」，而在于过去它们被静默丢弃——`[text, image]`
+# 只剩文字，模型于是对着一个它从未看到的附件作答，用户看到的是一个自信的幻觉。
+# 显式占位符让模型知道自己缺了什么，可以回答「我无法查看图片」而不是编造内容。
+IMAGE_PLACEHOLDER = "[Image omitted: this gateway's upstream providers accept text only]"
+FILE_PLACEHOLDER_TEMPLATE = "[File omitted: {name}]"
+
+_TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
+
+
+def _image_placeholder() -> str:
+    return IMAGE_PLACEHOLDER
+
+
+def _file_placeholder(block: dict) -> str:
+    name = block.get("filename") or block.get("file_id") or block.get("name") or ""
+    return FILE_PLACEHOLDER_TEMPLATE.format(name=name or "unnamed")
+
+
 def text_of(content: Union[str, List[dict], None]) -> str:
-    """从 OpenAI 消息 content（字符串或多部分列表）中提取纯文本。"""
+    """从 OpenAI 消息 content（字符串或多部分列表）中提取纯文本。
+
+    [PROTOCOL] 两种过去会出错的内容形状在这里统一收口：
+    - `{"type": "text", "text": null}`（客户端把可选字段显式写了 null）会让
+      `"\\n".join` 抛 `TypeError: sequence item 0: expected str instance`，一个
+      合法的请求变成 500；
+    - 图片/文件块会被静默跳过，模型对着没看到的附件作答。现在给出显式占位符。
+    """
     if content is None:
         return ""
     if isinstance(content, str):
         return content
+    if not isinstance(content, list):
+        return str(content)
     parts = []
     for p in content:
-        if isinstance(p, dict) and p.get("type") == "text":
-            parts.append(p.get("text", ""))
+        if isinstance(p, str):
+            parts.append(p)
+        elif isinstance(p, dict):
+            p_type = p.get("type")
+            text = p.get("text")
+            if p_type in _TEXT_BLOCK_TYPES or (p_type is None and "text" in p):
+                if isinstance(text, str) and text:
+                    parts.append(text)
+            elif p_type in ("image_url", "input_image", "image"):
+                parts.append(_image_placeholder())
+            elif p_type in ("input_file", "file", "document"):
+                parts.append(_file_placeholder(p))
     return "\n".join(parts)
 
 

@@ -9,7 +9,11 @@ import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
 from pydantic import BaseModel, ConfigDict, Field
-from .base import _id
+from .base import (
+    FILE_PLACEHOLDER_TEMPLATE,
+    IMAGE_PLACEHOLDER,
+    _id,
+)
 
 CLAUDE_MODELS_METADATA = [
     {"id": "claude-3-7-sonnet-20250219", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
@@ -90,7 +94,7 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
                 if th:
                     parts.append(f"<thinking>\n{th}\n</thinking>")
             elif b_type == "tool_result":
-                sub = block.get("content", "")
+                sub = block.get("content") or ""
                 if isinstance(sub, list):
                     sub = extract_anthropic_content(sub)
                 t_id = block.get("tool_use_id", "")
@@ -111,10 +115,15 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
                 parts.append(
                     f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
                 )
-            elif b_type == "image":
-                source = block.get("source", {})
-                media_type = source.get("media_type", "image")
-                parts.append(f"[Image: {media_type}]")
+            elif b_type in ("image", "document"):
+                # [PROTOCOL] 上游是纯文本网页接口，图片/文档无法送达。占位符必须
+                # 明说「未送达」，否则模型会把一个它从未看到的内容当作已读并作答。
+                source = block.get("source") if isinstance(block.get("source"), dict) else {}
+                media_type = source.get("media_type", "")
+                if b_type == "document":
+                    parts.append(f"{FILE_PLACEHOLDER_TEMPLATE.format(name=media_type or 'document')}")
+                else:
+                    parts.append(IMAGE_PLACEHOLDER)
             elif "text" in block and block["text"]:
                 parts.append(str(block["text"]))
     return "\n".join(parts)

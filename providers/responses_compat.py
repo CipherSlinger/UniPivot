@@ -46,7 +46,13 @@ from .anthropic_compat import (
     format_response_format_prompt,
     format_tools_system_prompt,
 )
-from .base import _est_tokens, _id, error_response
+from .base import (
+    FILE_PLACEHOLDER_TEMPLATE,
+    IMAGE_PLACEHOLDER,
+    _est_tokens,
+    _id,
+    error_response,
+)
 
 
 class ResponsesRequest(BaseModel):
@@ -112,9 +118,10 @@ def extract_responses_content(content: Any) -> str:
     if isinstance(content, dict):
         b_type = content.get("type", "")
         if b_type in ("text", "input_text", "output_text"):
-            return content.get("text", "")
+            t = content.get("text")
+            return t if isinstance(t, str) else ""
         if "text" in content:
-            return str(content["text"])
+            return str(content["text"]) if content["text"] is not None else ""
         return json.dumps(content, ensure_ascii=False)
     if not isinstance(content, list):
         return str(content)
@@ -126,9 +133,16 @@ def extract_responses_content(content: Any) -> str:
         elif isinstance(block, dict):
             b_type = block.get("type", "")
             if b_type in ("text", "input_text", "output_text"):
-                t = block.get("text", "")
-                if t:
+                t = block.get("text")
+                if isinstance(t, str) and t:
                     parts.append(t)
+            elif b_type in ("input_image", "image_url", "image"):
+                # [PROTOCOL] 上游是纯文本网页接口，图片无法送达；静默丢弃会让模型
+                # 对着一个它从未看到的附件作答（详见 providers/base.py 的说明）。
+                parts.append(IMAGE_PLACEHOLDER)
+            elif b_type in ("input_file", "file", "document"):
+                name = block.get("filename") or block.get("file_id") or ""
+                parts.append(FILE_PLACEHOLDER_TEMPLATE.format(name=name or "unnamed"))
             elif b_type == "thinking":
                 th = block.get("thinking", "")
                 if th:

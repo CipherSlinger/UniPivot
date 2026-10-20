@@ -105,7 +105,7 @@ from providers import (
     sse_done,
     sse_response_error,
 )
-from providers.base import _est_tokens, _id
+from providers.base import _est_tokens, _id, text_of
 from providers import http_client
 from providers.disconnect_guard import disconnect_guard, guard_stream
 from providers.stream_keepalive import sse_keepalive
@@ -1868,8 +1868,12 @@ async def chat_completions(req: ChatCompletionRequest):
     if system_additions:
         block = "\n\n".join(system_additions)
         if messages and messages[0].get("role") == "system":
-            orig = messages[0].get("content") or ""
-            messages[0]["content"] = f"{orig}\n\n{block}".strip()
+            # [PROTOCOL] 客户端的 system content 可以是 parts 列表；直接 f-string
+            # 会把它变成 Python repr（`[{'type': 'text', ...}]`），模型在工具契约
+            # 前面读到一段既不是指令、也不是它自己语言的噪声。统一走 text_of。
+            orig = text_of(messages[0].get("content"))
+            merged = f"{orig}\n\n{block}".strip()
+            messages[0]["content"] = merged
         else:
             messages.insert(0, {"role": "system", "content": block})
 

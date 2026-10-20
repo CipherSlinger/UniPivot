@@ -67,7 +67,14 @@ _CODE_BLOCK_RE = re.compile(
 
 
 def _extract_text_robust(content: Any) -> str:
-    """提取消息 content 中的纯文本（支持 str, list of blocks, None 等）。"""
+    """提取消息 content 中的纯文本（支持 str, list of blocks, None 等）。
+
+    [PROTOCOL] 这里是 `text_of` 的第二份拷贝，也是同一缺陷的第二个副本：
+    `{"type": "text", "text": null}` 会让 join 抛 TypeError。token 估算跑在
+    **路由之前**，所以它崩溃与把坏块送给模型是同一时刻——一个合法请求 500。
+    任何非字符串文本一律忽略（下面各分支逐个收口），而不是 str() 成 "None"
+    再计入上下文预算。
+    """
     if content is None:
         return ""
     if isinstance(content, str):
@@ -79,16 +86,18 @@ def _extract_text_robust(content: Any) -> str:
                 parts.append(p)
             elif isinstance(p, dict):
                 if p.get("type") == "text":
-                    parts.append(p.get("text", ""))
+                    t = p.get("text")
+                    if isinstance(t, str) and t:
+                        parts.append(t)
                 elif p.get("type") == "tool_result":
-                    sub = p.get("content", "")
+                    sub = p.get("content") or ""
                     if isinstance(sub, list):
                         sub = _extract_text_robust(sub)
                     parts.append(str(sub))
                 elif "content" in p:
                     parts.append(_extract_text_robust(p["content"]))
-                elif "text" in p:
-                    parts.append(str(p["text"]))
+                elif isinstance(p.get("text"), str) and p["text"]:
+                    parts.append(p["text"])
         return "\n".join(parts)
     return str(content)
 
