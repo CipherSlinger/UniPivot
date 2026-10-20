@@ -1,0 +1,171 @@
+"""Responses 历史回放中的工具调用测试 (tests/test_responses_history_tools.py)。
+
+[TOOL-LOOP] S1.5/S1.6：客户端把上一轮的 output 原样回放时，工具调用有两种非常常见
+的挂载方式，网关此前只认其中一种：
+
+  - **`message.tool_calls`**（OpenAI chat 兼容形状，多数 SDK 与自建客户端用它）：
+    整个分支只取了 `content`，`tool_calls` 被静默丢弃。于是模型下一轮只看到
+    `[Tool Result for c1]`，却找不到自己发过什么调用——它不知道 c1 是什么工具、
+    带什么参数，多轮 agent 循环在这里断掉，而且没有任何报错。
+  - **`role:"tool"`** 的 message 项（同样来自 chat 形状）：只带 `tool_call_id`，
+    原样落成一条 **user 发言**，模型看到的是一段无主的文本输出。
+
+本套件锁住：两种历史形状都还原成上游能识别的 assistant 调用 + 带 id 的工具结果，
+调用 id 与参数逐字保留，且 `message.tool_calls` 与 `function_call` 两条路径使用
+**同一份**渲染规则（同一事实不在两处解释）。
+
+运行: .venv/bin/python tests/test_responses_history_tools.py
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+os.environ["TESTING"] = "1"
+os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
+os.environ["GATEWAY_DISABLE_CREDENTIAL_WATCH"] = "1"
+os.environ["GATEWAY_DISABLE_PROBING"] = "1"
+os.environ["GATEWAY_DISABLE_PACING"] = "1"
+os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
+os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"
+os.environ["DOUBAO_AUTH_TOKEN"] = "fake_doubao"
+os.environ["KIMI_AUTH_TOKEN"] = "fake_kimi"
+os.environ["GLM_AUTH_TOKEN"] = "fake_glm"
+
+from fastapi.testclient import TestClient  # noqa: E402
+
+import server as srv  # noqa: E402
+from providers.base import flatten_messages  # noqa: E402
+from providers.responses_compat import (  # noqa: E402
+    ResponsesRequest,
+    convert_responses_to_gateway_messages,
+)
+
+ARGS = '{"path": "hello.py"}'
+
+
+def _call_blocks(messages: list) -> list:
+    """收集全部 ```tool_call 块（一条消息里可能有多次调用）。"""
+    blocks = []
+    for m in messages:
+        if m["role"] != "assistant":
+            continue
+        parts = m["content"].split("```tool_call\n")[1:]
+        for part in parts:
+            blocks.append(json.loads(part.split("\n```", 1)[0]))
+    return blocks
+
+
+def test_assistant_message_tool_calls_are_replayed():
+    req = ResponsesRequest.model_validate({
+        "model": "gpt-4o",
+        "input": [
+            {"type": "message", "role": "user", "content": "读一下 hello.py"},
+            {"type": "message", "role": "assistant", "content": "我来读",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read_file", "arguments": ARGS}}]},
+            {"type": "message", "role": "tool", "tool_call_id": "c1", "content": "print(1)"},
+            {"type": "message", "role": "user", "content": "现在呢？"},
+        ],
+    })
+    msgs = convert_responses_to_gateway_messages(req)
+
+    calls = _call_blocks(msgs)
+    assert len(calls) == 1, f"message.tool_calls 被丢弃了：模型找不到自己发过的调用。{msgs}"
+    assert calls[0]["name"] == "read_file"
+    assert calls[0]["id"] == "c1", "调用 id 丢失，工具结果无法对应"
+    assert calls[0]["arguments"] == {"path": "hello.py"}
+
+    # 调用所在的 assistant 消息不得丢掉它原本的文本
+    caller = [m for m in msgs if m["role"] == "assistant" and "```tool_call" in m["content"]][0]
+    assert "我来读" in caller["content"], "assistant 的说明文字被工具块覆盖了"
+
+    # role:"tool" 必须是带 id 的工具结果，而不是一句用户发言
+    results = [m for m in msgs if "[Tool Result for c1]" in m["content"]]
+    assert len(results) == 1, f"role:'tool' 没有还原成工具结果：{msgs}"
+    assert results[0]["role"] == "user"
+    tool_as_user = [m for m in msgs if m["role"] == "user" and m["content"].strip() == "print(1)"]
+    assert not tool_as_user, "工具输出仍以裸用户发言的形式出现"
+    print("test_assistant_message_tool_calls_are_replayed: PASSED")
+
+
+def test_both_history_shapes_render_identically():
+    # 同一轮调用，一种以 message.tool_calls 回放，一种以 function_call 项回放；
+    # 渲染结果必须逐字节相同，否则同一次调用在两条路径上有两套规则。
+    a = convert_responses_to_gateway_messages(ResponsesRequest.model_validate({
+        "model": "gpt-4o",
+        "input": [{"type": "message", "role": "assistant", "content": "",
+                   "tool_calls": [{"id": "c1", "type": "function",
+                                   "function": {"name": "read_file", "arguments": ARGS}}]}],
+    }))
+    b = convert_responses_to_gateway_messages(ResponsesRequest.model_validate({
+        "model": "gpt-4o",
+        "input": [{"type": "function_call", "name": "read_file",
+                   "arguments": ARGS, "call_id": "c1"}],
+    }))
+    assert _call_blocks(a) == _call_blocks(b) == [
+        {"name": "read_file", "arguments": {"path": "hello.py"}, "id": "c1"}
+    ]
+    print("test_both_history_shapes_render_identically: PASSED")
+
+
+def test_multiple_tool_calls_in_one_message_all_survive():
+    req = ResponsesRequest.model_validate({
+        "model": "gpt-4o",
+        "input": [{"type": "message", "role": "assistant", "content": "并行读两个",
+                   "tool_calls": [
+                       {"id": "c1", "function": {"name": "read_file", "arguments": '{"path":"a"}'}},
+                       {"id": "c2", "function": {"name": "read_file", "arguments": '{"path":"b"}'}},
+                   ]}],
+    })
+    calls = _call_blocks(convert_responses_to_gateway_messages(req))
+    assert [c["id"] for c in calls] == ["c1", "c2"], f"并行的第二次调用丢失: {calls}"
+    print("test_multiple_tool_calls_in_one_message_all_survive: PASSED")
+
+
+def test_tool_call_reaches_upstream_prompt_end_to_end():
+    captured = {}
+
+    class P:
+        async def chat(self, messages, model, conversation_id=None, **kw):
+            captured["prompt"] = flatten_messages(messages)
+            yield "ok", {}
+            yield "", {"conversation_id": None}
+
+    srv._make_provider = lambda key, client=None: P()
+    r = TestClient(srv.app).post("/v1/responses", json={
+        "model": "gpt-4o",
+        "input": [
+            {"type": "message", "role": "user", "content": "读一下 hello.py"},
+            {"type": "message", "role": "assistant", "content": "我来读",
+             "tool_calls": [{"id": "c1", "type": "function",
+                             "function": {"name": "read_file", "arguments": ARGS}}]},
+            {"type": "message", "role": "tool", "tool_call_id": "c1", "content": "print(1)"},
+        ],
+        "tools": [{"type": "function", "function": {
+            "name": "read_file", "parameters": {"type": "object",
+                                                "properties": {"path": {"type": "string"}}}}}],
+    })
+    assert r.status_code == 200, r.text
+    prompt = captured["prompt"]
+    assert "read_file" in prompt, f"调用没有到达上游提示词:\n{prompt}"
+    assert "c1" in prompt, "调用 id 没有到达上游，工具结果无法对应"
+    assert "[Tool Result for c1]" in prompt
+    print("test_tool_call_reaches_upstream_prompt_end_to_end: PASSED")
+
+
+def run_all():
+    test_assistant_message_tool_calls_are_replayed()
+    test_both_history_shapes_render_identically()
+    test_multiple_tool_calls_in_one_message_all_survive()
+    test_tool_call_reaches_upstream_prompt_end_to_end()
+    print("\n✅ All Responses history tool-call tests passed!")
+
+
+if __name__ == "__main__":
+    run_all()

@@ -184,6 +184,34 @@ def extract_responses_content(content: Any) -> str:
     return "\n".join(parts)
 
 
+def _tool_call_block(tc: Any) -> str:
+    """把一个工具调用渲染成上游认识的 ```tool_call 块；信息不足时返回空串。
+
+    [TOOL-LOOP] 只有一个调用**形状**在这里定义：`message.tool_calls` 回放与
+    `function_call` 项回放共用它，避免同一次调用的渲染规则出现第二份拷贝
+    （`id` 只在存在时写入，保持无 id 客户端的输出逐值不变）。
+    """
+    if not isinstance(tc, dict):
+        return ""
+    fn = tc.get("function") if isinstance(tc.get("function"), dict) else {}
+    name = tc.get("name") or fn.get("name") or ""
+    if not name:
+        return ""
+    args = tc.get("arguments") if "arguments" in tc else fn.get("arguments", {})
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except (ValueError, TypeError):
+            args = {"_raw": args}
+    if args is None:
+        args = {}
+    payload: dict[str, Any] = {"name": name, "arguments": args}
+    c_id = tc.get("id") or tc.get("call_id")
+    if c_id:
+        payload["id"] = c_id
+    return f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
+
+
 def _reasoning_item_text(item: dict) -> str:
     """从 Responses 的 reasoning output item 中取出可回放的思考文本。
 
@@ -259,6 +287,25 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                 if item_type == "message":
                     role = item.get("role", "user")
                     c_text = extract_responses_content(item.get("content"))
+                    if role == "tool":
+                        # [TOOL-LOOP] Chat 形状的 `role:"tool"` 条目：只带
+                        # `tool_call_id`，不带工具名。原样落成一条 user 发言，模型
+                        # 看到的是一段无主的输出，无法与上一次调用对应。
+                        c_id = item.get("tool_call_id") or item.get("call_id") or ""
+                        tag = f"[Tool Result for {c_id}]" if c_id else "[Tool Result]"
+                        messages.append({"role": "user", "content": f"{tag}:\n{c_text}"})
+                        continue
+                    # [TOOL-LOOP] 有些客户端（含 OpenAI SDK 的 chat 兼容形状）把工具
+                    # 调用挂在 assistant `message.tool_calls` 上，而不是独立的
+                    # `function_call` 项。此前这一整段被静默丢弃：模型下一轮只看到
+                    # 工具结果，却找不到自己发过什么调用——多轮 agent 循环在这里断掉。
+                    calls = item.get("tool_calls")
+                    if role == "assistant" and isinstance(calls, list) and calls:
+                        blocks = [_tool_call_block(tc) for tc in calls]
+                        blocks = [b for b in blocks if b]
+                        if blocks:
+                            joined = "\n\n".join(blocks)
+                            c_text = f"{c_text}\n\n{joined}" if c_text.strip() else joined
                     messages.append({"role": role, "content": c_text})
                 elif item_type == "reasoning":
                     # [AGENT-LOOP] Codex CLI 会在下一轮把上一轮的**全部** output items
@@ -290,12 +337,13 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                             args = json.loads(args)
                         except Exception:
                             pass
-                    payload: dict[str, Any] = {"name": name, "arguments": args}
-                    c_id = item.get("call_id") or item.get("id")
-                    if c_id:
-                        payload["id"] = c_id
-                    call_text = f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
-                    messages.append({"role": "assistant", "content": call_text})
+                    call_text = _tool_call_block({
+                        "name": name,
+                        "arguments": args,
+                        "id": item.get("call_id") or item.get("id"),
+                    })
+                    if call_text:
+                        messages.append({"role": "assistant", "content": call_text})
                 elif item_type in ("custom_tool_call", "local_shell_call", "shell_call"):
                     # [TOOL-LOOP] Codex CLI 的 `apply_patch` 等 freeform 工具回放的是
                     # `custom_tool_call`，参数是**纯文本** `input`（不是 JSON
