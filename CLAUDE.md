@@ -456,5 +456,5 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - **One rendering rule, not two**: `_tool_call_block()` is the single implementation, shared by the `message.tool_calls` path and the `function_call` item path. The suite asserts the two render **byte-identically** — the recurring defect class here is one fact interpreted in two places, and a call is the fact that matters most.
     - Pinned by `tests/test_responses_history_tools.py` (4 cases, each verified against the pre-fix code, which reproduces exactly `{'role': 'assistant', 'content': '我来读'}` followed by `{'role': 'tool', 'content': 'print(1)'}`), including an end-to-end case asserting the call and its id reached the prompt the upstream really receives.
 
-43. **Web Frontend (`static/index.html`)**:
+44. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible `<think>` drawer.
