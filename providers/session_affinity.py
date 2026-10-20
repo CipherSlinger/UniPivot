@@ -12,6 +12,18 @@
    - x-session-affinity: bound | handoff | fresh
    - x-session-handoff-from: <from_provider> (仅在发生跨模型迁移时产生)
    - x-session-turns: <turn_count>
+
+[TOOL-LOOP] 客户端的 `conversation_id` 是**线程标识**，不是上游会话标识。
+两者原先被当成同一个值：注册表里没有这条线程时，客户端传来的 id 被原样当成
+`upstream_conv_id` 交给 provider，而 provider 只要看到非空 `conversation_id`
+就走「续聊」分支——只发送最后一条 user 之后的增量内容。首轮请求的增量是空的，
+于是上游收到的提示词**只有最后一句用户输入**：注入的系统提示、`## Tools Available`
+工具契约、`response_format`、整段历史全部消失。实测同一请求在续聊分支下的提示词是
+`'read foo.py'`，在展平分支下是 990 字符。这就是「模型完全不理我给的 tools」的
+直接成因，而且只发生在「客户端自己生成了线程 id」的客户端上——症状因此显得时有时无。
+
+现在只有网关**实际观测到**的上游会话 id 才会被回放；未绑定的线程一律以
+`upstream_conv_id=None` 开始，由 provider 新建会话。
 """
 
 from __future__ import annotations
@@ -97,7 +109,9 @@ class SessionAffinityManager:
                     session_id=session_id,
                     provider_key=provider_key,
                     model_name=model_name,
-                    upstream_conv_id=upstream_conv_id or session_id,
+                    # 绝不拿客户端线程 id 冒充上游会话 id：未观测到就保持 None，
+                    # 让 provider 走「新建会话 + 展平全量历史」分支（见模块 docstring）。
+                    upstream_conv_id=upstream_conv_id,
                     created_at=now,
                     last_accessed_at=now,
                     turn_count=1,
@@ -132,11 +146,15 @@ class SessionAffinityManager:
             entry = self._registry.get(session_id)
 
             if not entry:
+                # 未绑定线程：客户端给的是线程标识，网关从未为它建立过上游会话，
+                # 因此**没有**可回放的上游 id。把它当上游 id 传下去会让 provider
+                # 走续聊分支，只发最后一条 user 之后的增量——首轮即只剩一句提问，
+                # 工具契约与历史整段丢失（[TOOL-LOOP] 见模块 docstring）。
                 return AffinityDecision(
                     status="fresh",
                     provider_key=primary_provider,
                     wire_model=primary_model,
-                    upstream_conv_id=session_id,
+                    upstream_conv_id=None,
                     is_handoff=False,
                     turn_count=1,
                 )
@@ -176,6 +194,22 @@ class SessionAffinityManager:
                 original_provider=orig_provider,
                 turn_count=entry.turn_count,
             )
+
+    def has_upstream_session(self, session_id: Optional[str]) -> bool:
+        """该线程是否已经持有**网关观测到的**上游会话 id。
+
+        调用方据此在「把全量历史展平发出去」与「只发本轮增量」之间选择——这是
+        [TOOL-LOOP] S1 的收口点：客户端自带的线程 id 永远不算数，只有 provider
+        真的返回过 `conversation_id` 并且已 `record_turn` 的线程才算。
+        只读，不改动任何状态。
+        """
+        if not session_id:
+            return False
+        now = time.time()
+        with self._lock:
+            self._clean_expired_locked(now)
+            entry = self._registry.get(session_id)
+            return bool(entry and entry.upstream_conv_id)
 
     def _clean_expired_locked(self, now: float) -> None:
         """清理已超时的会话缓存（内部私有方法，需持有锁）。"""

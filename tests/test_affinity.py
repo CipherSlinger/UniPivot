@@ -76,7 +76,10 @@ def test_session_affinity_manager_lifecycle():
     )
     assert dec1.status == "fresh"
     assert dec1.provider_key == "qwen"
-    assert dec1.upstream_conv_id == session_id
+    # [TOOL-LOOP] 客户端给的线程 id **不是**上游会话 id：注册表里没有这条线程时
+    # 必须交出 None，让 provider 新建会话并展平全量历史。把它原样当上游 id 传下去，
+    # provider 会走续聊分支只发最后一句 user，工具契约整段丢失。
+    assert dec1.upstream_conv_id is None
 
     # 记录第一轮对话
     mgr.record_turn(

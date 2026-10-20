@@ -1878,7 +1878,15 @@ async def chat_completions(req: ChatCompletionRequest):
     fold_headers = make_prompt_folding_headers(fold_meta)
 
     # 1. 估算 prompt tokens 与思考意图
-    prompt_text = continuation_content(messages) if req.conversation_id else flatten_messages(messages)
+    # [TOOL-LOOP] 决定发全量还是增量的，是**网关有没有这条线程的上游会话**，
+    # 而不是客户端有没有给线程 id。原先按 req.conversation_id 判断：一个自己生成
+    # 线程 id 的客户端（Codex / Claude Code 类）首轮就被当成「续聊」，上游只收到
+    # 最后一句提问，注入的系统提示与工具契约整段丢失——「模型无视我的 tools」。
+    prompt_text = (
+        continuation_content(messages)
+        if session_affinity_manager.has_upstream_session(req.conversation_id)
+        else flatten_messages(messages)
+    )
     prompt_tokens = _est_tokens(prompt_text)
     is_thinking = bool(req.thinking)
 
@@ -2771,7 +2779,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     )
                     yield sse_message_stop()
 
-                    if conv_id or req.conversation_id:
+                    if req.conversation_id or conv_id:
                         session_affinity_manager.record_turn(
                             req.conversation_id or conv_id,
                             dispatched_provider,
@@ -2932,7 +2940,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                 yield sse_message_stop()
 
-                if conv_id or req.conversation_id:
+                if req.conversation_id or conv_id:
                     session_affinity_manager.record_turn(
                         req.conversation_id or conv_id,
                         dispatched_provider,
@@ -3068,7 +3076,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         if not success and not group_finalized and flight_decision and flight_decision.is_leader:
             terminate_aborted_group(flight_decision.group)
 
-    if conv_id or req.conversation_id:
+    if req.conversation_id or conv_id:
         session_affinity_manager.record_turn(
             req.conversation_id or conv_id,
             dispatched_provider,
@@ -3145,7 +3153,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 stop_reason="tool_use",
-                conversation_id=conv_id or req.conversation_id,
+                conversation_id=req.conversation_id or conv_id,
             )
             if failover_event:
                 msg_data["failover"] = failover_event.to_dict()
@@ -3167,7 +3175,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         output_tokens=output_tokens,
         # [PROTOCOL] Anthropic 的枚举里有 stop_sequence，如实报告截断原因
         stop_reason="stop_sequence" if _stop_matched else "end_turn",
-        conversation_id=conv_id or req.conversation_id,
+        conversation_id=req.conversation_id or conv_id,
         stop_sequence=_stop_matched or None,
     )
     if failover_event:
@@ -3617,13 +3625,13 @@ async def responses_endpoint(req: ResponsesRequest):
                     out_tokens,
                     reasoning_tokens=reasoning_tokens,
                     failover=failover_event.to_dict() if failover_event else None,
-                    conversation_id=conv_id or req.conversation_id,
+                    conversation_id=req.conversation_id or conv_id,
                     # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete
                     incomplete_reason="stop" if stop_scan.hit else None,
                 )
                 yield sse_done()
 
-                if conv_id or req.conversation_id:
+                if req.conversation_id or conv_id:
                     session_affinity_manager.record_turn(
                         req.conversation_id or conv_id,
                         dispatched_provider,
@@ -3707,7 +3715,7 @@ async def responses_endpoint(req: ResponsesRequest):
         if not success and not group_finalized and flight_decision and flight_decision.is_leader:
             terminate_aborted_group(flight_decision.group)
 
-    if conv_id or req.conversation_id:
+    if req.conversation_id or conv_id:
         session_affinity_manager.record_turn(
             req.conversation_id or conv_id,
             dispatched_provider,
@@ -3779,7 +3787,7 @@ async def responses_endpoint(req: ResponsesRequest):
         output_text=full_output,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        conversation_id=conv_id or req.conversation_id,
+        conversation_id=req.conversation_id or conv_id,
         tool_calls=tool_calls_list,
         msg_id=msg_id,
         failover=failover_event.to_dict() if failover_event else None,

@@ -582,10 +582,18 @@ def test_anthropic_stateful_vs_stateless_lifecycle():
         },
     )
     assert r_stateful.status_code == 200
-    assert tracker.last_conversation_id == "client_session_xyz"
+    # [TOOL-LOOP] 客户端给的线程 id **不是**上游会话 id。网关为这条线程新建会话后，
+    # 上游返回的是自己的会话 id，续聊必须携带它；把客户端 id 原样透传下去会让
+    # provider 走「续聊一个它从未创建过的会话」，首轮只发送最后一句 user——
+    # 注入的系统提示与工具契约整段丢失（模型因此「无视 tools」）。
+    # 判据是「provider 是否拿到了一个上游 id」，而不是「拿到的是不是客户端那串」。
+    assert tracker.last_conversation_id is None or (
+        tracker.last_conversation_id != "client_session_xyz"
+    ), f"客户端线程 id 被当成了上游会话 id: {tracker.last_conversation_id!r}"
     time.sleep(0.05)
-    # 不应被加入删除列表
-    assert "client_session_xyz" not in tracker.deleted_conversations
+    # 网关已建立上游会话 → 不得被当作匿名临时会话删除
+    assert tracker.deleted_conversations == [], tracker.deleted_conversations
+    # 但客户端仍拿回自己的线程 id（线程标识对客户端必须稳定）
     assert r_stateful.json().get("conversation_id") == "client_session_xyz"
 
 

@@ -355,6 +355,86 @@ def test_no_stop_declared_passes_text_through():
     print("test_no_stop_declared_passes_text_through: PASSED")
 
 
+# ------------------------------------------------ E. 客户端线程 id 不得冒充上游会话 id
+
+
+class PromptCapturingProvider:
+    """记录网关**交给 provider 的判决**：该新建会话，还是续聊哪一个上游会话。
+
+    [TOOL-LOOP] 这是本用例唯一诚实的判据。provider 的内部实现（这次该展平还是该
+    只发增量）由它自己决定，测试不该替它决定；但「客户端自带的线程 id 有没有被
+    当成上游会话 id 传下来」是网关的判决，直接可观测。
+    """
+
+    last_prompt: str = ""
+    last_conversation_id: str | None = ""
+
+    async def chat(self, messages, model, conversation_id=None, **kw):
+        from providers.base import flatten_messages
+
+        PromptCapturingProvider.last_conversation_id = conversation_id
+        PromptCapturingProvider.last_prompt = flatten_messages(messages)
+        yield "ok", {}
+
+
+def test_client_thread_id_does_not_swallow_the_tool_contract():
+    """一个自己生成线程 id 的客户端，首轮也必须收到完整的工具契约。
+
+    [TOOL-LOOP] 这是「工具调用没跑起来」最隐蔽的一条成因：把客户端给的
+    `conversation_id`（线程标识）当成上游会话标识，provider 就会走「续聊」分支，
+    只发送最后一条 user 之后的增量内容。首轮的增量是空的，于是上游收到的提示词
+    只有最后一句提问——注入的系统提示、`## Tools Available`、`response_format`
+    全部消失，模型当然不会调用工具。
+
+    判据分两层，缺一不可：
+      1. 网关交给 provider 的判决必须是「新建会话」（`conversation_id is None`）；
+      2. 由此产出的提示词必须同时含有系统提示、工具契约与本轮的工具结果。
+    第一层是可精确复现的回归闸门（改前实测交出的是客户端那串 id），第二层保证
+    第一层修的不是一个无关字段。
+    """
+    body = {
+        "model": "gpt-4o",
+        "conversation_id": "client-generated-thread-id",
+        # 首轮就带工具往返：只发最后一句 user 的续聊分支会把历史整段丢掉
+        "messages": [
+            {"role": "system", "content": "You are a careful pair programmer."},
+            {"role": "user", "content": "read foo.py"},
+            {"role": "assistant", "content": "", "tool_calls": [
+                {"id": "call_1", "type": "function",
+                 "function": {"name": "Read", "arguments": {"file_path": "foo.py"}}}]},
+            {"role": "tool", "tool_call_id": "call_1", "content": "print('hello')"},
+        ],
+        "tools": TOOLS_OPENAI,
+    }
+    def go():
+        # 亲和注册表是按线程持久化的单例：上一次运行的记录会让这一次真的变成
+        # 「续聊」，断言就测不到首轮行为了。先清空，保证这条用例每次都是首轮。
+        srv.session_affinity_manager.clear()
+        return _client().post("/v1/chat/completions", json=body)
+
+    PromptCapturingProvider.last_prompt = ""
+    PromptCapturingProvider.last_conversation_id = ""
+    srv._make_provider = lambda key: PromptCapturingProvider()
+    try:
+        go()
+    finally:
+        srv._make_provider = _guarded_factory
+    assert PromptCapturingProvider.last_conversation_id is None, (
+        "客户端自带的线程 id 被当成了上游会话 id 传给 provider（"
+        f"{PromptCapturingProvider.last_conversation_id!r}）：provider 会把它当续聊目标，"
+        "首轮只发送最后一条 user 之后的增量，系统提示与工具契约整段丢失"
+    )
+    sent = PromptCapturingProvider.last_prompt
+    assert "print('hello')" in sent, (
+        f"工具结果没有送达上游（这是本轮真正的新内容）: {sent}"
+    )
+    assert "careful pair programmer" in sent, (
+        f"首轮就被当成续聊，系统提示整段丢失（模型因此无视 tools）: {sent}"
+    )
+    assert "Tools Available" in sent, f"工具契约没有送达上游: {sent}"
+    print("test_client_thread_id_does_not_swallow_the_tool_contract: PASSED")
+
+
 def run_all():
     tests = [
         test_openai_stop_truncates_and_reports_stop,
@@ -365,6 +445,7 @@ def run_all():
         test_tool_call_after_terminator_is_not_executed,
         test_response_format_reaches_upstream_prompt,
         test_no_stop_declared_passes_text_through,
+        test_client_thread_id_does_not_swallow_the_tool_contract,
     ]
     for fn in tests:
         fn()
