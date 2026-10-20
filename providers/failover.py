@@ -27,7 +27,6 @@
 from __future__ import annotations
 
 import asyncio
-import contextlib
 from contextlib import asynccontextmanager
 import logging
 import os
@@ -2236,25 +2235,46 @@ class FailoverRouter:
                 continue
 
             sem = self.cooldown_tracker.get_semaphore(curr_provider_key)
+            provider_key = curr_provider_key
+            wire_model = curr_wire_model
 
             try:
                 # 1. 频控规避 (Pacing & Jitter)
-                await self.cooldown_tracker.apply_pacing_and_acquire(curr_provider_key)
+                await self.cooldown_tracker.apply_pacing_and_acquire(provider_key)
 
                 # 2. 实例化 Provider
-                # [OPT-022] 观察期内先取串行闸门：把「解封瞬间的并发洪峰」压成逐个
-                # 探路请求（闸门只覆盖握手到首包，不占用整段流式输出），且必须在
-                # 信号量之前获取，避免多个请求先占住并发槽位再排队等闸门。
-                probation_lock = self.cooldown_tracker.probation_lock(curr_provider_key)
-                async with contextlib.AsyncExitStack() as stack:
+                #
+                # [STREAM-AUDIT] 两道闸门的**生命周期不同**，必须分别持有：
+                #
+                #   * 观察期串行闸门 (OPT-022) 只覆盖「握手 → 首包」，文档明确它不占用
+                #     整段流式输出，否则观察期内所有会话都会被串行化；
+                #   * 节点并发信号量必须覆盖**整段流**。此前两者都挂在同一个
+                #     `AsyncExitStack` 上，而本函数是在 `async with` **内部** return 的
+                #     —— 返回的那一刻 `__aexit__` 就把信号量还回去了，主体一个字节都
+                #     还没读。于是 PROVIDER_RISK_SPECS 里 qwen 3 / deepseek 2 / kimi 2
+                #     这些并发上限**只约束了毫秒级的握手**，对真正的并发流完全无效：
+                #     多个 agent 会话同时长跑时，同一账号可以同时背着任意多条上游
+                #     流式会话，而这正是反爬系统用来识别自动化并发的特征之一。
+                #
+                # 现在的持有方式是手动 acquire、由返回的生成器在 finally 里 release，
+                # 且释放是同步的（`Semaphore.release()`），因此在断连路径
+                # (GeneratorExit) 上也安全——那里不允许再 await。
+                probation_lock = self.cooldown_tracker.probation_lock(provider_key)
+                probation_held = False
+                sem_held = False
+                sem_handed_off = False
+                try:
                     if probation_lock is not None:
-                        await stack.enter_async_context(probation_lock)
-                    await stack.enter_async_context(sem)
-                    provider = provider_factory(curr_provider_key)
+                        await probation_lock.acquire()
+                        probation_held = True
+                    await sem.acquire()
+                    sem_held = True
+
+                    provider = provider_factory(provider_key)
 
                     # 3. 试探性获取首包 (确保在流交给外部客户端前捕获初始化错误与上游 4xx/5xx)
                     call_kwargs = dict(chat_args)
-                    call_kwargs["model"] = curr_wire_model
+                    call_kwargs["model"] = wire_model
 
                     raw_stream = provider.chat(**call_kwargs)
 
@@ -2265,36 +2285,82 @@ class FailoverRouter:
                     except StopAsyncIteration:
                         first_item = None
 
+                    # [STREAM-AUDIT] 上游一帧都没吐 = 空流，不是成功。
+                    # 五家的 chat() 结尾都**无条件**产出一帧末位元数据
+                    # （`("", {"conversation_id": ...})`），所以「首个元素就是
+                    # StopAsyncIteration」只可能意味着上游连接正常建立却没有任何
+                    # 内容帧。原实现把它记成 record_success 并返回一个空流，客户端
+                    # 收到一个正常的空回复，节点却被标记为健康——一次真实的失败被
+                    # 记成了成功，失败计数永远不增长。
+                    if first_item is None:
+                        raise ProviderError(
+                            f"节点 [{provider_key}:{wire_model}] 返回了空流（上游未产出任何内容帧）",
+                            status=502,
+                            err_type="upstream_error",
+                        )
+
                     # 首包读取成功，说明此 Provider 健康可用
-                    await self.cooldown_tracker.record_success(curr_provider_key)
+                    await self.cooldown_tracker.record_success(provider_key)
 
                     # 构造包装后的安全生成器
                     async def wrapped_stream() -> AsyncIterator[Tuple[str, dict]]:
-                        nonlocal first_item, raw_stream
-                        # 输出首个包
-                        if first_item is not None:
-                            delta, meta = first_item
-                            # 如果发生了故障转移，在首包元数据注入标记
-                            if failover_event:
-                                meta = dict(meta or {})
-                                meta["x-failover-from"] = failover_event.from_provider
-                                meta["x-failover-to"] = failover_event.to_provider
-                                meta["x-failover-model"] = failover_event.to_model
-                                meta["x-failover-ring"] = failover_event.ring.value
-                            yield delta, meta
-
-                        # 持续迭代剩余数据包
+                        nonlocal first_item, raw_stream, sem_held
                         try:
+                            # 输出首包
+                            if first_item is not None:
+                                delta, meta = first_item
+                                # 如果发生了故障转移，在首包元数据注入标记
+                                if failover_event:
+                                    meta = dict(meta or {})
+                                    meta["x-failover-from"] = failover_event.from_provider
+                                    meta["x-failover-to"] = failover_event.to_provider
+                                    meta["x-failover-model"] = failover_event.to_model
+                                    meta["x-failover-ring"] = failover_event.ring.value
+                                yield delta, meta
+
+                            # 持续迭代剩余数据包
                             async for item in raw_stream:
                                 yield item
+                        except StopSequenceHit:
+                            raise
                         except Exception as stream_err:
                             logger.error(
-                                f"[对等互备网格] 节点 [{curr_provider_key}] 流传输中途断开: {stream_err}"
+                                f"[对等互备网格] 节点 [{provider_key}] 流传输中途断开: {stream_err}"
                             )
+                            # [STREAM-AUDIT] 中途断流必须记入冷却。
+                            # 原实现只打一行日志，节点健康度毫发无损：一个每几次请求
+                            # 就吐到一半断掉的节点，失败计数永远是 0，于是下一轮仍然
+                            # 被选为主选，客户端反复看到「回复说到一半停住」——这正是
+                            # 「稳定性差」的直接来源。风险类拦截（401/429/WAF）由上层
+                            # server 侧统一记账，这里只管非风险类，避免同一次失败记两遍。
+                            is_risk, _ = is_risk_interception(stream_err)
+                            if not is_risk:
+                                try:
+                                    await self.cooldown_tracker.record_failure(
+                                        provider_key,
+                                        int(getattr(stream_err, "status", 502)),
+                                        str(getattr(stream_err, "message", stream_err)),
+                                    )
+                                except Exception:  # noqa: BLE001 - 记账失败不得掩盖原始错误
+                                    pass
                             # 中途断开按原有规范上抛，不产生半包污染
-                            raise stream_err
+                            raise
+                        finally:
+                            # 整段流结束（正常、异常、或被 aclose）→ 归还并发槽位。
+                            # 必须同步释放：GeneratorExit 路径上不允许 await。
+                            if sem_held:
+                                sem_held = False
+                                sem.release()
 
+                    sem_handed_off = True
                     return wrapped_stream(), failover_event, provider
+                finally:
+                    # 观察期闸门只到首包为止：无论成功交接与否，走出握手区就释放。
+                    if probation_held:
+                        probation_lock.release()
+                    # 握手失败 / 空流 / 构造异常：信号量尚未交接给流，就地归还。
+                    if sem_held and not sem_handed_off:
+                        sem.release()
 
             except StopSequenceHit:
                 # [PROTOCOL] 停用词命中是客户端要求「到此为止」的正常终止，不是上游
