@@ -1307,9 +1307,13 @@ async def get_diagnostics():
             "supported_protocols": ["openai_chat", "anthropic_messages", "openai_responses"],
             "total_tool_calls": _tool_healing_stats["total_tool_calls"],
             "healed_tool_calls": _tool_healing_stats["healed_tool_calls"],
+            # [TOOL-LOOP] 正文为空、调用只写在思考流里的回合数：这个计数不为零
+            # 说明上游正在系统性地把工具调用吐进思考通道，是可观测的产品信号。
+            "reasoning_recovered_tool_calls": _tool_healing_stats["reasoning_recovered_tool_calls"],
             "features": [
                 "speculative_text_streaming",
                 "zero_latency_reasoning",
+                "reasoning_channel_tool_recovery",
                 "deep_json_repair",
                 "truncated_json_auto_completion",
                 "telemetry_headers",
