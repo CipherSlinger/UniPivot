@@ -64,6 +64,7 @@ from providers import (
     anthropic_sse_event,
     build_anthropic_tool_blocks,
     completion_response,
+    continuation_content,
     convert_anthropic_to_gateway_messages,
     error_response,
     flatten_messages,
@@ -73,6 +74,7 @@ from providers import (
     parse_tool_call,
     parse_tool_calls,
     parse_tool_calls_with_healing,
+    tool_names_of,
     SpeculativeToolStreamer,
     sse_content_block_delta,
     sse_content_block_start,
@@ -1804,7 +1806,7 @@ async def chat_completions(req: ChatCompletionRequest):
     fold_headers = make_prompt_folding_headers(fold_meta)
 
     # 1. 估算 prompt tokens 与思考意图
-    prompt_text = last_user_content(messages) if req.conversation_id else flatten_messages(messages)
+    prompt_text = continuation_content(messages) if req.conversation_id else flatten_messages(messages)
     prompt_tokens = _est_tokens(prompt_text)
     is_thinking = bool(req.thinking)
 
@@ -2028,7 +2030,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     chat_args=chat_args,
                 )
 
-                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
                 first_frame_emitted = False
 
                 async for delta, meta in stream:
@@ -2353,7 +2355,7 @@ async def chat_completions(req: ChatCompletionRequest):
         })
 
     if req.tools:
-        parsed, was_healed = parse_tool_calls_with_healing(full_output)
+        parsed, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
         if parsed:
             prefix, tool_list = parsed
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -2610,7 +2612,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     chat_args=chat_args,
                 )
 
-                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
                 yield sse_message_start(msg_id, req.model, input_tokens)
 
                 block_idx = 0
@@ -2882,7 +2884,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         blocks.append({"type": "thinking", "thinking": full_thinking})
 
     if req.tools:
-        parsed, was_healed = parse_tool_calls_with_healing(full_output)
+        parsed, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
         if parsed:
             prefix, tool_list = parsed
             _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -3240,7 +3242,7 @@ async def responses_endpoint(req: ResponsesRequest):
                     return
 
                 # 2. Tools 模式：推测式流式分发与自愈解析
-                streamer = SpeculativeToolStreamer(tools_enabled=True)
+                streamer = SpeculativeToolStreamer(tools_enabled=True, allowed=tool_names_of(req.tools))
                 yield sse_response_created(resp_id, req.model)
 
                 out_idx = 0
@@ -3492,7 +3494,7 @@ async def responses_endpoint(req: ResponsesRequest):
     resp_headers.update(thinking_headers)
 
     tool_calls_list = None
-    parsed_res, was_healed = parse_tool_calls_with_healing(full_output)
+    parsed_res, was_healed = parse_tool_calls_with_healing(full_output, tool_names_of(req.tools))
     if parsed_res:
         prefix, tool_list = parsed_res
         _tool_healing_stats["total_tool_calls"] += len(tool_list)

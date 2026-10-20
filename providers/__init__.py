@@ -43,6 +43,7 @@ from .base import (
     ensure_async_client,
     error_response,
     flatten_messages,
+    continuation_content,
     last_user_content,
     sse_frame,
 )
@@ -129,6 +130,7 @@ from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
     parse_tool_calls_with_healing,
+    tool_names_of,
 )
 from .session_affinity import (
     AffinityDecision,
@@ -151,6 +153,7 @@ __all__ = [
     "ensure_async_client",
     "error_response",
     "flatten_messages",
+    "continuation_content",
     "last_user_content",
     "sse_frame",
     "get_http_client",
@@ -225,6 +228,7 @@ __all__ = [
     "SpeculativeToolStreamer",
     "StreamAction",
     "parse_tool_calls_with_healing",
+    "tool_names_of",
     "SessionAffinityManager",
     "AffinityDecision",
     "session_affinity_manager",

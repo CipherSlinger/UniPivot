@@ -27,7 +27,7 @@ from ..base import (
     ProviderError,
     ensure_async_client,
     flatten_messages,
-    last_user_content,
+    continuation_content,
     parse_cookie_header,
 )
 from ..device_identity import stable_device_id
@@ -228,7 +228,7 @@ class GLMProvider:
         async with ensure_async_client(self.client, self.timeout) as client:
             access_token = await self._get_access_token(client)
 
-            prompt = last_user_content(messages) if conversation_id else flatten_messages(messages)
+            prompt = continuation_content(messages) if conversation_id else flatten_messages(messages)
 
             converted_messages = [
                 {

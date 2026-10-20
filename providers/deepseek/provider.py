@@ -22,7 +22,7 @@ from typing import AsyncIterator, Dict, List, Optional, Tuple
 
 import httpx
 
-from ..base import ProviderError, ensure_async_client, flatten_messages, last_user_content
+from ..base import ProviderError, continuation_content, ensure_async_client, flatten_messages
 from .pow import DeepSeekPow
 
 BASE = "https://chat.deepseek.com"
@@ -146,7 +146,7 @@ class DeepSeekProvider:
             if conversation_id:
                 session_id, _, msg = conversation_id.partition(":")
                 parent_id = int(msg) if msg.isdigit() else None
-                prompt = last_user_content(messages)
+                prompt = continuation_content(messages)
                 pow_header = await self._pow_header(client)
             else:
                 model_type = MODEL_TYPE_MAP.get(model, "default")

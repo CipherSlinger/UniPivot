@@ -25,7 +25,7 @@ from ..base import (
     ProviderError,
     ensure_async_client,
     flatten_messages,
-    last_user_content,
+    continuation_content,
     parse_cookie_header,
 )
 from ..device_identity import stable_device_id
@@ -169,7 +169,7 @@ class QwenProvider:
             conversation_id = None
 
         session_id = conversation_id or uuid.uuid4().hex
-        prompt = last_user_content(messages) if conversation_id else flatten_messages(messages)
+        prompt = continuation_content(messages) if conversation_id else flatten_messages(messages)
         conv_id = session_id
         acc_text = ""
         acc_thought = ""

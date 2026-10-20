@@ -25,7 +25,7 @@ from ..base import (
     ProviderError,
     ensure_async_client,
     flatten_messages,
-    last_user_content,
+    continuation_content,
     parse_cookie_header,
 )
 from ..device_identity import stable_device_id
@@ -240,7 +240,7 @@ class KimiProvider:
                 conv_id = await self._create_conversation(client, access_token, user_id, wire_model)
                 created_new_conv = True
 
-            prompt = last_user_content(messages) if not created_new_conv else flatten_messages(messages)
+            prompt = continuation_content(messages) if not created_new_conv else flatten_messages(messages)
 
             send_messages = [{"role": "user", "content": prompt}]
             stream_url = f"{BASE_URL}/api/chat/{conv_id}/completion/stream"

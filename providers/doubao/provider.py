@@ -27,7 +27,7 @@ from ..base import (
     ProviderError,
     ensure_async_client,
     flatten_messages,
-    last_user_content,
+    continuation_content,
     parse_cookie_header,
 )
 from ..device_identity import stable_device_id
@@ -269,7 +269,7 @@ class DoubaoProvider:
         conversation_id 为空时按“新会话”处理；传入时续聊。
         """
         bot_id, need_deep_think = self._resolve_bot_and_think(model, thinking)
-        prompt = last_user_content(messages) if conversation_id else flatten_messages(messages)
+        prompt = continuation_content(messages) if conversation_id else flatten_messages(messages)
         payload = self._build_payload(prompt, bot_id, need_deep_think, conversation_id)
         params = self._security_params()
         url = f"{BASE_URL}{COMPLETION_ENDPOINT}?{urlencode(params)}"

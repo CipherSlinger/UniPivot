@@ -155,9 +155,17 @@ def format_tools_system_prompt(tools: List[dict]) -> str:
     return "\n".join(lines)
 
 
+# [TOOL-LOOP] 围栏语言标签必须落在**可能承载工具调用**的集合内。
+# 原正则是 `[a-zA-Z0-9_.-]*`，不锚定标签，于是 ```python / ```ts / ```typescript
+# 全都命中，任何带 name 键的普通代码块都会被伪造成工具调用。
+#
+# 保留 `json` 是有意为之：真实模型经常把工具调用写成 ```json，禁掉它会误伤大量
+# 正常调用（本仓库的既有用例即来自实测）。所以防伪造**不靠猜格式**，而靠两道
+# 校验——`_extract_single_tool_strict` 要求契约形状，`allowed` 要求名字确实是客户端
+# 声明过的工具。格式白名单只负责挡掉 `python`/`ts` 这类显然不相关的代码块。
 _BLOCK_TOOL_PATTERN = re.compile(
-    r"```+[a-zA-Z0-9_.-]*\s*\n?(.*?)(?:\n?```+|$)",
-    re.DOTALL,
+    r"```+\s*(?:tool_call|tool|function|json|json5)\s*\n(.*?)(?:\n?```+|$)",
+    re.DOTALL | re.IGNORECASE,
 )
 _XML_TOOL_PATTERN = re.compile(
     r"<(?:tool_call|function_call)(?:\s+[^>]*)?>([\s\S]*?)(?:</(?:tool_call|function_call)>|$)",
@@ -254,8 +262,55 @@ def _normalize_tool_args(raw_args: Any) -> dict:
     return {}
 
 
+def _extract_single_tool_strict(item: Any) -> Optional[Tuple[str, dict]]:
+    """严格提取：只有**工具调用契约**形状的对象才算工具调用。
+
+    [TOOL-LOOP] 与 `_extract_single_tool` 的区别是「拒绝」而不是「尽力识别」。
+    宽松版把任何带 `name` 键的对象都当成调用，参数则用「除保留键之外的所有键」
+    兜底，于是普通数据（`{"name": "Alice", "age": 30}`）会被伪造成 `Alice(age=30)`。
+    对 agent 来说这是灾难性的：客户端收到一个它从未声明过、也无法执行的工具调用，
+    整个回合报废。
+
+    严格版要求满足其一：
+      - `{"name": ..., "arguments"|"args"|"parameters"|...: ...}`（网关契约 / OpenAI 形状）
+      - `{"function": {"name": ..., "arguments": ...}}`（OpenAI tool_calls 形状）
+    并且**不再有兜底参数推断**：没有显式参数键时按空参数处理，而不是把其余键全收。
+    """
+    if not isinstance(item, dict):
+        return None
+
+    fn = item.get("function") if isinstance(item.get("function"), dict) else None
+    if fn is not None:
+        name = fn.get("name")
+        raw_args = fn.get("arguments", fn.get("parameters", {}))
+    else:
+        name = item.get("name") or item.get("tool_name")
+        marker = None
+        for key in ("arguments", "args", "parameters", "param", "action_input", "input", "params"):
+            if key in item:
+                marker = key
+                break
+        raw_args = item.get(marker) if marker else None
+        if marker is None:
+            # 没有任何参数键：只有「name + 空对象」这种极窄形状才认，
+            # 其余（如 {"name":"Alice","age":30}）一律不是工具调用。
+            if set(item.keys()) - {"name", "tool_name", "type", "id"}:
+                return None
+            raw_args = {}
+
+    if not name or not isinstance(name, str):
+        return None
+    # 工具名必须是标识符形状：排除 "Alice Smith"、URL、句子等自由文本。
+    stripped = name.strip()
+    if not stripped or not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_.:-]{0,127}", stripped):
+        return None
+
+    args = _normalize_tool_args(raw_args)
+    return stripped, args
+
+
 def _extract_single_tool(item: Any) -> Optional[Tuple[str, dict]]:
-    """从单个字典对象中提取工具名称与归一化参数字典。"""
+    """从单个字典对象中提取工具名称与归一化参数字典（宽松版，保留向后兼容）。"""
     if not isinstance(item, dict):
         return None
 
@@ -292,29 +347,43 @@ def _extract_single_tool(item: Any) -> Optional[Tuple[str, dict]]:
     return name.strip(), args
 
 
-def _extract_tools_from_data(data: Any) -> List[Tuple[str, dict]]:
-    """从解析后的数据（可能为 dict、list、或嵌套列表）中提取一个或多个工具调用。"""
+def _extract_tools_from_data(
+    data: Any,
+    allowed: Optional[set] = None,
+    *,
+    strict: bool = True,
+) -> List[Tuple[str, dict]]:
+    """从解析后的数据（可能为 dict、list、或嵌套列表）中提取一个或多个工具调用。
+
+    `allowed` 为客户端声明的工具名集合；给出时**只接受**集合内的名字。这是
+    伪工具调用的最后一道闸：即便模型写出了契约形状，只要名字不是客户端声明过的，
+    客户端也只会拒绝整个回合。
+    """
+    extractor = _extract_single_tool_strict if strict else _extract_single_tool
     tools: List[Tuple[str, dict]] = []
     if isinstance(data, list):
         for item in data:
-            tool = _extract_single_tool(item)
+            tool = extractor(item)
             if tool:
                 tools.append(tool)
     elif isinstance(data, dict):
         if "tool_calls" in data and isinstance(data["tool_calls"], list):
             for item in data["tool_calls"]:
-                tool = _extract_single_tool(item)
+                tool = extractor(item)
                 if tool:
                     tools.append(tool)
         elif "tools" in data and isinstance(data["tools"], list):
             for item in data["tools"]:
-                tool = _extract_single_tool(item)
+                tool = extractor(item)
                 if tool:
                     tools.append(tool)
         else:
-            tool = _extract_single_tool(data)
+            tool = extractor(data)
             if tool:
                 tools.append(tool)
+
+    if allowed is not None:
+        tools = [(n, a) for (n, a) in tools if n in allowed]
     return tools
 
 
