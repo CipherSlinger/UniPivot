@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import asyncio
 from contextlib import asynccontextmanager
+import json
 import logging
 import os
 import random
@@ -336,6 +337,12 @@ class CooldownTracker:
         }
         # 保护锁
         self._lock = asyncio.Lock()
+        # [H5] 已落盘状态的指纹：内容未变则不重写。
+        # `record_success` 在每个请求的首包成功后被调用，而健康节点的成功**不会改变
+        # 任何持久化状态**（冷却为空、失败计数为 0），原实现却无条件整份重写
+        # （temp 文件 + fsync + os.replace）。实测：健康节点上 20 次成功 = 20 次落盘，
+        # 且每次都在 `_lock` 内阻塞事件循环——这正是「连接 agent 时抖动」的一个来源。
+        self._persisted_fingerprint: Optional[str] = None
         # 风控拦截台账与冷却状态持久化（best-effort）
         self.risk_ledger = get_risk_ledger()
         # [OPT-020] 运维人工长期封禁租约：折入冷却读数，使所有门控自动遵循
@@ -411,6 +418,9 @@ class CooldownTracker:
         except Exception:  # noqa: BLE001 - 恢复失败不得影响启动
             return
         if not state:
+            # [H5] 磁盘上没有状态 = 空状态与内存一致（「没有需要避让的节点」）。
+            # 播种指纹，使进程启动后的第一批健康请求不会只为写一个空文件而 fsync。
+            self._persisted_fingerprint = self._snapshot_fingerprint()
             return
         now = time.time()
         cooldowns = state.get("cooldowns") or {}
@@ -461,28 +471,67 @@ class CooldownTracker:
                 restored_cd,
                 {k: round(v - now, 1) for k, v in self._cooldowns.items()},
             )
+        # [H5] 若恢复后的状态与磁盘上的完全一致（没有过期冷却被丢弃、没有零计数被
+        # 剪掉），则磁盘已经持有这份内容——直接播种指纹，使重启后的第一批健康请求
+        # 不再把同一份状态原样重写一遍。
+        try:
+            restored_fingerprint = self._snapshot_fingerprint()
+            if json.dumps(state, sort_keys=True, default=str) == restored_fingerprint:
+                self._persisted_fingerprint = restored_fingerprint
+        except Exception:  # noqa: BLE001 - 播种失败只意味着多写一次，不影响正确性
+            pass
+
+    def _snapshot_fingerprint(self) -> str:
+        return json.dumps(self._state_snapshot(), sort_keys=True, default=str)
+
+    def _state_snapshot(self) -> Dict[str, Any]:
+        """当前需要跨重启存活的风控状态。
+
+        抽取成单一实现，是为了让「写盘内容」与「恢复后判定磁盘是否已持有同一份
+        内容」（[H5] 的指纹播种）共用一份定义：两处各写一遍必然漂移，那正是本项目
+        反复修复的缺陷类型。
+        """
+        return {
+            "cooldowns": {k: v for k, v in self._cooldowns.items()},
+            "failure_counts": {k: v for k, v in self._failure_counts.items()},
+            # [OPT-022] 观察期判定依赖 episode 结束时间，须随冷却一并持久化，
+            # 否则「避让期间重启」会丢失观察期，导致解封瞬间直接放行并发洪峰。
+            "episode_ends": {k: v for k, v in self._episode_ends.items()},
+            # [OPT-026] 冷却成因同样必须持久化：否则重启后无法判断
+            # 「这次冷却是否由认证失效造成」，复位便失去依据（fail-closed）。
+            "cooldown_severity": {k: v for k, v in self._cooldown_severity.items()},
+            # [OPT-027] 「新凭证仍被拒」的证据与自动租约指纹必须跨界存活：
+            # 重启若能抹掉它，账号就会被重新反复触碰。
+            "fresh_credential_rejected": {k: v for k, v in self._fresh_credential_rejected.items()},
+            "auto_lease_fingerprint": {k: v for k, v in self._auto_lease_fingerprint.items()},
+        }
 
     def _persist_state(self) -> None:
-        """持久化冷却状态与失败计数（best-effort，绝不上抛）。"""
+        """持久化冷却状态与失败计数（best-effort，绝不上抛）。
+
+        [H5] 内容未变时不写盘。本方法在两个**每请求**路径上被调用
+        （`record_success` 的首包成功、`record_failure` 的失败），而多数请求既不改
+        冷却也不改失败计数——无条件重写意味着把 temp 文件 + fsync + os.replace
+        放进了每一次正常请求里，且在 `_lock` 内阻塞事件循环。落盘是「为崩溃保留
+        证据」，对一份与磁盘上逐字节相同的状态重复写入没有任何收益。
+        """
         try:
-            self.risk_ledger.save_state(
-                {
-                    "cooldowns": {k: v for k, v in self._cooldowns.items()},
-                    "failure_counts": {k: v for k, v in self._failure_counts.items()},
-                    # [OPT-022] 观察期判定依赖 episode 结束时间，须随冷却一并持久化，
-                    # 否则「避让期间重启」会丢失观察期，导致解封瞬间直接放行并发洪峰。
-                    "episode_ends": {k: v for k, v in self._episode_ends.items()},
-                    # [OPT-026] 冷却成因同样必须持久化：否则重启后无法判断
-                    # 「这次冷却是否由认证失效造成」，复位便失去依据（fail-closed）。
-                    "cooldown_severity": {k: v for k, v in self._cooldown_severity.items()},
-                    # [OPT-027] 「新凭证仍被拒」的证据与自动租约指纹必须跨界存活：
-                    # 重启若能抹掉它，账号就会被重新反复触碰。
-                    "fresh_credential_rejected": {k: v for k, v in self._fresh_credential_rejected.items()},
-                    "auto_lease_fingerprint": {k: v for k, v in self._auto_lease_fingerprint.items()},
-                }
+            state = self._state_snapshot()
+            fingerprint = self._snapshot_fingerprint()
+            if fingerprint == self._persisted_fingerprint:
+                return
+            if self.risk_ledger.save_state(state):
+                self._persisted_fingerprint = fingerprint
+        except Exception as exc:  # noqa: BLE001
+            # [H5] 这里曾经是裸 `pass`。后果不是「少了一次写盘」，而是**整条持久化
+            # 链路静默失效且完全不可见**：一次 `NameError`（`json` 未导入）就让冷却
+            # 状态再也不落盘，而日志里没有任何一行提示——正是本项目反复记录的
+            # 「文档/埋点声称做了、代码其实没做」的缺陷。best-effort 不等于无声失败。
+            logger.warning(
+                "[风控持久化] 冷却状态写盘失败 (已忽略本次): %s: %s",
+                type(exc).__name__,
+                exc,
             )
-        except Exception:  # noqa: BLE001
-            pass
 
     def is_disabled(self, provider_key: str) -> bool:
         """[OPT-033] 检查指定 Provider 是否被运维显式禁用。
@@ -1136,7 +1185,10 @@ class CooldownTracker:
                 self.renewal.clear_provider(provider_key)
             except Exception:  # noqa: BLE001
                 pass
-            self._failure_counts[provider_key] = 0
+            # [H5] 用 pop 而不是写 0：`failure_counts` 的语义是「当前处于失败中的
+            # 节点」，写 0 会留下一个与「从未失败」等价、却让快照指纹每次都不相同的
+            # 条目，使健康节点的成功永远无法被判定为「状态未变」而白白写盘。
+            self._failure_counts.pop(provider_key, None)
             self._cooldowns.pop(provider_key, None)
             self._cooldown_severity.pop(provider_key, None)
             # [OPT-027] 节点已用当前凭证成功 -> 「新凭证仍被拒」的证据被证伪，清除。
@@ -1399,7 +1451,8 @@ class CooldownTracker:
 
             self._cooldowns.pop(provider_key, None)
             self._cooldown_severity.pop(provider_key, None)
-            self._failure_counts[provider_key] = 0
+            # [H5] 同上：清零用 pop，避免在持久化状态里留下「0 = 从未失败」的噪声条目。
+            self._failure_counts.pop(provider_key, None)
             # 注意：**不**清除凭证指纹记录。释放只是「假设凭证已修好」，而不是
             # 「确认修好」——指纹记录必须保留，否则下一次失败的比对基准被抹掉，
             # OPT-027 赖以判定的「本次失败是否发生在一枚更新的凭证上」将永远为假，

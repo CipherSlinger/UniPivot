@@ -163,16 +163,24 @@ class RiskLedger:
                 logger.warning("读取风控冷却状态失败 (已忽略): %s: %s", type(exc).__name__, exc)
                 return {}
 
-    def save_state(self, state: Mapping[str, Any]) -> None:
-        """持久化冷却状态与失败计数（best-effort）。"""
+    def save_state(self, state: Mapping[str, Any]) -> bool:
+        """持久化冷却状态与失败计数（best-effort）。
+
+        返回是否**确实写盘成功**。调用方（[H5] 的 `_persist_state`）用它决定要不要
+        记住这次内容的指纹：写失败时绝不能记住，否则下一份相同状态会被误判为
+        「已经落盘」而跳过重试——一次磁盘瞬时故障就会让冷却状态直到内容再次变化
+        之前都不再持久化。
+        """
         if self.is_disabled():
-            return
+            return False
         try:
             payload = json.dumps(state, ensure_ascii=False, indent=2, sort_keys=True)
         except Exception:  # noqa: BLE001
-            return
+            return False
         if self._atomic_write(self.cooldown_path, payload):
             self._stats["cooldown_saves"] += 1
+            return True
+        return False
 
     # ------------------------------------------------------------ 拦截台账
 
