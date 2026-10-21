@@ -32,6 +32,27 @@ logger = logging.getLogger("gateway.singleflight")
 
 _SENTINEL = object()
 
+# [M4] 全进程累计的「因消费过慢被摘除」跟随者数。放在模块级而不是实例上，
+# 是因为多个端点/多个管理器实例都会广播，而运维关心的是「这条路是否在丢客户端」。
+_DETACHED_STATS: Dict[str, int] = {"followers_detached": 0}
+
+
+def _bump_detached() -> None:
+    _DETACHED_STATS["followers_detached"] += 1
+
+
+def get_follower_backpressure_stats() -> Dict[str, int]:
+    """[M4] 背压遥测：被摘除的慢跟随者总数。"""
+    return dict(_DETACHED_STATS)
+
+
+def follower_backlog_limit() -> int:
+    """[M4] 单个跟随者允许积压的帧数上限（默认 256）。唯一一份定义。"""
+    try:
+        return max(1, int(os.getenv("GATEWAY_SINGLEFLIGHT_BACKLOG", "256")))
+    except ValueError:
+        return 256
+
 
 @dataclass
 class SingleFlightDecision:
@@ -60,6 +81,9 @@ class FlightGroup:
         self.subscribers: List[asyncio.Queue] = []
         self._lock = asyncio.Lock()
         self.done_event = asyncio.Event()
+        # [M4] 跟随者背压状态。见 `broadcast_chunk` 的注释：
+        # 「一帧都不消费的跟随者」必须有明确结局，否则它的队列会被无限灌满。
+        self._followers_detached = 0
         self.completed_result: Optional[Any] = None
         self.completed_headers: Optional[Dict[str, str]] = None
         self.error: Optional[Exception] = None
@@ -78,7 +102,14 @@ class FlightGroup:
                 return history_snapshot, None, True
             q = asyncio.Queue()
             self.subscribers.append(q)
+            # 有新的跟随者挂上来，说明上一轮背压已经结束（那几位已经退出队列），
+            # 重置摘除标记，避免一次慢客户端永久关闭本组的跟随能力。
+            self._followers_detached = 0
             return history_snapshot, q, False
+
+    def _follower_backlog_limit(self) -> int:
+        """[M4] 背压上限（委托给模块级唯一判据）。"""
+        return follower_backlog_limit()
 
     async def remove_subscriber(self, q: asyncio.Queue) -> None:
         """移除已退出的订阅者。"""
@@ -87,13 +118,51 @@ class FlightGroup:
                 self.subscribers.remove(q)
 
     async def broadcast_chunk(self, item: Any) -> None:
-        """Leader 向所有订阅者分发增量数据帧，并存入历史重放缓冲区。"""
+        """Leader 向所有订阅者分发增量数据帧，并存入历史重放缓冲区。
+
+        [M4] 跟随者必须有**背压下限**，否则「一帧都不消费的客户端」会被无声地
+        喂到内存耗尽：队列是无界的（`asyncio.Queue()` 默认 maxsize=0），而这里
+        `put_nowait` 永不失败，异常分支实际是死代码。实测：Leader 广播 20000 帧
+        512 字节后，单个不消费的跟随者队列里躺着 20000 帧 —— 约 10 MB，且完全
+        没有任何上限；正常的速度差（客户端在慢网络上、或 SSE 客户端处理卡顿）
+        会比任何人手写慢得多的测试更早地把它堆起来。
+
+        正确的处置不是**阻塞** Leader（那会用一个慢客户端拖住所有跟随者，
+        正是 SingleFlight 要消除的问题），而是**摘除**该跟随者并让它知道自己被
+        摘除：队列里放一个错误，`stream_follower_gen` 会把它抛给该客户端——
+        它拿到的是「本路共享流已不可靠，请重试」的明确答复，而不是永远等下去，
+        也不是被静默截断成半截回答。这台机器上只有它一个人，因此保留 Leader 对
+        其余跟随者的广播。
+        """
+        limit = self._follower_backlog_limit()
         async with self._lock:
             self.history.append(item)
             for q in list(self.subscribers):
+                if q.qsize() >= limit:
+                    self.subscribers.remove(q)
+                    self._followers_detached += 1
+                    _bump_detached()
+                    # 摘除时**清空**已积压的帧：留着它们既占着这笔内存（正是要
+                    # 防的东西），又没有任何用处——该跟随者收到的结局是「重试」，
+                    # 而不是「读完这半截再重试」。
+                    while not q.empty():
+                        try:
+                            q.get_nowait()
+                        except Exception:  # noqa: BLE001
+                            break
+                    try:
+                        q.put_nowait(
+                            RuntimeError(
+                                f"本路共享流消费过慢（积压超过 {limit} 帧），已被摘除；"
+                                f"请重试该请求（x-singleflight: leader 不受影响）"
+                            )
+                        )
+                    except Exception:  # noqa: BLE001 - 摘除失败不影响其余跟随者
+                        pass
+                    continue
                 try:
                     q.put_nowait(item)
-                except Exception:
+                except Exception:  # noqa: BLE001
                     pass
 
     async def finish(
@@ -243,6 +312,8 @@ class SingleFlightManager:
             "leader_executions": 0,
             "follower_shares": 0,
         }
+        # [M4] 模块级背压计数同属「管理器状态」，必须一并重置，否则用例之间串扰。
+        _DETACHED_STATS["followers_detached"] = 0
 
     def get_diagnostics(self) -> Dict[str, Any]:
         """获取 SingleFlight 运行指标统计。"""
@@ -261,6 +332,10 @@ class SingleFlightManager:
             "follower_shares": self._stats["follower_shares"],
             "saved_ratio": saved_ratio,
             "debounce_ttl_seconds": self.debounce_ttl,
+            # [M4] 背压：不设上限时，一个不消费的跟随者会被无声地喂到内存耗尽。
+            # 被摘除的跟随者会收到明确错误（而不是被静默截断），计数在这里可见。
+            "followers_detached": _DETACHED_STATS["followers_detached"],
+            "follower_backlog_limit": follower_backlog_limit(),
         }
 
 
@@ -361,6 +436,9 @@ async def stream_follower_gen(group: FlightGroup) -> AsyncGenerator[Any, None]:
             if item is _SENTINEL:
                 break
             if isinstance(item, Exception):
+                # [M4] 这里会收到两类错误：Leader 的真实失败（上游异常），以及
+                # 「本路消费过慢、已被摘除」的背压通知。两者都必须抛给客户端——
+                # 静默结束会让客户端把半截回答当成完整回答，是比报错更糟的结局。
                 raise item
             yield item
     finally:
