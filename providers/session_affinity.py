@@ -52,7 +52,7 @@ class AffinityEntry:
 @dataclass
 class AffinityDecision:
     """会话粘滞路由决策。"""
-    status: str  # "bound" (已粘滞) | "handoff" (已跨模型迁移) | "fresh" (全新会话)
+    status: str  # "bound" | "degraded" (原节点短冷却，粘滞保留) | "handoff" (已跨模型迁移) | "fresh" (全新会话)
     provider_key: str
     wire_model: str
     upstream_conv_id: Optional[str]
@@ -73,6 +73,7 @@ class SessionAffinityManager:
         self._stats = {
             "total_recorded_sessions": 0,
             "affinity_hits": 0,
+            "affinity_degraded": 0,
             "affinity_handoffs": 0,
         }
 
@@ -124,11 +125,21 @@ class SessionAffinityManager:
         primary_provider: str,
         primary_model: str,
         is_provider_available: Callable[[str], bool],
+        can_retain_degraded: Optional[Callable[[str], bool]] = None,
     ) -> AffinityDecision:
         """解析当前会话粘滞关系。
 
-        若存在已绑定的健康 Provider，则锁定该 Provider；
-        若原 Provider 离线或不可用，则触发跨模型状态迁移并剥离旧 ID。
+        若存在已绑定的可用 Provider，则锁定该 Provider；
+        若原 Provider 处于硬阻断状态，则触发跨模型状态迁移并剥离旧 ID。
+
+        [M3] 「可用」与「值得为它放弃整段上下文」是两个判据，此前被混成一个。
+        `is_provider_available` 对**任何**软冷却（哪怕 15 秒的 429 退避）都返回
+        False，于是每有一次频控退避，进行中的长程会话就被永久改嫁到另一家厂商：
+        上游上下文全部重建、提示词缓存全丢、工具调用契约重新学习——为躲开一个
+        数十秒的窗口付出几十倍的代价。这里改为**只判定粘滞是否仍保留得下**：
+        硬阻断（租约 / 禁用 / 长效避让）不可保留，短冷却可以保留（见
+        `FailoverRouter.is_affinity_retainable`）。调用方传入的仍是同一个谓词，
+        由服务端注入更严格的语义，判定口径因此只有一份。
         """
         if not session_id:
             return AffinityDecision(
@@ -161,7 +172,7 @@ class SessionAffinityManager:
 
             entry.last_accessed_at = now
 
-            # 检查原绑定的 Provider 是否健康可用
+            # 原绑定节点不可用：先区分「一时退避」与「不值得保留」
             if is_provider_available(entry.provider_key):
                 self._stats["affinity_hits"] += 1
                 return AffinityDecision(
@@ -173,7 +184,23 @@ class SessionAffinityManager:
                     turn_count=entry.turn_count,
                 )
 
-            # 原绑定节点不可用，执行平滑状态迁移
+            degraded_ok = can_retain_degraded or (lambda _p: False)
+            # 原绑定节点一时退避（短冷却），**保留粘滞关系**：不迁移、不清洗上游
+            # 会话 id。本次请求仍以常规候选为主选（调用方传入的 primary），由派发
+            # 边界按 OPT-021 的「短冷却只降级」语义处置；冷却一结束，同一会话自动
+            # 回到原节点、原上游会话，无需重建上下文。
+            if degraded_ok(entry.provider_key):
+                self._stats["affinity_degraded"] += 1
+                return AffinityDecision(
+                    status="degraded",
+                    provider_key=entry.provider_key,
+                    wire_model=entry.model_name or primary_model,
+                    upstream_conv_id=entry.upstream_conv_id,
+                    is_handoff=False,
+                    turn_count=entry.turn_count,
+                )
+
+            # 原绑定节点硬阻断（租约 / 禁用 / 长效避让），执行平滑状态迁移
             self._stats["affinity_handoffs"] += 1
             orig_provider = entry.provider_key
             logger.info(
@@ -227,6 +254,7 @@ class SessionAffinityManager:
             self._stats = {
                 "total_recorded_sessions": 0,
                 "affinity_hits": 0,
+                "affinity_degraded": 0,
                 "affinity_handoffs": 0,
             }
 
@@ -240,6 +268,9 @@ class SessionAffinityManager:
                 "active_sessions": active_count,
                 "total_recorded_sessions": self._stats["total_recorded_sessions"],
                 "affinity_hits": self._stats["affinity_hits"],
+                # [M3] 「降级但保留」是本轮新增的第三种结局，必须可观测：
+                # 它如果长期为 0 而 handoffs 很高，说明判据没有真正生效。
+                "affinity_degraded": self._stats["affinity_degraded"],
                 "affinity_handoffs": self._stats["affinity_handoffs"],
                 "ttl_seconds": self.ttl_seconds,
             }

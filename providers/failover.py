@@ -716,6 +716,42 @@ class CooldownTracker:
             pass
         return self.get_remaining_cooldown(provider_key) >= self.long_avoidance_threshold()
 
+    def is_affinity_retainable(self, provider_key: str) -> bool:
+        """[M3] 会话粘滞是否仍可保留在该节点（只读，供会话亲和判定）。
+
+        原判定只看「节点是否可用」，而可用性对**任何**软冷却都回答 False。后果是：
+        一次 429 退避（15 秒）就会把一个正在进行长程 agent 会话的客户端整体迁移到
+        另一个厂商——上游上下文全部重建、提示词缓存全丢、工具调用契约需要重新学习，
+        而这一切只为躲开一次 15 秒的频控。跨厂商迁移的代价是**几十倍**的，为了一个
+        秒级窗口付这笔钱是明确的错误取舍。
+
+        语义与派发边界的分层保持一致（OPT-021/031 已确立）：
+        - **硬阻断**（运维/自动租约、`DISABLED_PROVIDERS`、长效避让）→ 不可保留：
+          这些是「不要碰这个节点」的声明，等待没有意义，必须迁移；
+        - **短冷却**（频控退避、一次性人机验证）→ 保留：它数秒到两分钟即自愈，
+          而迁移要付出整段上下文的代价。粘滞关系**不动**，冷却一结束就自动回到
+          原节点、原上游会话；单次请求仍由派发边界按原语义处置（短冷却只降级、
+          保留最后一搏，失败则在本次请求内故障转移），但会话本身不会被永久改嫁。
+
+        只读：本方法不改变任何风控状态。
+        """
+        try:
+            if self.is_disabled(provider_key):
+                return False
+        except Exception:  # noqa: BLE001 - 判定失败按不可用处理，绝不误留
+            return False
+        try:
+            if self.is_quarantined(provider_key):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        try:
+            if self.is_in_long_avoidance(provider_key):
+                return False
+        except Exception:  # noqa: BLE001
+            return False
+        return True
+
     def ring_long_avoidance_snapshot(self) -> Dict[str, Dict[str, Any]]:
         """[OPT-031] 当前处于长效避让的节点及其成因/剩余时长（只读，供快速失败文案与诊断）。"""
         snapshot: Dict[str, Dict[str, Any]] = {}

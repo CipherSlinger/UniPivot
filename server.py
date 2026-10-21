@@ -853,6 +853,11 @@ def _make_affinity_headers(decision: AffinityDecision) -> dict[str, str]:
     }
     if decision.is_handoff and decision.original_provider:
         headers["x-session-handoff-from"] = decision.original_provider
+    # [M3] 粘滞保留在处于短冷却的原节点上：本次请求可能由别的节点服务（故障转移），
+    # 但会话归属并未改嫁。把这个选择显式说出来，而不是让人从「没有 handoff 头」
+    # 反推——「降级但保留」与「一切正常」在响应上是两件事。
+    if decision.status == "degraded" and decision.provider_key:
+        headers["x-session-affinity-degraded"] = decision.provider_key
     return headers
 
 
@@ -995,7 +1000,7 @@ class ReclaimingStreamingResponse(StreamingResponse):
 
 
 def _is_provider_healthy(pkey: str) -> bool:
-    """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期。
+    """检查指定 Provider 是否未被显式禁用且未处于熔断冷却期（**可用性**判据）。
 
     [OPT-033] 禁用判定改由 `cooldown_tracker.is_disabled()` 提供，不再在此处**另读一次**
     `DISABLED_PROVIDERS` 环境变量。此前本函数与 `CooldownTracker` 各自解析同一份配置：
@@ -1003,12 +1008,27 @@ def _is_provider_healthy(pkey: str) -> bool:
     （测试、或任何不经进程重启的配置变更）时会给出不一致的答案——而「同一份配置被两处
     各自解读」正是本项目反复出现的缺陷类型。现在只有一份解读，会话亲和与派发边界因此
     对「哪些节点被禁用」永远同答。
+
+    [M3] 注意本函数回答的是「此刻能不能用」，而会话粘滞要问的是「值不值得为它放弃
+    整段上下文」——后者由 `_is_provider_retainable` 回答，两者的差别只在短冷却。
     """
     if failover_router.cooldown_tracker.is_disabled(pkey):
         return False
     if failover_router.cooldown_tracker.is_in_cooldown(pkey):
         return False
     return True
+
+
+def _is_provider_retainable(pkey: str) -> bool:
+    """[M3] 会话粘滞是否仍**保留得下**（可迁移性判据，与可用性是两件事）。
+
+    `_is_provider_healthy` 回答「这个节点此刻能不能用」，对任何软冷却都答 False；
+    本函数回答「值不值得为了这次不可用把整段会话改嫁别家」。两者的差别只在短冷却：
+    一次 15 秒的 429 退避不该让进行中的长程 agent 会话永久切换厂商（上下文重建、
+    提示词缓存全丢、工具契约重新学习），而租约 / 禁用 / 长效避让必须迁移。
+    判据由 `CooldownTracker.is_affinity_retainable()` 唯一给出。
+    """
+    return failover_router.cooldown_tracker.is_affinity_retainable(pkey)
 
 
 def is_anthropic_request(request: Request) -> bool:
@@ -2037,6 +2057,7 @@ async def chat_completions(req: ChatCompletionRequest):
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
+        can_retain_degraded=_is_provider_retainable,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -2490,11 +2511,20 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield "data: [DONE]\n\n"
 
                 if conversation_id:
+                    # [M3] 若本次因原节点短冷却而改由别家服务，会话归属**不得**跟着
+                    # 改嫁：否则一次频控退避就会把长程会话永久迁到另一个厂商，导致
+                    # 上游上下文全部重建。归属仍记在原节点上，并清掉本轮观测到的
+                    # 上游会话 id（它属于服务本次请求的那个节点，不能回放给原节点）。
+                    keep_provider = (
+                        affinity_decision.provider_key
+                        if affinity_decision.status == "degraded"
+                        else dispatched_provider
+                    )
                     session_affinity_manager.record_turn(
                         req.conversation_id or conversation_id,
-                        dispatched_provider,
+                        keep_provider,
                         dispatched_model,
-                        conversation_id,
+                        None if affinity_decision.status == "degraded" else conversation_id,
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -2625,11 +2655,17 @@ async def chat_completions(req: ChatCompletionRequest):
             terminate_aborted_group(flight_decision.group)
 
     if conversation_id:
+        # [M3] 短冷却降级期间不迁移会话归属（见流式分支同处注释）。
+        keep_provider = (
+            affinity_decision.provider_key
+            if affinity_decision.status == "degraded"
+            else dispatched_provider
+        )
         session_affinity_manager.record_turn(
             req.conversation_id or conversation_id,
-            dispatched_provider,
+            keep_provider,
             dispatched_model,
-            conversation_id,
+            None if affinity_decision.status == "degraded" else conversation_id,
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -2791,6 +2827,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
+        can_retain_degraded=_is_provider_retainable,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -3147,11 +3184,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 yield sse_message_stop()
 
                 if req.conversation_id or conv_id:
+                    # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
+                    keep_provider = (
+                        affinity_decision.provider_key
+                        if affinity_decision.status == "degraded"
+                        else dispatched_provider
+                    )
                     session_affinity_manager.record_turn(
                         req.conversation_id or conv_id,
-                        dispatched_provider,
+                        keep_provider,
                         dispatched_model,
-                        conv_id,
+                        None if affinity_decision.status == "degraded" else conv_id,
                     )
 
                 if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -3292,11 +3335,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             terminate_aborted_group(flight_decision.group)
 
     if req.conversation_id or conv_id:
+        # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
+        keep_provider = (
+            affinity_decision.provider_key
+            if affinity_decision.status == "degraded"
+            else dispatched_provider
+        )
         session_affinity_manager.record_turn(
             req.conversation_id or conv_id,
-            dispatched_provider,
+            keep_provider,
             dispatched_model,
-            conv_id,
+            None if affinity_decision.status == "degraded" else conv_id,
         )
 
     if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -3495,6 +3544,7 @@ async def responses_endpoint(req: ResponsesRequest):
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
+        can_retain_degraded=_is_provider_retainable,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
