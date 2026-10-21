@@ -1064,6 +1064,7 @@ class CooldownTracker:
         status: int,
         error_msg: str = "",
         custom_cooldown: Optional[float] = None,
+        is_timeout: bool = False,
     ) -> float:
         """记录失败并触发动态冷却避让。
         返回该节点进入的冷却时长。
@@ -1083,12 +1084,30 @@ class CooldownTracker:
             # 401 令牌过期也需要避让
             is_auth_error = status == 401
 
+            # [M2] 超时是被**显式判定**的成因，不靠解析文案去猜：握手与流式空闲
+            # 边界由网关自己产生，它知道这次失败是「上游不吐字」。判定必须发生在
+            # 分支选择**之前**，否则超时的错误文案会先被风控匹配器认领（分类器对
+            # 任何非 401/429 的输入都缺省回 waf），落进 WAF 分支拿到 ≤45 秒的短冷却
+            # ——既起不到避让作用，又给节点记下一段它从未有过的风控画像。
+            is_timeout = bool(is_timeout) or status == 504
+
             # 严重度分级：auth（令牌/账号级）> ratelimit（频控）> waf（人机验证）
             severity = classify_interception_severity(
                 is_risk=is_risk, risk_reason=risk_reason, status=status, error_msg=error_msg
             )
             escalated = False
-            if severity == SEVERITY_AUTH or is_auth_error:
+            if is_timeout:
+                # 上游故障，不是风控：常规 5xx 那套 15s×n 的递增在这里方向相反
+                # ——连续超时说明上游**持续**不吐字，越敲越亏；而 45 秒以内的冷却
+                # 又落进「短冷却值得最后一搏」的区间，节点会一直被派发下去。
+                cooldown_duration = max(30.0, base_cd)
+                severity = "timeout"
+                logger.warning(
+                    f"[超时避让] 节点 [{provider_key}] 上游超时 (HTTP {status})："
+                    f"冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次连续失败)。"
+                    f"这是上游故障而非风控拦截，不会写入风控台账"
+                )
+            elif severity == SEVERITY_AUTH or is_auth_error:
                 # 认证失效通常需重新登录，且高频重试会加剧上游封禁：
                 # 首次维持既有短冷却，连续 ≥3 次后按 2 的幂次长效升级并持久化。
                 cooldown_duration = max(60.0, base_cd)
@@ -1140,7 +1159,7 @@ class CooldownTracker:
                         f"触发避让冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次失败)"
                     )
             else:
-                # 普通网络超时或 5xx
+                # 普通 5xx（超时已在上面单独分支处置）
                 cooldown_duration = min(base_cd, 15.0 * cur_fails)
 
             end_time = time.time() + cooldown_duration
@@ -1152,7 +1171,7 @@ class CooldownTracker:
             # [OPT-025] 认证失效还需上报全环检测器：若多个**不同**节点在同一窗口内
             # 相继 401，说明整环凭证已失效，故障转移不可能成功——必须快速失败而非
             # 逐个打满五个节点（那正是上游眼中的「自动化凭证尝试」流量特征本身）。
-            if severity == SEVERITY_AUTH or is_auth_error:
+            if not is_timeout and (severity == SEVERITY_AUTH or is_auth_error):
                 try:
                     self.credential_watch.note_auth_failure(provider_key)
                 except Exception:  # noqa: BLE001 - 检测器异常绝不影响冷却主流程
@@ -1179,12 +1198,12 @@ class CooldownTracker:
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
-            if is_risk or is_waf_or_rate or is_auth_error:
+            if not is_timeout and (is_risk or is_waf_or_rate or is_auth_error):
                 self._enter_probation(provider_key, self._cooldowns[provider_key])
 
             # 台账记录：仅记录真正的拦截事件（风控 / 频控 / 认证失效），
             # 普通 5xx 与超时不入账，避免污染风控画像。
-            if is_risk or is_waf_or_rate or is_auth_error:
+            if not is_timeout and (is_risk or is_waf_or_rate or is_auth_error):
                 try:
                     self.risk_ledger.record_interception(
                         provider=provider_key,
@@ -2197,6 +2216,47 @@ class FailoverRouter:
             ),
         }
 
+    # ---------------------------------------------------------------- [M2] 超时边界
+    def _first_chunk_timeout(self) -> float:
+        """[M2] 等待上游**首包**的上限（秒，默认 180）。
+
+        这不是「回复多久算慢」的调参，而是「握手阶段可以占用多少共享资源」的边界：
+        在首包到达之前，本函数握着节点并发信号量与观察期串行闸门，而推理模型正常
+        思考几十秒是**健康**的（心跳机制存在的原因），所以上限必须明显高于正常
+        思考时间、又必须存在——否则一个挂住的上游会把这些共享资源占到 httpx 的
+        600 秒读超时为止，把同账号的所有请求一起拖住。
+        `GATEWAY_FIRST_CHUNK_TIMEOUT=0` 关闭（回退为裸 await，逐值等同旧行为）。
+        """
+        return self.cooldown_tracker._env_float("GATEWAY_FIRST_CHUNK_TIMEOUT", 180.0)
+
+    def _stream_idle_timeout(self) -> float:
+        """[M2] 上游**两条**数据帧之间的最长间隔（秒，默认 180）。
+
+        为什么需要它：httpx 的 read timeout 是**每个 socket 读**的，每来一个字节
+        就重置一次，因此一个每 599 秒吐一字节的上游永远不会触发它；而心跳只会
+        持续产出 `: keepalive`，让客户端也永远不会放弃。结果是连接、上游 socket、
+        节点并发信号量与负载均衡配额可以被一个半死不活的上游无限期占住。
+        这里给「上游还活着吗」一个明确的判据，超时按上游故障处置并计入失败。
+        `GATEWAY_STREAM_IDLE_TIMEOUT=0` 关闭。
+        """
+        return self.cooldown_tracker._env_float("GATEWAY_STREAM_IDLE_TIMEOUT", 180.0)
+
+    def _timeout_cooldown(self) -> float:
+        """[M2] 超时失败后的冷却时长（秒，默认 60）。
+
+        超时与 5xx 的其它成员不同：`record_failure` 的通用分支按
+        `min(base_cd, 15 × 连续失败)` 递增，对真实 5xx 是对的（上游可能正在抖），
+        但对超时它是**反向**的——连续超时意味着上游**持续**不吐字，此时反复以
+        15 秒节奏去敲，每一次都白占一个节点并发槽与 HTTP/2 连接，并把客户端拖在
+        故障转移链上。更糟的是通用分支按规则可能落在 45 秒以内，也就是**短冷却**
+        区间，于是该节点被判定为「值得最后一搏」继续派发（OPT-021/031 的判据），
+        超时节点因此永远得不到真正的退避。
+        取 60 秒：明确高于短冷却上限对「一次性 5xx」的取值，同时又远低于长效避让，
+        让一次网络抖动不至于把节点冻结数小时。
+        `GATEWAY_TIMEOUT_COOLDOWN` 可调。
+        """
+        return self.cooldown_tracker._env_float("GATEWAY_TIMEOUT_COOLDOWN", 60.0)
+
     async def execute_chat(
         self,
         primary_provider_key: str,
@@ -2442,11 +2502,36 @@ class FailoverRouter:
                     raw_stream = provider.chat(**call_kwargs)
 
                     # 尝试读取第一个元素（以捕获握手及首包异常）
+                    #
+                    # [M2] 这里必须有**上限**。此前是一个裸 await：上游连上了却不
+                    # 吐字时，唯一的边界是 httpx 的 600 秒读超时，而这段时间里本函数
+                    # 正握着节点并发信号量与观察期串行闸门——一次挂住的握手会把同一
+                    # 账号下所有请求堵在观察期闸门后面长达十分钟，客户端早已放弃。
+                    # 超时按「上游故障」处置（可故障转移），不是风控成因，因此不会
+                    # 给节点上风控冷却，只是普通的失败计数。
                     first_item: Optional[Tuple[str, dict]] = None
-                    try:
-                        first_item = await raw_stream.__anext__()
-                    except StopAsyncIteration:
-                        first_item = None
+                    handshake_timeout = self._first_chunk_timeout()
+                    if handshake_timeout > 0:
+                        # `wait_for` 的超时会取消被等待的协程——这里正是我们想要的：
+                        # 超时即判定上游已死，主动取消拉取以防它作为幽灵任务持有连接。
+                        try:
+                            first_item = await asyncio.wait_for(
+                                raw_stream.__anext__(), timeout=handshake_timeout
+                            )
+                        except asyncio.TimeoutError:
+                            raise ProviderError(
+                                f"节点 [{provider_key}:{wire_model}] 在 "
+                                f"{handshake_timeout:.0f}s 内未返回首包（握手超时）",
+                                status=504,
+                                err_type="upstream_timeout",
+                            ) from None
+                        except StopAsyncIteration:
+                            first_item = None
+                    else:
+                        try:
+                            first_item = await raw_stream.__anext__()
+                        except StopAsyncIteration:
+                            first_item = None
 
                     # [STREAM-AUDIT] 上游一帧都没吐 = 空流，不是成功。
                     # 五家的 chat() 结尾都**无条件**产出一帧末位元数据
@@ -2477,9 +2562,45 @@ class FailoverRouter:
                             sem_held = False
                             sem.release()
 
+                    # [M2] 空闲超时拉取：用 `asyncio.wait` 观察，而不是
+                    # `asyncio.wait_for` / `asyncio.timeout()`。
+                    #
+                    # 后两者靠**取消**实现超时，而取消会被抛进上游生成器体内、把它
+                    # 整体关闭（`stream_keepalive` 的 docstring 记录了同一个坑：首个
+                    # 沉默之后的数据全部永久丢失）。两者的区别在这里很关键：
+                    # 普通超时路径上我们其实**希望**关闭上游（已经判定它死了），
+                    # 但取消必须由我们主动、在确认超时之后发起；若由 `wait_for`
+                    # 顺手取消，我们就分不清「超时」与「调用方取消」，也没机会先
+                    # 把上游流关干净再报错。
+                    async def _next_with_idle(stream, idle: float):
+                        if idle <= 0:
+                            return await stream.__anext__()
+                        task = asyncio.ensure_future(stream.__anext__())
+                        try:
+                            done, _ = await asyncio.wait({task}, timeout=idle)
+                        except asyncio.CancelledError:
+                            # 调用方取消（客户端断连）：把取消传给上游拉取，
+                            # 否则它会作为一个持有上游流的幽灵任务继续挂着。
+                            task.cancel()
+                            raise
+                        if not done:
+                            task.cancel()
+                            try:
+                                await task
+                            except BaseException:  # noqa: BLE001 - 取消/收尾异常无关紧要
+                                pass
+                            raise ProviderError(
+                                f"节点 [{provider_key}:{wire_model}] 上游已 "
+                                f"{idle:.0f}s 未产出任何数据（流式空闲超时）",
+                                status=504,
+                                err_type="upstream_timeout",
+                            )
+                        return task.result()
+
                     # 构造包装后的安全生成器
                     async def wrapped_stream() -> AsyncIterator[Tuple[str, dict]]:
                         nonlocal first_item, raw_stream
+                        idle_timeout = self._stream_idle_timeout()
                         try:
                             # 输出首包
                             if first_item is not None:
@@ -2493,8 +2614,12 @@ class FailoverRouter:
                                     meta["x-failover-ring"] = failover_event.ring.value
                                 yield delta, meta
 
-                            # 持续迭代剩余数据包
-                            async for item in raw_stream:
+                            # 持续迭代剩余数据包（[M2] 带空闲上限，见上一个函数）
+                            while True:
+                                try:
+                                    item = await _next_with_idle(raw_stream, idle_timeout)
+                                except StopAsyncIteration:
+                                    break
                                 yield item
                         except StopSequenceHit:
                             raise
@@ -2511,10 +2636,19 @@ class FailoverRouter:
                             is_risk, _ = is_risk_interception(stream_err)
                             if not is_risk:
                                 try:
+                                    stream_status = int(getattr(stream_err, "status", 502))
                                     await self.cooldown_tracker.record_failure(
                                         provider_key,
-                                        int(getattr(stream_err, "status", 502)),
+                                        stream_status,
                                         str(getattr(stream_err, "message", stream_err)),
+                                        # [M2] 流式空闲超时按**超时成因**处置，而不是
+                                        # 通用 5xx 的 15s×n（见 `_timeout_cooldown`）。
+                                        custom_cooldown=(
+                                            self._timeout_cooldown()
+                                            if stream_status == 504
+                                            else None
+                                        ),
+                                        is_timeout=(stream_status == 504),
                                     )
                                 except Exception:  # noqa: BLE001 - 记账失败不得掩盖原始错误
                                     pass
@@ -2553,7 +2687,15 @@ class FailoverRouter:
                 logger.warning(f"[对等互备网格] 尝试失败: {err_summary}")
 
                 # 记录失败并进入动态冷却
-                await self.cooldown_tracker.record_failure(curr_provider_key, status_code, err_msg)
+                # [M2] 超时（握手 / 空闲）用专门的冷却时长，其余维持原判据。
+                is_timeout = status_code == 504
+                await self.cooldown_tracker.record_failure(
+                    curr_provider_key,
+                    status_code,
+                    err_msg,
+                    custom_cooldown=self._timeout_cooldown() if is_timeout else None,
+                    is_timeout=is_timeout,
+                )
 
                 # 寻找同能力环内的下一个健康备用节点
                 candidates = self.get_fallback_candidates(

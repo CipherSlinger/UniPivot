@@ -143,6 +143,21 @@ AVOIDANCE_MATRIX: Dict[str, Dict[str, Any]] = {
                     "并在租约解除后以恢复观察期 (OPT-022) 渐进试探，避免解封瞬间的并发"
                     "洪峰把账号二次打进封禁。",
     },
+    # [M2] 上游超时：不是风控拦截，aggregate 严重度分类器对它的缺省回答是 waf，
+    # 会把一次「上游挂了」误报成「需要人工完成滑块验证」。处置建议必须指向网络与
+    # 上游可用性，而不是让运维去登录一个根本没有拦截他的平台。
+    "timeout": {
+        "label": "上游超时 (握手或流式空闲超时)",
+        "technically_bypassable": False,
+        "recoverable_by_relogin": False,
+        "auto_recovers": True,
+        "typical_span": "分钟级",
+        "strategy": "这不是风控拦截，而是上游迟迟不产出数据（握手超过 "
+                    "`GATEWAY_FIRST_CHUNK_TIMEOUT`，或两条数据帧间隔超过 "
+                    "`GATEWAY_STREAM_IDLE_TIMEOUT`）。网关已按上游故障处置并故障转移。"
+                    "**重新登录无效**，也不应破解任何验证码；若频繁出现，应检查上游"
+                    "服务状态与本地出网质量，而非调整风控参数。",
+    },
     # [OPT-035] 运维声明出局：不是平台的风控，而是运维把节点排除出本次部署。
     # 措辞刻意与「封禁」和「认证失效」都不同，因为它们**都**建议重登，而这里重登
     # 完全无效——这正是本项目反复修复的「误导运维」缺陷类型（OPT-026/027/029/031）。
@@ -166,7 +181,14 @@ _SEVERITY_TO_VERDICT = {
     "ratelimit": "ratelimit",
     "waf": "waf",
     "auth": "auth",
+    # [M2] 超时是上游故障，不是风控；映射到独立的处置建议。
+    "timeout": "timeout",
 }
+
+# [M2] 台账**无法表达**的成因：超时从不入账（它不是风控拦截），因此研判不能
+# 只在台账里找它，否则「此刻正因超时避让」会被报成台账里的旧成因（通常是 waf），
+# 把运维引去登录一个从未拦截过他的平台。只有这类成因才允许覆盖台账多数成因。
+_LIVE_ONLY_CAUSES = ("timeout",)
 
 
 class RiskDossier:
@@ -277,14 +299,41 @@ class RiskDossier:
             # 取出现次数最多的严重度作为主要症结；无记录则按最轻的 ratelimit。
             by_sev = stats.get("by_severity") or {}
             dominant = max(by_sev.items(), key=lambda kv: kv[1])[0] if by_sev else ""
-            verdict_key = _SEVERITY_TO_VERDICT.get(dominant) or "ratelimit"
-            reason = f"主要症结：{dominant or '无拦截记录'}"
+            # [M2] 超时**不入台账**（它不是风控拦截，见 `record_failure` 的 M2 注释），
+            # 因此台账永远无法给出这个成因。一个**此刻**正因为超时避让的节点，若档案
+            # 照旧报「主要症结 waf」，运维会照着去登录一个从未拦截过他的平台、甚至去找
+            # 验证码——处置方向完全相反。这里只让**台账无法表达**的成因覆盖台账多数成因；
+            # 其余情况仍以全量台账研判，避免一次 15 秒的频控退避抹掉整段风控历史。
+            live_cause = self._live_cooldown_cause(provider_key)
+            source = live_cause if live_cause in _LIVE_ONLY_CAUSES else dominant
+            verdict_key = _SEVERITY_TO_VERDICT.get(source) or "ratelimit"
+            if source and source != dominant:
+                reason = (
+                    f"当前冷却成因：{source}"
+                    f"（全量台账主要症结：{dominant or '无'}）"
+                )
+            else:
+                reason = f"主要症结：{dominant or '无拦截记录'}"
         matrix = AVOIDANCE_MATRIX[verdict_key]
         return {
             "verdict": verdict_key,
             "reason": reason,
             **matrix,
         }
+
+    def _live_cooldown_cause(self, provider_key: str) -> str:
+        """[M2] 该节点**此刻**的冷却成因（无冷却/不可读时返回空串）。
+
+        判读委托给 `CooldownTracker.cooldown_cause()`，即全项目唯一的冷却成因判读者，
+        不在档案里另写一份——两处各写一遍必然漂移（本项目的既有缺陷类型）。
+        """
+        tracker = self.cooldown_tracker
+        if tracker is None:
+            return ""
+        try:
+            return str(tracker.cooldown_cause(provider_key) or "")
+        except Exception:  # noqa: BLE001 - 判读失败不改变台账研判
+            return ""
 
     def _is_disabled(self, provider_key: str) -> bool:
         """[OPT-035] 该节点是否被运维声明出局（判读委托给唯一判读者，查询失败按未禁用）。"""
@@ -479,6 +528,13 @@ class RiskDossier:
                     f"凭证更新后网关会自动解除该避让并转入串行探路重新验证",
                     "若重登后仍被拒绝，说明是账号级问题而非凭证问题，网关会据此自动施加租约停止触碰",
                 ]
+            if cause == "timeout":
+                return [
+                    f"该节点处于长效避让（剩余约 {rem / 3600.0:.1f} 小时），成因是**上游超时**"
+                    f"而非风控拦截，已被派发边界硬阻断（零上游调用）",
+                    "**无需重新登录**；请检查上游服务状态与本地出网质量。"
+                    "这是软冷却，没有人工解除入口，到期后由网关自行放行",
+                ]
             return [
                 f"该节点处于长效避让（剩余约 {rem / 3600.0:.1f} 小时，成因：{cause or '未知'}），"
                 f"已被派发边界硬阻断（零上游调用）",
@@ -505,6 +561,13 @@ class RiskDossier:
                     f"执行 `.venv/bin/python login.py {provider_key}` 重新登录取令牌；"
                     f"凭证更新后网关会自动解除避让并转入串行探路重新验证",
                 ]
+            if cause == "timeout":
+                return [
+                    f"该节点因**上游超时**进入避让，剩余约 {rem:.0f} 秒；网关已按上游故障"
+                    f"处置并故障转移",
+                    "**无需重新登录**：超时不是风控拦截，重登不会改善上游不吐字的问题；"
+                    "若频繁出现请检查上游服务状态与本地出网质量",
+                ]
             return [
                 f"保持避让：冷却剩余约 {rem:.0f} 秒（成因：{cause or '未知'}），由自动门控管理，无需人工介入",
                 "流量已自动分流至同能力环的其他健康节点",
@@ -526,6 +589,11 @@ class RiskDossier:
             return [
                 f"执行 `.venv/bin/python login.py {provider_key}` 由人工完成人机滑块验证",
                 "严禁以脚本方式自动破解验证码：属对抗行为且会显著加重账号风控评分",
+            ]
+        if verdict["verdict"] == "timeout":
+            return [
+                "上游超时：检查上游服务状态与本地出网质量；**重新登录无效**",
+                "网关已按上游故障处置并故障转移，无需人工改配置",
             ]
         if verdict["verdict"] == "ratelimit":
             return [
