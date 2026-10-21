@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import threading
 import time
@@ -29,7 +30,7 @@ import urllib.parse
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import List, Optional, Union
+from typing import Awaitable, Callable, List, Optional, Union
 
 import dotenv
 import httpx
@@ -108,6 +109,8 @@ from providers import (
 from providers.base import _est_tokens, _id, text_of
 from providers import http_client
 from providers.disconnect_guard import disconnect_guard, guard_stream
+
+logger = logging.getLogger("gateway.server")
 from providers.stream_keepalive import sse_keepalive
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
@@ -869,6 +872,126 @@ def _make_disconnect_headers() -> dict[str, str]:
     return {
         "x-disconnect-guard": "disabled" if disconnect_guard.is_disabled() else "enabled",
     }
+
+
+def _stream_reclaimer(stream) -> Optional[Callable[[], None]]:
+    """[C2] 为一条已打开的上游流构造同步回收钩子。
+
+    `ManagedStream.close()` 是异步的，但响应收尾往往发生在**任务已被取消**的时刻，
+    那里不允许 await。这里只取它的同步槽位回收动作（幂等），作为「响应体从未启动」
+    路径上的兜底；上游生成器本身仍由框架侧的 `aclose` 负责关闭。
+    """
+    hook = getattr(stream, "release_sync", None)
+    return hook if callable(hook) else None
+
+
+def _stream_closer(stream) -> Optional[Callable[[], Awaitable[None]]]:
+    """[C2] 为上游流构造异步关闭动作（响应体从未启动时的兜底）。"""
+    close = getattr(stream, "close", None)
+    return close if callable(close) else None
+
+
+async def _close_upstream_stream(stream) -> None:
+    """[C2] 关闭 `execute_chat` 交出的上游流。
+
+    这条关闭动作有两条到达路径，缺一不可：
+
+      * 响应体正常跑完 / 中途异常 —— 协议层生成器的 `finally` 走到这里；
+      * 响应体从未被拉取 —— 生成器的 `finally` 根本不会执行，此时由
+        `ReclaimingStreamingResponse` 的 `on_close`（同步槽位回收）兜底，上游
+        连接则在独立的关闭任务里释放。
+
+    对已关闭或未实现的流是空操作。
+    """
+    close = getattr(stream, "close", None)
+    if close is None:
+        return
+    await _close_stream_safely(close)
+
+
+async def _close_stream_safely(aclose: Callable[[], Awaitable[None]]) -> None:
+    """在**当前任务可能已被取消**的情况下可靠地关闭一条响应体流。
+
+    客户端断连时，收尾代码通常正运行于被取消的任务中，就地 `await aclose()` 会被
+    立即二次取消，收尾一行都执行不到（实测断连路径上上游流既不关闭、槽位也不归还，
+    且因为从未启动而不会被任何生成器 `finally` 兜住）。改为调度独立任务，并
+    `shield` 当前协程等待其完成——取消只会打断等待，收尾任务仍会跑完。
+    """
+    try:
+        task = asyncio.ensure_future(aclose())
+    except Exception:  # noqa: BLE001
+        return
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        pass
+    except BaseException as exc:  # noqa: BLE001 - 回收绝不得掩盖原始异常
+        logger.warning("流式响应体收尾失败 (已忽略): %s: %s", type(exc).__name__, exc)
+
+
+class ReclaimingStreamingResponse(StreamingResponse):
+    """[C2] 保证响应体收尾的流式响应。
+
+    问题不在「断连传播」而在「**从未开始**」：三条流式路径都在返回响应之前就已经
+    占用了上游资源（`execute_chat` 已握有首包与节点信号量，`/v1/responses` 还额外
+    先 `load_balancer.acquire()`），而归还动作写在生成器的 `finally` 里。生成器如果
+    从未被 `__anext__()` 过，Python 不会为它运行收尾代码——`guard_stream` 也看不到
+    任何中断，因为它同样从未启动。
+
+    实测（ASGI 层，客户端在响应头到达前断开）：三条路径的负载均衡配额、节点并发
+    信号量与上游流**全部**泄漏；`/v1/responses` 的配额是在构造阶段就占用的，泄漏后
+    负载均衡会逐步把该节点判为高负载并持续把流量分流走，直到进程重启。
+
+    这里把「响应体走到哪里都不能不关」变成结构性质：`__call__` 的 `finally` 无条件
+    `aclose()` 响应体，并在其后再调用一次显式的 `on_close` 钩子。
+
+    两点必须同时存在，缺一不可：
+
+      1. `aclose()` 只对**已经启动**的生成器有效。若响应体一帧都没被拉取，它不会
+         执行任何用户代码——而那恰恰是「资源已占用、收尾代码在 finally 里」的失效
+         场景本身。所以真正兜底的是 `on_close`。
+      2. `on_close` 必须接收响应体**自身**的关闭信号（本类的 `_on_close`），而不是
+         让各条协议路径自己再记一份上游流的引用：`BaseHTTPMiddleware` 会在响应体
+         之外再包一层流，任何由协议层记账的引用都会与真实生命周期脱节。
+
+    正常路径逐字节不变：`aclose()` 与 `on_close` 都是幂等空操作。
+    """
+
+    def __init__(self, content, *args, on_close=None, on_close_async=None, on_exit=None, **kwargs) -> None:
+        super().__init__(content, *args, **kwargs)
+        self._on_close = on_close
+        self._on_close_async = on_close_async
+        self._on_exit = on_exit
+
+    async def __call__(self, scope, receive, send) -> None:
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            # 1. 同步资源回收最先执行，且**不受当前任务取消状态影响**：
+            #    客户端断连时本任务通常已在取消中，任何 await 都会被二次取消。
+            if self._on_close is not None:
+                try:
+                    self._on_close()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("流式响应资源回收失败 (已忽略): %s", exc)
+            # 2. 关闭响应体。独立任务 + shield：正常路径上是空操作，断连路径上
+            #    也不会因二次取消而跳过。
+            body = getattr(self, "body_iterator", None)
+            aclose = getattr(body, "aclose", None)
+            if aclose is not None:
+                await _close_stream_safely(aclose)
+            # 3. 异步兜底：响应体生成器可能**从未启动**，此时它内部的 finally
+            #    （关闭上游流）永远不执行。这条钩子直接关闭 `execute_chat` 交出的
+            #    上游流，与响应体是否被拉取无关。
+            if self._on_close_async is not None:
+                await _close_stream_safely(self._on_close_async)
+            # 4. 协议层在构造响应之前占用的配额（`/v1/responses` 的负载均衡槽位）
+            #    也必须在这条路径上归还：它的 finally 同样位于响应体生成器内部。
+            if self._on_exit is not None:
+                try:
+                    self._on_exit()
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning("流式响应退出回收失败 (已忽略): %s", exc)
 
 
 def _is_provider_healthy(pkey: str) -> bool:
@@ -2388,6 +2511,10 @@ async def chat_completions(req: ChatCompletionRequest):
                 error_msg = str(e)
                 yield sse_frame(error_response(f"上游服务异常: {e}", 502, "upstream_error"))
             finally:
+                # [C2] 上游流必须显式关闭：`ManagedStream.close()` 归还节点信号量，
+                # 并关闭 provider 侧的 HTTP 流。正常结束/中途异常/断连都走这里；
+                # 响应体从未启动的路径由响应类的 `on_close` 同步兜底。
+                await _close_upstream_stream(stream)
                 load_balancer.release(
                     dispatched_provider,
                     success=success,
@@ -2402,10 +2529,15 @@ async def chat_completions(req: ChatCompletionRequest):
         if not disconnect_guard.is_disabled():
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
-        return StreamingResponse(
+        # [C2] 上游流与节点信号量在返回响应之前就已持有；响应体若从未被拉取，
+        # 生成器的 finally 不会执行（guard_stream 同样从未启动，看不到中断）。
+        # `on_close` 是这条路径上唯一能归还已有资源的钩子。
+        return ReclaimingStreamingResponse(
             sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
+            on_close=_stream_reclaimer(preopened_stream),
+            on_close_async=_stream_closer(preopened_stream),
         )
 
     # 非流式：若当前请求为 Follower，挂载等待 Leader 完成
@@ -3040,6 +3172,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     "error", anthropic_error_response(f"上游服务异常: {e}", 502, "upstream_error")
                 )
             finally:
+                # [C2] 上游流必须显式关闭：`ManagedStream.close()` 归还节点信号量，
+                # 并关闭 provider 侧的 HTTP 流。正常结束/中途异常/断连都走这里；
+                # 响应体从未启动的路径由响应类的 `on_close` 同步兜底。
+                await _close_upstream_stream(stream)
                 load_balancer.release(
                     dispatched_provider,
                     success=success,
@@ -3054,10 +3190,15 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         if not disconnect_guard.is_disabled():
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
-        return StreamingResponse(
+        # [C2] 上游流与节点信号量在返回响应之前就已持有；响应体若从未被拉取，
+        # 生成器的 finally 不会执行（guard_stream 同样从未启动，看不到中断）。
+        # `on_close` 是这条路径上唯一能归还已有资源的钩子。
+        return ReclaimingStreamingResponse(
             sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
+            on_close=_stream_reclaimer(preopened_stream),
+            on_close_async=_stream_closer(preopened_stream),
         )
 
     # 非流式：若当前请求为 Follower，挂载等待 Leader 完成
@@ -3743,6 +3884,9 @@ async def responses_endpoint(req: ResponsesRequest):
                 error_msg = str(e)
                 yield ev.error(f"上游服务异常: {e}", 502, "upstream_error")
             finally:
+                # [C2] 先关闭上游流（`ManagedStream.close` 归还节点信号量并关闭
+                # provider 侧连接），再释放负载均衡配额。
+                await _close_upstream_stream(stream)
                 _release_lb()
 
         stream_body = gen()
@@ -3752,10 +3896,20 @@ async def responses_endpoint(req: ResponsesRequest):
         if not disconnect_guard.is_disabled():
             stream_body = guard_stream(stream_body, provider_key=dispatched_provider)
 
-        return StreamingResponse(
+        # [C2] 上游流与节点信号量在返回响应之前就已持有；响应体若从未被拉取，
+        # 生成器的 finally 不会执行（guard_stream 同样从未启动，看不到中断）。
+        # `on_close` 是这条路径上唯一能归还已有资源的钩子。
+        return ReclaimingStreamingResponse(
             sse_keepalive(stream_body),
             media_type="text/event-stream",
             headers=stream_headers,
+            on_close=_stream_reclaimer(stream),
+            on_close_async=_stream_closer(stream),
+            # [C2] 本路径的负载均衡配额在构造响应之前就已 acquire（见上方
+            # `load_balancer.acquire`），而归还写在 `gen()` 的 finally 里。响应体
+            # 从未启动时该 finally 不会执行，配额永久泄漏——负载均衡随后会逐步把
+            # 这个节点判为高负载并持续分流走，直到进程重启。这里补一个幂等同步回收。
+            on_exit=_release_lb,
         )
 
     # 非流式处理

@@ -1728,6 +1728,80 @@ def get_traffic_pacer() -> TrafficPacer:
     return _traffic_pacer_instance
 
 
+class ManagedStream:
+    """[C2] 带显式回收钩子的上游流。
+
+    `execute_chat` 在**返回之前**就已持有节点并发信号量并打开了上游流，而归还动作
+    原本只写在包装生成器的 `finally` 里。异步生成器的收尾代码有一个容易被忽略的
+    前提：**它必须先被启动过**。`aclose()` 对一个从未 `__anext__()` 的生成器是
+    空操作，不会执行 `finally`——于是「拿到了流、却一帧都没拉就开始关闭」这条路径
+    上，信号量与上游连接永久泄漏，节点并发上限被幽灵流占满。
+
+    本类型把回收变成一个可以单独调用的动作，并且**幂等**：无论是流正常走完、
+    中途异常、被 `aclose()`，还是调用方从未开始迭代就直接 `close()`，槽位都只
+    归还一次。它实现完整的异步迭代协议，对既有消费方完全透明。
+    """
+
+    def __init__(self, agen: AsyncIterator[Tuple[str, dict]], close: Optional[Callable[[], None]] = None):
+        self._agen = agen
+        self._close_hook = close
+        self._closed = False
+        self._started = False
+
+    def release_sync(self) -> None:
+        """只执行同步槽位回收，不关闭上游生成器。
+
+        供**任务已被取消**的收尾路径使用（那里不允许 await）：槽位必须立即归还，
+        否则并发上限被幽灵流占满；上游连接由框架侧的 `aclose` 负责关闭。
+        """
+        if self._close_hook is not None:
+            try:
+                self._close_hook()
+            except Exception:  # noqa: BLE001 - 回收失败不得掩盖原始错误
+                logger.warning("[对流回收] 回收节点槽位失败 (已忽略)")
+
+    async def close(self) -> None:
+        """幂等收尾：先关闭生成器，再执行回收钩子。
+
+        [C2] 关键细节：若流**从未被启动**，`aclose()` 不会执行生成器内部的任何
+        收尾代码（Python 对未启动的异步生成器直接返回）。而「拿到流却一帧没拉就
+        放弃」正是要回收的那条路径——于是这里先推进一帧使生成器进入运行态，再
+        `aclose()`，其 `finally`（关闭上游 `raw_stream`）才会真正执行。对已经
+        启动过的流，这一步会被 `_started` 跳过，行为逐字节不变。
+        """
+        if self._closed:
+            return
+        self._closed = True
+        try:
+            if not self._started:
+                try:
+                    await self._agen.__anext__()
+                except (StopAsyncIteration, Exception):  # noqa: BLE001
+                    # 启动即失败/即结束：生成器已自行收尾，继续走关闭流程
+                    pass
+            aclose = getattr(self._agen, "aclose", None)
+            if aclose is not None:
+                await aclose()
+        finally:
+            self.release_sync()
+
+    def __aiter__(self) -> "ManagedStream":
+        return self
+
+    async def __anext__(self) -> Tuple[str, dict]:
+        if self._closed:
+            raise StopAsyncIteration
+        self._started = True
+        try:
+            return await self._agen.__anext__()
+        except StopAsyncIteration:
+            await self.close()
+            raise
+
+    async def aclose(self) -> None:
+        await self.close()
+
+
 @dataclass
 class FailoverCandidate:
     """后备候选节点"""
@@ -2355,9 +2429,21 @@ class FailoverRouter:
                     # 首包读取成功，说明此 Provider 健康可用
                     await self.cooldown_tracker.record_success(provider_key)
 
+                    # [C2] 槽位回收必须是**可显式调用**的，不能只依赖生成器的
+                    # finally：`aclose()` 对一个从未 `__anext__` 过的异步生成器是
+                    # 空操作（Python 不会为未启动的生成器运行收尾代码）。而本函数
+                    # 在返回之前就已 acquire 了信号量并打开了上游流——调用方若在拉取
+                    # 第一帧之前放弃（客户端在响应头到达前断连），槽位会永久泄漏，
+                    # 节点并发上限被幽灵流占满，负载均衡随后持续把流量分流走。
+                    def _release_sem() -> None:
+                        nonlocal sem_held
+                        if sem_held:
+                            sem_held = False
+                            sem.release()
+
                     # 构造包装后的安全生成器
                     async def wrapped_stream() -> AsyncIterator[Tuple[str, dict]]:
-                        nonlocal first_item, raw_stream, sem_held
+                        nonlocal first_item, raw_stream
                         try:
                             # 输出首包
                             if first_item is not None:
@@ -2401,12 +2487,14 @@ class FailoverRouter:
                         finally:
                             # 整段流结束（正常、异常、或被 aclose）→ 归还并发槽位。
                             # 必须同步释放：GeneratorExit 路径上不允许 await。
-                            if sem_held:
-                                sem_held = False
-                                sem.release()
+                            _release_sem()
 
                     sem_handed_off = True
-                    return wrapped_stream(), failover_event, provider
+                    return (
+                        ManagedStream(wrapped_stream(), close=_release_sem),
+                        failover_event,
+                        provider,
+                    )
                 finally:
                     # 观察期闸门只到首包为止：无论成功交接与否，走出握手区就释放。
                     if probation_held:

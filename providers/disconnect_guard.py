@@ -78,6 +78,37 @@ class DisconnectGuard:
             self._stats["reclaimed_streams"] += 1
         return True
 
+    async def safe_aclose_detached(self, agen: Any) -> bool:
+        """[C2] 在**当前任务可能已被取消**的情况下可靠地关闭上游流。
+
+        断连时的收尾代码正运行于被取消的任务中，就地 `await agen.aclose()` 会被
+        立即二次取消：实测 provider 生成器的 `finally` 一次都没有执行，上游 HTTP
+        连接与配额随之泄漏。这里把关闭动作调度成独立任务再 shield 等待——取消只会
+        打断等待，关闭任务本身仍会跑完。
+
+        对**从未启动**的生成器，`aclose()` 是空操作；调用方（`guard_stream`）在
+        关闭前已由 `ManagedStream.close()` 推进一帧使其进入运行态，因此内部
+        `finally` 能真正执行。
+        """
+        if agen is None or not hasattr(agen, "aclose"):
+            return False
+        try:
+            task = asyncio.ensure_future(agen.aclose())
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("上游流安全关闭失败 (已忽略): %s: %s", type(exc).__name__, exc)
+            return False
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            # 当前任务被取消：关闭任务继续在后台完成
+            pass
+        except BaseException as exc:  # noqa: BLE001 - 回收路径必须绝对安全
+            logger.warning("上游流安全关闭失败 (已忽略): %s: %s", type(exc).__name__, exc)
+            return False
+        with self._lock:
+            self._stats["reclaimed_streams"] += 1
+        return True
+
     def record_client_disconnect(self, provider_key: str, estimated_tokens: int = 0) -> None:
         """记录一次客户端断连事件。"""
         with self._lock:
@@ -153,17 +184,28 @@ async def guard_stream(
             yield item
         completed = True
     finally:
-        # 1. 显式关闭上游流，令 provider 侧 httpx 连接立即释放
-        await disconnect_guard.safe_aclose(gen)
+        # 1. 先做**同步**回收（槽位/租约），它不受当前任务取消状态影响
+        release_sync = getattr(gen, "release_sync", None)
+        if callable(release_sync):
+            try:
+                release_sync()
+            except Exception as exc:  # noqa: BLE001
+                logger.warning("同步资源回收失败 (已忽略): %s", exc)
 
-        # 2. 提前中止时记录断连遥测并触发回调
+        # 2. 显式关闭上游流，令 provider 侧 httpx 连接立即释放。
+        #    [C2] 客户端断连时本生成器正运行在被取消的任务里：就地 await 会被
+        #    立即二次取消，上游流根本关不掉（实测断连路径上 provider 的 finally
+        #    从未执行，连接与上游配额随之泄漏）。调度独立任务并 shield 等待。
+        await disconnect_guard.safe_aclose_detached(gen)
+
+        # 3. 提前中止时记录断连遥测并触发回调
         if not completed:
             disconnect_guard.record_client_disconnect(provider_key)
             logger.info("客户端断连，已回收上游流 [%s]", provider_key or "unknown")
             if on_close is not None:
                 try:
-                    await on_close()
-                except Exception as cb_exc:  # noqa: BLE001 - 回调异常不得掩盖原始异常
+                    await asyncio.shield(asyncio.ensure_future(on_close()))
+                except BaseException as cb_exc:  # noqa: BLE001 - 回调异常不得掩盖原始异常
                     logger.warning("断连回调执行失败 (已忽略): %s", cb_exc)
 
 

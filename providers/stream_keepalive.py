@@ -89,3 +89,21 @@ async def sse_keepalive(
                 await pending
             except (asyncio.CancelledError, StopAsyncIteration):
                 pass
+        # [C2] 取消拉取并不等于关闭源：若拉取任务在取消前刚好完成，或源本身
+        # 从未被启动，取消是空操作，源生成器的 finally（上游连接、并发槽位）
+        # 永远不会执行。这里显式关闭——对已结束的生成器是空操作，绝不多做。
+        #
+        # 用**独立任务**而不是就地 await：客户端断连时调用方通常已处于取消状态，
+        # 任何 await 都会立即被二次取消，收尾逻辑一行都跑不到（实测断连路径上
+        # 通道既不关闭也被计为「从未启动」，静默泄漏）。调度一个任务则不受当前
+        # 任务取消状态影响。
+        aclose = getattr(iterator, "aclose", None)
+        if aclose is not None:
+            task = asyncio.ensure_future(aclose())
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                # 当前任务被取消：收尾任务继续在后台完成，不阻塞关闭流程。
+                pass
+            except (StopAsyncIteration, Exception):  # noqa: BLE001
+                pass

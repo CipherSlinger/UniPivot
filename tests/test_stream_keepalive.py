@@ -128,7 +128,11 @@ def test_all_streaming_responses_are_wrapped():
     因此直接把「每个 StreamingResponse 的第一个参数都包着 sse_keepalive」钉成断言。
     """
     src = Path(srv.__file__).read_text(encoding="utf-8")
-    total = src.count("StreamingResponse(")
+    # 只数**返回出口**，不数类定义行（`class ReclaimingStreamingResponse(...)`）:
+    # 类名本身含 "StreamingResponse(" 子串，直接数会把定义当成第八个出口。
+    total = src.count("return StreamingResponse(") + src.count(
+        "return ReclaimingStreamingResponse("
+    )
     wrapped = src.count("sse_keepalive(stream_body)") + src.count(
         "sse_keepalive(stream_follower_gen("
     )
