@@ -31,6 +31,7 @@ from ..base import (
     read_error_body,
 )
 from ..device_identity import stable_device_id
+from ..stream_completion import COMPLETION_KEY
 from ..http_client import get_http_client
 
 
@@ -268,6 +269,10 @@ class KimiProvider:
 
             full_content = ""
             in_thinking = False
+            # [S2] 是否看到了协议的完成标记（`event == "all_done"`）。原先这个
+            # 标记只被用来 break，证据在函数边界上消失，于是「被截断」与
+            # 「说完了」在上层完全无法区分。
+            saw_complete = False
 
             try:
                 req = client.build_request("POST", stream_url, headers=headers, json=payload)
@@ -339,6 +344,7 @@ class KimiProvider:
                             continue
 
                         if event == "all_done":
+                            saw_complete = True
                             break
                 finally:
                     await resp.aclose()
@@ -354,7 +360,9 @@ class KimiProvider:
                     status=502,
                 )
 
-            yield "", {"conversation_id": conv_id}
+            # [S2] Kimi 协议**有**完成标记，所以能给出确定的完整性判据
+            # （deepseek/doubao/glm 协议里没有标记，必须省略此键 = 未知）。
+            yield "", {"conversation_id": conv_id, COMPLETION_KEY: saw_complete}
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         if not conversation_id:

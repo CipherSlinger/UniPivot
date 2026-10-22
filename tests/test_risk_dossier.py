@@ -373,8 +373,19 @@ def test_diagnostics_and_admin_endpoint_exposure():
         body = r.json()
         for key in ("summary", "providers", "avoidance_matrix"):
             assert key in body
-        assert set(body["avoidance_matrix"]) == {"ratelimit", "waf", "auth", "ban", "disabled"}, (
-            "研判矩阵新增成因时必须同步更新此断言（OPT-035 新增 disabled）"
+        assert set(body["avoidance_matrix"]) == {
+            "ratelimit",
+            "waf",
+            "auth",
+            "ban",
+            "disabled",
+            "timeout",
+            "truncated",
+        }, (
+            "研判矩阵新增成因时必须同步更新此断言"
+            "（OPT-035 新增 disabled；[M2] 新增 timeout、[S2] 新增 truncated —— "
+            "这两类都是**上游故障**而不是风控拦截，建议必须指向上游健康/本地出口"
+            "质量，而不是「去重新登陆」或「去完成人机验证」）"
         )
 
         # 单节点视图

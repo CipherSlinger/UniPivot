@@ -53,6 +53,11 @@ from .base import ProviderError, StopSequenceHit
 from .credential_renewal import get_credential_renewal
 from .credential_watch import get_credential_watch
 from .quarantine import get_quarantine_store
+from .stream_completion import (
+    completion_check_enabled,
+    is_incomplete,
+    observe as observe_completion,
+)
 from .risk_correlation import get_risk_correlation
 from .risk_ledger import (
     SEVERITY_AUTH,
@@ -1073,6 +1078,7 @@ class CooldownTracker:
         error_msg: str = "",
         custom_cooldown: Optional[float] = None,
         is_timeout: bool = False,
+        is_truncation: bool = False,
     ) -> float:
         """记录失败并触发动态冷却避让。
         返回该节点进入的冷却时长。
@@ -1099,6 +1105,17 @@ class CooldownTracker:
             # ——既起不到避让作用，又给节点记下一段它从未有过的风控画像。
             is_timeout = bool(is_timeout) or status == 504
 
+            # [S2] 截断与超时同属**上游故障**而非风控拦截，判定同样必须发生在
+            # 分支选择之前：截断走的是 502，而分类器对任何非 401/429 的输入都
+            # 缺省回 waf —— 实测一次截断被归因为 `waf`，于是档案会建议运维去
+            # 完成一个平台从未出现过的人机验证（与 [M2] 对超时的误判同形）。
+            is_truncation = bool(is_truncation)
+
+            # 「是上游故障，不是账号被标记」只定义一次：风控台账、全环凭证检测、
+            # 恢复观察期三处都用它。否则每新增一种上游故障都要在四处各加一个
+            # `and not ...`，正是本仓库反复在修的「同一事实散落多处」。
+            is_upstream_fault = is_timeout or is_truncation
+
             # 严重度分级：auth（令牌/账号级）> ratelimit（频控）> waf（人机验证）
             severity = classify_interception_severity(
                 is_risk=is_risk, risk_reason=risk_reason, status=status, error_msg=error_msg
@@ -1114,6 +1131,19 @@ class CooldownTracker:
                     f"[超时避让] 节点 [{provider_key}] 上游超时 (HTTP {status})："
                     f"冷却 {cooldown_duration:.1f}s (第 {cur_fails} 次连续失败)。"
                     f"这是上游故障而非风控拦截，不会写入风控台账"
+                )
+            elif is_truncation:
+                # [S2] 回答被截断：上游连上了、说了一半就停了。这是上游故障，
+                # 和超时同类处置——记冷却让它不再当主选（否则失败计数永远是 0，
+                # 客户端反复看到「回复说到一半停住」），但不进风控台账、不进
+                # 恢复观察期（没有封禁解除的惊群可言）。
+                cooldown_duration = max(30.0, base_cd)
+                severity = "truncated"
+                logger.warning(
+                    f"[截断避让] 节点 [{provider_key}] 的回答被截断（上游流结束但"
+                    f"未出现协议完成标记）：冷却 {cooldown_duration:.1f}s "
+                    f"(第 {cur_fails} 次连续失败)。这是上游故障而非风控拦截，"
+                    f"不会写入风控台账"
                 )
             elif severity == SEVERITY_AUTH or is_auth_error:
                 # 认证失效通常需重新登录，且高频重试会加剧上游封禁：
@@ -1179,7 +1209,7 @@ class CooldownTracker:
             # [OPT-025] 认证失效还需上报全环检测器：若多个**不同**节点在同一窗口内
             # 相继 401，说明整环凭证已失效，故障转移不可能成功——必须快速失败而非
             # 逐个打满五个节点（那正是上游眼中的「自动化凭证尝试」流量特征本身）。
-            if not is_timeout and (severity == SEVERITY_AUTH or is_auth_error):
+            if not is_upstream_fault and (severity == SEVERITY_AUTH or is_auth_error):
                 try:
                     self.credential_watch.note_auth_failure(provider_key)
                 except Exception:  # noqa: BLE001 - 检测器异常绝不影响冷却主流程
@@ -1206,12 +1236,12 @@ class CooldownTracker:
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
-            if not is_timeout and (is_risk or is_waf_or_rate or is_auth_error):
+            if not is_upstream_fault and (is_risk or is_waf_or_rate or is_auth_error):
                 self._enter_probation(provider_key, self._cooldowns[provider_key])
 
             # 台账记录：仅记录真正的拦截事件（风控 / 频控 / 认证失效），
             # 普通 5xx 与超时不入账，避免污染风控画像。
-            if not is_timeout and (is_risk or is_waf_or_rate or is_auth_error):
+            if not is_upstream_fault and (is_risk or is_waf_or_rate or is_auth_error):
                 try:
                     self.risk_ledger.record_interception(
                         provider=provider_key,
@@ -2653,10 +2683,15 @@ class FailoverRouter:
                     async def wrapped_stream() -> AsyncIterator[Tuple[str, dict]]:
                         nonlocal first_item, raw_stream
                         idle_timeout = self._stream_idle_timeout()
+                        # [S2] 上游完整性三态：True 看到完成标记 / False 协议有标记
+                        # 但没看到（截断）/ None 协议没有标记（未知，行为零变化）。
+                        completeness: Optional[bool] = None
+                        check_completion = completion_check_enabled()
                         try:
                             # 输出首包
                             if first_item is not None:
                                 delta, meta = first_item
+                                completeness = observe_completion(meta, completeness)
                                 # 如果发生了故障转移，在首包元数据注入标记
                                 if failover_event:
                                     meta = dict(meta or {})
@@ -2671,7 +2706,27 @@ class FailoverRouter:
                                 try:
                                     item = await _next_with_idle(raw_stream, idle_timeout)
                                 except StopAsyncIteration:
+                                    # [S2] 「干净耗尽」是唯一**不抛异常**的失败通道。
+                                    # 协议有完成标记而我们始终没看到它 → 这段回答
+                                    # 是被截断的。原实现在这里直接 break，于是截断
+                                    # 与说完走同一条出口：协议处理器补上
+                                    # `finish_reason: "stop"` 与 `[DONE]`，客户端
+                                    # 收到一个**自称完整**的半截回答，而节点的失败
+                                    # 计数保持 0（record_success 记在首包），下一轮
+                                    # 它仍是主选 —— 这正是 C3「中途断流」的症状，
+                                    # 从不抛异常的那道门进来。
+                                    #
+                                    # 未知（协议无标记，三家如此）必须照常 break：
+                                    # 把未知当截断会让这三家每条正常回答都被误判。
+                                    if check_completion and is_incomplete(completeness):
+                                        raise ProviderError(
+                                            f"节点 [{provider_key}:{wire_model}] 的回答被截断"
+                                            f"（上游流结束但未出现协议完成标记）",
+                                            status=502,
+                                            err_type="upstream_incomplete",
+                                        )
                                     break
+                                completeness = observe_completion(item[1], completeness)
                                 yield item
                         except StopSequenceHit:
                             raise
@@ -2689,6 +2744,12 @@ class FailoverRouter:
                             if not is_risk:
                                 try:
                                     stream_status = int(getattr(stream_err, "status", 502))
+                                    # [S2] 截断必须带着自己的成因进入记账：它走 502，
+                                    # 而严重度分类器对非 401/429 缺省回 waf。
+                                    is_trunc = (
+                                        getattr(stream_err, "err_type", "")
+                                        == "upstream_incomplete"
+                                    )
                                     await self.cooldown_tracker.record_failure(
                                         provider_key,
                                         stream_status,
@@ -2701,6 +2762,7 @@ class FailoverRouter:
                                             else None
                                         ),
                                         is_timeout=(stream_status == 504),
+                                        is_truncation=is_trunc,
                                     )
                                 except Exception:  # noqa: BLE001 - 记账失败不得掩盖原始错误
                                     pass

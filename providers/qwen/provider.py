@@ -31,6 +31,7 @@ from ..base import (
     read_error_body,
 )
 from ..device_identity import stable_device_id
+from ..stream_completion import COMPLETION_KEY
 
 BASE = "https://chat2.qianwen.com"
 CHAT_ENDPOINT = "/api/v2/chat"
@@ -193,6 +194,9 @@ class QwenProvider:
             acc_text = ""
             acc_thought = ""
             waf_detected = False
+            # [S2] 本次尝试是否看到了协议的完成标记（`data.status == "complete"`）。
+            # 每次尝试都重置：算数的是最终产出末位元数据帧那一次的状态。
+            saw_complete = False
             cookies = self._cookies
             # [OPT-030] 用户标识的兜底同样必须稳定：原先每次实例化都是新 uuid，
             # 等于每次请求换一个账号身份（比换设备更致命）。
@@ -335,6 +339,10 @@ class QwenProvider:
                                 yield text_chunk, {}
 
                             if obj.get("data", {}).get("status") == "complete":
+                                # [S2] 标记不只是循环的出口：它是「上游确实说完了」
+                                # 的唯一证据。原先它只被用来 break，于是这条证据
+                                # 在函数边界上消失，截断与说完变得无法区分。
+                                saw_complete = True
                                 break
 
                 if waf_detected:
@@ -389,7 +397,9 @@ class QwenProvider:
             except httpx.HTTPError as e:
                 raise ProviderError(f"通义千问网络错误: {e}", status=502)
 
-        yield "", {"conversation_id": conv_id}
+        # [S2] 通义千问协议**有**完成标记，所以这里能给出确定的完整性判据
+        # （而 deepseek/doubao/glm 协议里没有标记，它们必须省略此键 = 未知）。
+        yield "", {"conversation_id": conv_id, COMPLETION_KEY: saw_complete}
 
     async def delete_conversation(self, conversation_id: str) -> bool:
         """删除通义千问远端会话。
