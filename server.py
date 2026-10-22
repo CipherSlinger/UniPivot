@@ -204,11 +204,22 @@ def _make_lb_headers(decision: BalancingDecision) -> dict[str, str]:
 
 
 def _make_risk_headers(
-    delay_ms: float, provider_key: str, primary_provider: Optional[str] = None
+    delay_ms: Optional[float], provider_key: str, primary_provider: Optional[str] = None
 ) -> dict[str, str]:
-    """构造流量整形等待耗时与风控避让冷却响应头"""
+    """构造流量整形等待耗时与风控避让冷却响应头。
+
+    [M1] 不传 `delay_ms` 时报告的是节奏裁决者记录的**本节点最近一次实际施加**
+    的等待（`CooldownTracker.last_pacing_wait_ms`）。节奏裁决已唯一化到紧贴上游
+    调用的那一处（带锁预约时刻），本函数不再自带一套计时——两套计时各自为政时，
+    这个头报告的只是一个「大概等了多少」，与真实节奏无关。
+    """
+    applied_ms = (
+        failover_router.cooldown_tracker.last_pacing_wait_ms(provider_key)
+        if delay_ms is None
+        else delay_ms
+    )
     headers = {
-        "x-risk-pacing-delay-ms": str(round(delay_ms, 2)),
+        "x-risk-pacing-delay-ms": str(round(applied_ms, 2)),
     }
     rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(provider_key)
     if rem_cd <= 0 and primary_provider:
@@ -2073,8 +2084,12 @@ async def chat_completions(req: ChatCompletionRequest):
         "stream": req.stream,
     }
 
-    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
-        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+    # [M1] 节奏裁决只有一处：`execute_chat` 派发循环里的
+    # `apply_pacing_and_acquire`（紧贴上游调用、带锁预约可用时刻）。这里原先还有一次
+    # `traffic_pacer.acquire(...)` 的「等待后立即释放」：它只推迟了本条请求自己，
+    # 对并发者毫无约束（实测三路并发里有两路在同一毫秒打到上游），却让诊断数字
+    # 看起来像是做了频控。现在此处只**读取**裁决结果用于遥测，不再产生第二段等待。
+    risk_headers = _make_risk_headers(None, dispatched_provider, primary_provider=provider_key)
 
     # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
     flight_decision = None
@@ -2841,8 +2856,12 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         "thinking": enable_thinking,
     }
 
-    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
-        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+    # [M1] 节奏裁决只有一处：`execute_chat` 派发循环里的
+    # `apply_pacing_and_acquire`（紧贴上游调用、带锁预约可用时刻）。这里原先还有一次
+    # `traffic_pacer.acquire(...)` 的「等待后立即释放」：它只推迟了本条请求自己，
+    # 对并发者毫无约束（实测三路并发里有两路在同一毫秒打到上游），却让诊断数字
+    # 看起来像是做了频控。现在此处只**读取**裁决结果用于遥测，不再产生第二段等待。
+    risk_headers = _make_risk_headers(None, dispatched_provider, primary_provider=provider_key)
 
     # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
     flight_decision = None
@@ -3558,8 +3577,12 @@ async def responses_endpoint(req: ResponsesRequest):
         "thinking": enable_thinking,
     }
 
-    async with traffic_pacer.acquire(dispatched_provider) as pacing_delay:
-        risk_headers = _make_risk_headers(pacing_delay, dispatched_provider, primary_provider=provider_key)
+    # [M1] 节奏裁决只有一处：`execute_chat` 派发循环里的
+    # `apply_pacing_and_acquire`（紧贴上游调用、带锁预约可用时刻）。这里原先还有一次
+    # `traffic_pacer.acquire(...)` 的「等待后立即释放」：它只推迟了本条请求自己，
+    # 对并发者毫无约束（实测三路并发里有两路在同一毫秒打到上游），却让诊断数字
+    # 看起来像是做了频控。现在此处只**读取**裁决结果用于遥测，不再产生第二段等待。
+    risk_headers = _make_risk_headers(None, dispatched_provider, primary_provider=provider_key)
 
     # 2.2 智能并发语义去重与流式请求合并 (SingleFlight)
     flight_decision = None

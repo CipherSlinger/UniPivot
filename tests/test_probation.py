@@ -229,13 +229,20 @@ def _concurrency_probe_factory(key: str):
 
     class _Probe:
         async def chat(self, *a, **kw):
+            # [M1/OPT-022] 计数窗口必须与**闸门语义**一致：观察期闸门只覆盖
+            # 「握手 → 首包」，随后立即释放，整段流式输出并不串行化。旧探针把
+            # `+=1` 放在生成器入口、`-=1` 放在生成器 finally，测到的是
+            # **生成器寿命**而不是握手重叠——首包之后仍在吐字的流天然会重叠，
+            # 于是断言在**代码完全正确**时也会红（实测时间线：
+            # chat-enter 0.2615 → 首包放行 0.3137 → 下一个 chat-enter 0.3139）。
+            # 现在只统计「进入上游 → 交出首包」这一段。
             _IN_FLIGHT["n"] += 1
             MAX_IN_FLIGHT.append(_IN_FLIGHT["n"])
             try:
                 await asyncio.sleep(0.05)
-                yield ("hi", {})
             finally:
                 _IN_FLIGHT["n"] -= 1
+            yield ("hi", {})
 
         async def delete_conversation(self, *a, **kw):
             return None

@@ -330,6 +330,14 @@ class CooldownTracker:
         self._failure_counts: Dict[str, int] = {}
         # provider -> 上次调用时间戳
         self._last_call_time: Dict[str, float] = {}
+        # [M1] provider -> 已预约的「下一次可调用时刻」（节奏预约，见
+        # apply_pacing_and_acquire）。与 `_last_call_time` 分工不同：前者是
+        # **预测**（谁排在什么时刻），后者是**事实**（真正放行在什么时刻）。
+        self._next_slot: Dict[str, float] = {}
+        # [M1] provider -> 最近一次**实际施加**的节奏等待毫秒数。
+        # 节奏裁决唯一化之后，响应头 x-risk-pacing-delay-ms 必须报告这里记录的真实
+        # 等待，而不是由调用方另起一套计时自己算一个「大概等了多少」。
+        self._last_pacing_wait_ms: Dict[str, float] = {}
         # provider -> asyncio.Semaphore 并发控制
         self._semaphores: Dict[str, asyncio.Semaphore] = {
             pk: asyncio.Semaphore(meta.max_concurrency)
@@ -1592,7 +1600,31 @@ class CooldownTracker:
         )
 
     async def apply_pacing_and_acquire(self, provider_key: str) -> None:
-        """自适应调用步调（Pacing & Jitter）及并发获取"""
+        """自适应调用步调（Pacing & Jitter）：**唯一的节奏裁决点**。
+
+        [M1] 原实现把它写成「读 → 算 → 睡 → 写」四段，每一段都在锁外：
+        两个并发调用者读到同一个 `last`、算出同一个 `elapsed`、同时睡完、
+        同时写回。于是 `min_call_interval`（qwen 0.3s / deepseek 0.4s /
+        kimi 0.35s）在并发下被完全绕过——实测三个并发派发里有两个在同
+        一毫秒打到上游（`[0.0, 0.301, 0.301]`）。
+
+        更根本的问题是节奏有**两处**：`server.py` 在派发前也做了一次
+        `traffic_pacer.acquire(...)` 的「等待后立即释放」，而真正的上游调用
+        发生在后面，所以那次等待只推迟了请求自己，不约束任何并发者。
+
+        现在用**两段式**语义，缺一段都不成立：
+
+        1. **预约**（锁内）：把「下一次可调用时刻」写回 `_next_slot`，并发调用者
+           因此各拿到一段互不重叠的时间片，不会挤在同一个空档。
+        2. **放行时复核**（锁内循环）：睡醒后在锁内用**真实时刻**再判一次
+           `now - 上次实际放行 >= interval`，不满足就继续等到满足为止。
+
+        只做第 1 段是不够的——实测过：事件循环被压住时调用者会**睡过头**
+        （0.300s 的槽位在 0.398s 才醒），它自己的槽位没错，但与下一个槽位
+        （0.600s）的**实际**间隔被压缩到 0.203s。槽位是预测值，风控看的是真实
+        上游调用间隔，所以真正的约束必须落在第 2 段的放行时刻上。睡过头只会
+        把后续调用整体后移，永远不会压缩间隔。
+        """
         if os.getenv("GATEWAY_DISABLE_PACING") == "1":
             self._last_call_time[provider_key] = time.time()
             return
@@ -1601,20 +1633,38 @@ class CooldownTracker:
         if not meta:
             return
 
-        # 1. 频控间隔检查与随机抖动 Jitter
-        now = time.time()
-        last_time = self._last_call_time.get(provider_key, 0.0)
-        elapsed = now - last_time
-
-        jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
         # [OPT-022] 观察期内放大调用间隔：避免解封瞬间以常规速率涌入而立即二次触发风控
+        # 倍率在锁外取（纯函数、带 TTL 缓存），锁内只做「读-算-预约」这一小段。
+        jitter = random.uniform(meta.jitter_range[0], meta.jitter_range[1])
         target_interval = self.compute_pacing_interval(provider_key, jitter)
 
-        if elapsed < target_interval:
-            wait_time = target_interval - elapsed
+        # ---- 第 1 段：预约一个互不重叠的时间片 ----
+        async with self._lock:
+            now = time.time()
+            slot = max(now, self._next_slot.get(provider_key, 0.0))
+            self._next_slot[provider_key] = slot + target_interval
+        wait_time = max(0.0, slot - time.time())
+        if wait_time > 0:
             await asyncio.sleep(wait_time)
 
-        self._last_call_time[provider_key] = time.time()
+        # ---- 第 2 段：在锁内按**真实时刻**占座，睡过头时补足间隔 ----
+        while True:
+            async with self._lock:
+                now = time.time()
+                last_time = self._last_call_time.get(provider_key, 0.0)
+                deficit = target_interval - (now - last_time)
+                if deficit <= 0:
+                    self._last_call_time[provider_key] = now
+                    break
+            wait_time += deficit
+            await asyncio.sleep(deficit)
+
+        # 记录「本节点最近一次实际施加的等待」，供遥测头读取（见 _last_pacing_wait_ms）
+        self._last_pacing_wait_ms[provider_key] = wait_time * 1000.0
+
+    def last_pacing_wait_ms(self, provider_key: str) -> float:
+        """最近一次节奏裁决实际施加的等待毫秒数（只读，供遥测）。"""
+        return float(self._last_pacing_wait_ms.get(provider_key, 0.0))
 
     def get_semaphore(self, provider_key: str) -> asyncio.Semaphore:
         """获取节点的并发控制信号量"""
@@ -1629,6 +1679,8 @@ class CooldownTracker:
         self._cooldowns.clear()
         self._failure_counts.clear()
         self._last_call_time.clear()
+        self._next_slot.clear()
+        self._last_pacing_wait_ms.clear()
         # [OPT-026] 冷却成因记录一并重置（否则会与后续用例的冷却串扰）
         self._cooldown_severity.clear()
         # [OPT-027] 封禁推断证据一并重置，确保用例之间零串扰
