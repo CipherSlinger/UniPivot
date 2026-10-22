@@ -2104,6 +2104,18 @@ async def chat_completions(req: ChatCompletionRequest):
             thinking=is_thinking,
             stream=req.stream,
             protocol="openai_chat",
+            # [S3] 会改变输出的客户端声明必须进去重键：Follower 直接领用
+            # Leader 的答案，键相同就等于断言「两者的正确答案可以互换」。
+            # 这些字段原先不在键里，而那时它们确实不改变输出（被解析后无人读）；
+            # 逐个修好之后它们开始改变输出，键却没同步 —— 声明 tool_choice:"none"
+            # 的请求会领到工具调用，且没有任何错误可看。
+            constraints={
+                "tool_choice": req.tool_choice,
+                "parallel_tool_calls": req.parallel_tool_calls,
+                "stop": req.stop,
+                "response_format": req.response_format,
+                "max_tokens": req.max_tokens,
+            },
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)
@@ -2876,6 +2888,16 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             thinking=enable_thinking,
             stream=req.stream,
             protocol="anthropic_messages",
+            # [S3] 会改变输出的客户端声明必须进去重键：Follower 直接领用
+            # Leader 的答案，键相同就等于断言「两者的正确答案可以互换」。
+            # 这些字段原先不在键里，而那时它们确实不改变输出（被解析后无人读）；
+            # 逐个修好之后它们开始改变输出，键却没同步 —— 声明 tool_choice:"none"
+            # 的请求会领到工具调用，且没有任何错误可看。
+            constraints={
+                "tool_choice": req.tool_choice,
+                "stop_sequences": req.stop_sequences,
+                "max_tokens": req.max_tokens,
+            },
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)
@@ -3597,6 +3619,18 @@ async def responses_endpoint(req: ResponsesRequest):
             thinking=enable_thinking,
             stream=req.stream,
             protocol="openai_responses",
+            # [S3] 会改变输出的客户端声明必须进去重键：Follower 直接领用
+            # Leader 的答案，键相同就等于断言「两者的正确答案可以互换」。
+            # 这些字段原先不在键里，而那时它们确实不改变输出（被解析后无人读）；
+            # 逐个修好之后它们开始改变输出，键却没同步 —— 声明 tool_choice:"none"
+            # 的请求会领到工具调用，且没有任何错误可看。
+            constraints={
+                "tool_choice": req.tool_choice,
+                "parallel_tool_calls": req.parallel_tool_calls,
+                "stop": getattr(req, "stop", None),
+                "text": req.text,
+                "max_output_tokens": req.max_output_tokens,
+            },
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)

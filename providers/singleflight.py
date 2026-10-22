@@ -234,8 +234,26 @@ class SingleFlightManager:
         thinking: Optional[bool] = None,
         stream: bool = False,
         protocol: str = "openai_chat",
+        constraints: Optional[Dict[str, Any]] = None,
     ) -> str:
-        """计算请求特征指纹 (SHA-256)。"""
+        """计算请求特征指纹 (SHA-256)。
+
+        指纹的正确性判据只有一条：**指纹相同 ⇒ 两条请求的正确答案可以互换**。
+        Follower 直接领用 Leader 的答案，所以任何会改变输出的客户端声明都必须
+        在指纹里。
+
+        [S3] `constraints` 承载的正是这一类声明（`tool_choice` / `stop` /
+        `response_format` / `parallel_tool_calls` …）。它们原先不在指纹里，
+        而当时这是**无害**的 —— 因为那时它们被解析之后就没人读，确实不改变
+        输出。随后每个字段被逐个修好（允许名单、网关侧截断、进提示词、裁剪
+        调用数量），于是它们**开始**改变输出，而指纹没有同步更新：声明
+        `tool_choice:"none"` 的请求会领到工具调用，声明 `stop` 的请求会领到
+        未截断的文本，全都没有任何错误可看。
+
+        加字段只会让键**更**具体（合并变少），绝不会把两条不该合并的请求并到
+        一起 —— 这是唯一安全的方向。`None` 与 `{}` 等价，所以未传约束的调用点
+        逐值保持原语义。
+        """
         payload = {
             "protocol": protocol,
             "provider": provider,
@@ -245,6 +263,8 @@ class SingleFlightManager:
             "temperature": round(temperature or 0.7, 2),
             "thinking": bool(thinking),
             "stream": stream,
+            # 空字典与缺省必须产生同一个 payload；`sort_keys` 负责顺序无关
+            "constraints": constraints or {},
         }
         raw_str = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
