@@ -1198,6 +1198,8 @@ async def health():
 
     healing_status = healing_engine.get_healing_status()
     risk_recent = risk_ledger.recent_interceptions(hours=24.0)
+    _dg_diag = disconnect_guard.get_diagnostics()
+    _sf_diag = singleflight_manager.get_diagnostics()
     return {
         "status": "ok",
         "disabled_providers": sorted(list(disabled_set)),
@@ -1210,6 +1212,19 @@ async def health():
             },
         },
         "quarantine": quarantine_store.list_active(),
+        # [C2] 断连回收的**结果**必须在就绪面上可见，而不只在 /v1/diagnostics 的明细里。
+        # 这两组数字是「网关有没有在白白占用上游配额」的唯一直接证据：客户端中断
+        # （Claude Code 的 Esc、Codex 的 Ctrl-C、任何重连）在 agent 使用中是常态，
+        # 而它是否真的回收了上游流、飞行组是否被唤醒，此前只有翻完整诊断才能看到。
+        "disconnect_guard": {
+            "enabled": not disconnect_guard.is_disabled(),
+            "client_disconnects": _dg_diag["client_disconnects"],
+            "reclaimed_streams": _dg_diag["reclaimed_streams"],
+            "orphaned_flights_recovered": _dg_diag["orphaned_flights_recovered"],
+        },
+        "singleflight": {
+            "active_flights": _sf_diag["active_flights"],
+        },
         "qwen_configured": _configured(resolve_qwen),
         "deepseek_configured": _configured(resolve_deepseek),
         "doubao_configured": _configured(resolve_doubao),

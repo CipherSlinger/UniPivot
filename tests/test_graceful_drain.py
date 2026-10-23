@@ -176,6 +176,25 @@ def test_observer_endpoints_do_not_count_themselves():
     print("test_observer_endpoints_do_not_count_themselves: PASSED")
 
 
+def test_health_exposes_reclamation_result():
+    """[C2] 就绪面必须回答「有没有在白白占用上游」，而不只是「凭证配好了没」。
+
+    断连回收此前只有 `/v1/diagnostics` 的完整明细里有，而 `/health` 是运维与
+    探针最先看的那一屏。agent 场景里客户端中断是常态（Esc / Ctrl-C / 重连），
+    被吞掉的上游配额正是从这些中断里漏出来的，因此这两组计数属于就绪事实。
+    """
+    _reset()
+    client = TestClient(srv.app)
+    h = client.get("/health").json()
+    dg = h.get("disconnect_guard")
+    assert dg is not None, "/health 未暴露断连回收结果"
+    for key in ("enabled", "client_disconnects", "reclaimed_streams", "orphaned_flights_recovered"):
+        assert key in dg, f"/health.disconnect_guard 缺少 {key}"
+    assert "active_flights" in h.get("singleflight", {}), "/health 未暴露飞行组存量"
+    assert dg["enabled"] is True
+    print("test_health_exposes_reclamation_result: PASSED")
+
+
 def run_all():
     test_drain_when_idle_returns_immediately()
     test_drain_waits_for_completion()
@@ -185,6 +204,7 @@ def run_all():
     test_middleware_ignores_non_http_scope()
     test_health_and_diagnostics_expose_inflight()
     test_observer_endpoints_do_not_count_themselves()
+    test_health_exposes_reclamation_result()
     print("\n✅ All graceful in-flight drain tests (OPT-015) passed!")
 
 
