@@ -1707,6 +1707,8 @@ async def get_diagnostics():
         "dispatch_gates": failover_router.cooldown_tracker.disabled_gate_report(),
         # [OPT-034] 后台自维护触点的避让拒载分布（按成因）
         "touch_gates": failover_router.cooldown_tracker.touch_gate_report(),
+        # [BUDGET-4] 预算裁短的连续证据与升级次数（「机制有没有在做事」可观测）
+        "budget_capped": failover_router.cooldown_tracker.budget_capped_report(),
         "inflight_requests": _inflight_requests,
         "risk_avoidance": risk_avoidance,
     }

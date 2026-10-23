@@ -411,6 +411,21 @@ class CooldownTracker:
         # [OPT-026] provider -> 当前冷却的成因严重度（auth/ratelimit/waf），
         # 随冷却一并持久化：只有确认冷却由「认证失效」造成，才允许被续期复位。
         self._cooldown_severity: Dict[str, str] = {}
+        # [BUDGET-4] provider -> 连续被**总预算裁短**的超时次数。
+        #
+        # 这是与 `_failure_counts` 分开的一本账，因为它们是两件不同的事实：
+        # `_failure_counts` 回答「节点自己坏了多少次」，本表回答「节点多少次没能
+        # 在我们给它的那份时间里吐首包」。前者在份额 0.1s 时是诬告（上一轮
+        # `BudgetCappedTimeout` 修的就是它），后者不是——它如实描述了节点与
+        # **预算份额**的关系，而这个关系正是派发决策需要的。
+        #
+        # 没有这本账的后果是实测出来的：五节点环、qwen 挂死、预算 5s → 首份 1.0s，
+        # 连发四轮全是 1.00s、`qwen_calls` 单调增长、冷却与失败计数恒 0。长会话的
+        # agent 每次请求都稳定多等一秒且永不收敛，而且每次都对一个已知不吐字的节点
+        # 发起了一次带凭证的真实调用。
+        self._budget_capped_streak: Dict[str, int] = {}
+        # [BUDGET-4] 累计升级次数，仅用于诊断可观测性。
+        self._budget_capped_escalations: Dict[str, int] = {}
         # [OPT-034] 后台触点避让门控的拒绝直方图（按成因）
         self._touch_block_stats: Dict[str, int] = {}
         # [OPT-027] 「新凭证仍被拒」证据：provider -> 自凭证更新以来，拿着**已更新**的
@@ -512,6 +527,17 @@ class CooldownTracker:
             for pk, fp in auto_fp_map.items():
                 if isinstance(fp, str) and fp:
                     self._auto_lease_fingerprint[str(pk)] = fp
+        # [BUDGET-4] 恢复「连续被预算裁短」的证据与累计升级次数。与上面两本账同理：
+        # 能被一次重启清零的连续计数等于不存在。
+        for key, target in (
+            ("budget_capped_streak", self._budget_capped_streak),
+            ("budget_capped_escalations", self._budget_capped_escalations),
+        ):
+            raw = state.get(key) or {}
+            if isinstance(raw, dict):
+                for pk, n in raw.items():
+                    if isinstance(n, int) and n > 0:
+                        target[str(pk)] = n
         # [OPT-022] 恢复 episode 结束时间：据此可在解封瞬间重新启用观察期，
         # 使「避让期间重启」不会绕过惊群保护。仅保留观察期窗口内仍有意义的记录。
         episode_ends = state.get("episode_ends") or {}
@@ -561,6 +587,15 @@ class CooldownTracker:
             # 重启若能抹掉它，账号就会被重新反复触碰。
             "fresh_credential_rejected": {k: v for k, v in self._fresh_credential_rejected.items()},
             "auto_lease_fingerprint": {k: v for k, v in self._auto_lease_fingerprint.items()},
+            # [BUDGET-4] 「连续 N 次被预算裁短」同样必须跨界存活：一次重启若能清零
+            # 它，就等于给了一个挂死的节点重新被白等 N 次的机会，而这正是本机制的
+            # 全部意义所在。只存正数，保持「健康」与「缺席」同构（[H5] 的同一条纪律）。
+            "budget_capped_streak": {
+                k: v for k, v in self._budget_capped_streak.items() if v > 0
+            },
+            "budget_capped_escalations": {
+                k: v for k, v in self._budget_capped_escalations.items() if v > 0
+            },
         }
 
     def _persist_state(self) -> None:
@@ -1307,6 +1342,98 @@ class CooldownTracker:
             )
             return cooldown_duration
 
+    # ---------------------------------------------------------------- [BUDGET-4]
+
+    def budget_capped_limit(self) -> int:
+        """连续被预算裁短多少次后升级为一次真实的上游超时冷却。
+
+        `0` 表示永不升级（回到「每次请求都白等一份份额」的旧行为，保留为开关）。
+        负值按 0 处理——一个无意义的配置不该悄悄变成「每次立即冷却」。
+        """
+        try:
+            return max(0, int(os.getenv("GATEWAY_BUDGET_CAPPED_LIMIT", "3")))
+        except (TypeError, ValueError):
+            return 3
+
+    def budget_capped_count(self, provider_key: str) -> int:
+        """该节点当前连续被预算裁短的次数（只读，供诊断与用例断言）。"""
+        return self._budget_capped_streak.get(provider_key, 0)
+
+    def budget_actions(self, provider_key: str) -> int:
+        """该节点累计因预算裁短而升级的冷却次数（只读，仅供诊断）。"""
+        return self._budget_capped_escalations.get(provider_key, 0)
+
+    def budget_capped_report(self) -> Dict[str, Any]:
+        """[BUDGET-4] 预算裁短升级机制的可观测面。
+
+        「这个机制到底有没有在做事」必须是可观测的，而不是靠读日志推断：
+        `streaks` 是各节点当前的连续计数，`escalations` 是累计升级次数。
+        两者都持久化，故重启后仍能读出真实状态。
+        """
+        limit = self.budget_capped_limit()
+        return {
+            "enabled": limit > 0,
+            "limit": limit,
+            "streaks": {k: v for k, v in self._budget_capped_streak.items() if v > 0},
+            "escalations": {
+                k: v for k, v in self._budget_capped_escalations.items() if v > 0
+            },
+            "timeout_cooldown_seconds": self._env_float(
+                "GATEWAY_TIMEOUT_COOLDOWN", 60.0
+            ),
+        }
+
+    async def note_budget_capped(self, provider_key: str) -> float:
+        """记一次「本候选没能在我们给它的份额里吐首包」，返回升级出的冷却时长。
+
+        为什么这**不是**上一轮修掉的诬告：诬告是把「份额 0.1s 到了」说成
+        「节点坏了」，并据此给它 60s 冷却。本方法说的是另一件事，而且是可观测的
+        事实：**连续 N 次，我们把全部可用份额都给了它，它一次都没吐首包**。对一个
+        真的挂死的节点，这条事实与「它坏了」在行为上等价（冷却后走健康节点）；
+        对一个只是比份额慢的健康节点，它也会在冷却到期后重新被试探，且一旦成功
+        `record_success` 立即把连续计数清零。
+
+        单次绝不触发——这正是 `BudgetCappedTimeout` 存在的理由，阈值机制不会把它
+        吃掉。也不进风控台账、不进恢复观察期、不写 `waf`/`auth` 成因：这是上游
+        健康问题，不是账号被标记。
+        """
+        async with self._lock:
+            limit = self.budget_capped_limit()
+            streak = self._budget_capped_streak.get(provider_key, 0) + 1
+            self._budget_capped_streak[provider_key] = streak
+            if limit == 0 or streak < limit:
+                self._persist_state()
+                return 0.0
+
+            # 达到阈值：按**上游超时**计一次失败（成因 timeout），并清空连续计数
+            # ——冷却本身就是接下来 N 次请求不再碰它，继续累加没有意义，反而会让
+            # 冷却一到期就立刻再次升级。
+            self._budget_capped_streak.pop(provider_key, None)
+            self._budget_capped_escalations[provider_key] = (
+                self._budget_capped_escalations.get(provider_key, 0) + 1
+            )
+            # 与 `FailoverRouter._timeout_cooldown` 同一个配置项：升级后的处置就是
+            # 「一次上游超时」，所以时长必须与真正的超时分支一致，否则两条路径会
+            # 各自朝不同方向漂移（本仓库反复出现的「同一事实两份定义」）。
+            cooldown = self._env_float("GATEWAY_TIMEOUT_COOLDOWN", 60.0)
+            end_time = time.time() + cooldown
+            self._cooldowns[provider_key] = max(
+                self._cooldowns.get(provider_key, 0.0), end_time
+            )
+            self._cooldown_severity[provider_key] = "timeout"
+            self._persist_state()
+            logger.warning(
+                "[握手预算] 节点 [%s] 连续 %d 次未能在分到的预算份额内返回首包，"
+                "按上游超时冷却 %.1fs。这不是风控拦截（不写入风控台账）：节点只是"
+                "比预算份额慢或挂死，冷却到期后会再探一次。若该节点实际健康且只是"
+                "较慢，请调大 GATEWAY_HANDSHAKE_BUDGET，而不是关掉本机制——"
+                "关掉之后每个请求都会为它白等一整份份额，且每次都真的触发一次上游调用",
+                provider_key,
+                limit,
+                cooldown,
+            )
+            return cooldown
+
     async def record_success(self, provider_key: str) -> None:
         """调用成功，重置失败计数并清除冷却状态"""
         async with self._lock:
@@ -1331,6 +1458,10 @@ class CooldownTracker:
             # [OPT-027] 节点已用当前凭证成功 -> 「新凭证仍被拒」的证据被证伪，清除。
             self._fresh_credential_rejected.pop(provider_key, None)
             self._auto_lease_fingerprint.pop(provider_key, None)
+            # [BUDGET-4] 成功即证明它能在份额内吐首包 -> 「连续被裁短」的连续计数
+            # 归零。不清零的话，隔很久之后一次单次被裁短就会立刻触发升级，等于把
+            # 一段早已过去的旧账算在现在的节点头上（「连续」必须是连续的）。
+            self._budget_capped_streak.pop(provider_key, None)
             self._persist_state()
 
     # -------------------------------------------------------- [OPT-027] 账号级封禁推断
@@ -1760,6 +1891,9 @@ class CooldownTracker:
         # [OPT-027] 封禁推断证据一并重置，确保用例之间零串扰
         self._fresh_credential_rejected.clear()
         self._auto_lease_fingerprint.clear()
+        # [BUDGET-4] 预算裁短的连续计数同样不得跨用例串扰
+        self._budget_capped_streak.clear()
+        self._budget_capped_escalations.clear()
         self._ban_stats = {
             "rejections_after_renewal": 0,
             "auto_leases_applied": 0,
@@ -3114,11 +3248,22 @@ class FailoverRouter:
                 # 上游的罪状，正是本项目反复记录的那类谎报。继续故障转移（这次确实
                 # 没拿到首包），但不进冷却、不增失败计数。
                 if _is_budget_capped(exc):
+                    # 单次不记账（那是诬告），但**连续**被裁短是一条不同的事实：
+                    # 「我们在全部可用份额里都没等到首包」。没有这本账，一个挂死的
+                    # 节点会在每次请求上重新被白等一整份份额且永不收敛（实测四轮
+                    # 全是 1.00s）。升级仍按上游超时处置，不进风控台账。
+                    escalated = await self.cooldown_tracker.note_budget_capped(
+                        curr_provider_key
+                    )
                     logger.warning(
                         "[握手预算] 节点 [%s] 的本次上限被总预算裁剪至 %.1fs（节点本身"
-                        "未表现出故障，不计冷却），继续故障转移",
+                        "未表现出故障，单次不计冷却%s），继续故障转移",
                         curr_provider_key,
                         getattr(exc, "handshake_timeout", 0.0) or 0.0,
+                        f"；已连续 {self.cooldown_tracker.budget_capped_limit()} 次，"
+                        f"升级为上游超时冷却 {escalated:.1f}s"
+                        if escalated
+                        else "",
                     )
                 else:
                     is_timeout = status_code == 504
