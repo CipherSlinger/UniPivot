@@ -97,17 +97,57 @@ class DisconnectGuard:
         except Exception as exc:  # noqa: BLE001
             logger.warning("上游流安全关闭失败 (已忽略): %s: %s", type(exc).__name__, exc)
             return False
+        interrupted = False
         try:
             await asyncio.shield(task)
         except asyncio.CancelledError:
             # 当前任务被取消：关闭任务继续在后台完成
-            pass
+            interrupted = True
         except BaseException as exc:  # noqa: BLE001 - 回收路径必须绝对安全
-            logger.warning("上游流安全关闭失败 (已忽略): %s: %s", type(exc).__name__, exc)
+            # 当前生成器自身正在被关闭时（事件循环收尾 / GeneratorExit），
+            # 等待点会立刻以 GeneratorExit 结束——这描述的是**等待方**的处境，
+            # 不是关闭任务的结局。实测此时关闭任务已正常完成、上游 finally 已执行，
+            # 若据此记为失败，一次成功回收会被计成一次失败，计数器长期少计。
+            interrupted = True
+            logger.debug("关闭等待被中断（关闭任务本身不受影响）: %s", type(exc).__name__)
+        # 结论只看任务本身：它才代表「上游流是否真的关掉了」。
+        if task.done() and not task.cancelled():
+            outcome = task.exception()
+            if outcome is not None:
+                logger.warning(
+                    "上游流安全关闭失败 (已忽略): %s: %s", type(outcome).__name__, outcome
+                )
+                return False
+            with self._lock:
+                self._stats["reclaimed_streams"] += 1
+            return True
+        if not interrupted:
             return False
+        # 等待被打断且任务尚未完成：关闭仍在后台进行，交给 done_callback 记账，
+        # 这样「确实关掉了」的流不会被永久漏计。
+        task.add_done_callback(self._record_reclaim_outcome)
+        return False
+
+    def _record_reclaim_outcome(self, task: "asyncio.Future[Any]") -> None:
+        """关闭任务在等待被中断后才得出结论时的记账入口。
+
+        等待被打断不代表关闭失败：任务仍然会在后台跑完。这里按任务**真实的**
+        结局记账——成功则计入 reclaimed_streams，失败则记录一次告警。回收路径
+        必须绝对安全，因此回调自身不得抛出。
+        """
+        try:
+            if task.cancelled():
+                return
+            outcome = task.exception()
+        except BaseException:  # noqa: BLE001 - 回收路径必须绝对安全
+            return
+        if outcome is not None:
+            logger.warning(
+                "上游流安全关闭失败 (已忽略): %s: %s", type(outcome).__name__, outcome
+            )
+            return
         with self._lock:
             self._stats["reclaimed_streams"] += 1
-        return True
 
     def record_client_disconnect(self, provider_key: str, estimated_tokens: int = 0) -> None:
         """记录一次客户端断连事件。"""
