@@ -922,8 +922,30 @@ class ResponsesEventStream:
         （内容已经发出去了，重试只会产生半包重放）。之前的记录把「减少重试」记在
         它头上是不准确的。
 
-        `error.code` 取 OpenAI 风格的 code（`error_response` 已经做过映射），而不是
-        内部 `err_type`——客户端按前者做重试分级。
+        `error.code` 的取值：实测（真实 codex-cli 0.145.0，唯一变量就是这个字段）
+        Codex **确实**按它分流，而且只有 5 个值会改变行为——
+
+            insufficient_quota        → 立即终止，1 次请求，"Quota exceeded. Check your plan..."
+            usage_not_included        → 立即终止，1 次请求，"upgrade to Plus"
+            context_length_exceeded   → 立即终止，1 次请求，"ran out of room in the context window"
+            invalid_prompt / cyber_policy → 立即终止，1 次请求，原样显示上游 message
+            其余一切（含 server_error / rate_limit_exceeded / 内部 err_type）→ 重试 5 次后
+                                        "stream disconnected before completion: <message>"
+
+        关键是**只有这 5 个值**：`rate_limit_exceeded`、`auth_error`、`waf_blocked`、
+        `upstream_error`、`quota_exceeded`、`billing_error`、`rate_limit` 等全部落在
+        重试分支，与内部 err_type 的行为完全相同。换一个「看起来更标准」的枚举名
+        并不会改善任何东西，除非它恰好在上面这 5 个里。
+
+        因此这里**保留内部 err_type** 而不是硬改成标准枚举：网关的失败类别
+        （风控拦截 / 凭证失效 / 整环耗尽）在 OpenAI 的枚举里没有对应值，映射过去
+        只能编一个，而编出来的值要么落进重试分支（等于没改），要么被客户端当成
+        别的原因显示。message 本身就是完整可读的上游原因，实测 Codex 无论走到哪个
+        分支都会把它显示出来（除 3 个自带固定文案的 code 以外）。
+
+        （历史注释曾写「`error_response` 已经做过 OpenAI 风格映射」——这是错的：
+        `error_response` 只产出 message/type，从来不产 `code`。见
+        `tests/test_responses_protocol.py` 中钉住这一点的用例。）
         """
         err = error_response(message, status, err_type)["error"]
         resp_obj = self._response_shell("failed")
