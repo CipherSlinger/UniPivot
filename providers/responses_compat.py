@@ -80,7 +80,10 @@ class ResponsesRequest(BaseModel):
     # 而不是 `reasoning_effort` 字符串。此前只认后者，模型名又恰好落在
     # `gpt-5-codex` 这样的非推理前缀上，于是「想清楚再动手」的意图被静默丢弃。
     reasoning: Optional[Union[dict, str]] = None
-    thinking: Optional[Union[dict, bool]] = None
+    # [PROTOCOL] `"adaptive"` 裸字符串是 `{"type":"adaptive"}` 的另一种序列化，
+    # 另外两个协议都接受它。这里若只声明 `dict | bool`，pydantic 会把一个合法请求
+    # 拒成 400——同一份声明在三条路径上得到三种结果（200/200/400）。
+    thinking: Optional[Union[dict, bool, str]] = None
 
     @field_validator("tools")
     @classmethod

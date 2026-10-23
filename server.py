@@ -3800,13 +3800,18 @@ async def responses_endpoint(req: ResponsesRequest):
     max_tokens = req.max_output_tokens or req.max_tokens or 4096
 
     # 判定 thinking 意图
-    enable_thinking = False
-    if req.thinking is not None:
-        if isinstance(req.thinking, dict):
-            enable_thinking = req.thinking.get("type") == "enabled"
-        else:
-            enable_thinking = bool(req.thinking)
-    else:
+    #
+    # [PROTOCOL] 这里必须走 `_wants_thinking()`，与 /v1/messages、/v1/chat/completions
+    # 共用同一个判定。此前本路径自行重推了一遍（`type == "enabled"`），于是同一份
+    # 声明在三处各自漂移，且没有任何一个方向是安全的：
+    #   * `{"type":"adaptive"}` —— 这正是当前 Claude Code（2.1.293）发出的写法——
+    #     另外两个协议判「开」，这里判「关」：思考被**静默**关掉，请求照常 200，
+    #     日志里什么都看不到；
+    #   * `"adaptive"` 裸字符串（同一个值的另一种序列化）在请求模型处就被拒成 400。
+    # 这不是「Responses 少一个特性」，而是同一事实两份定义。`_wants_thinking`
+    # 失败开放（只有明确的 disabled/false 才关），正是这里需要的语义。
+    enable_thinking = _wants_thinking(req.thinking)
+    if req.thinking is None:
         # [AGENT-LOOP] 线上有两种写法：`reasoning_effort:"high"`（旧版 SDK）与
         # `reasoning:{"effort":"high"}`（Codex CLI 现行）。只认前者会让 Codex 的
         # 「想清楚再动手」静默失效——尤其代码类模型（gpt-5-codex）不走推理前缀兜底。

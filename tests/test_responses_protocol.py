@@ -256,6 +256,88 @@ def test_tool_call_stream_contract():
     print("test_tool_call_stream_contract: PASSED")
 
 
+def test_thinking_declaration_means_the_same_thing_on_all_three_protocols():
+    """同一份 `thinking` 声明在三个协议上必须得到同一个判定。
+
+    [PROTOCOL] `_wants_thinking()` 的 docstring 写着「三个协议共用这一个判定」，
+    但 `/v1/responses` 从未调用它——第 3803 行自己重新推导了一遍，于是三种写法
+    各自漂移，且**没有任何一个方向是安全的**：
+
+      声明                           messages / chat    responses（修复前）
+      {"type":"adaptive"}            思考开（实测 CLI   thinking=False（静默关掉）
+                                     发的是这个）
+      "adaptive"（裸字符串）          思考开             400（pydantic 拒绝 str）
+      {"type":"disabled"}            思考关             思考关（恰好一致）
+
+    第一行是当前 Claude Code 的线上写法，第二行是同一个值的另一种序列化。
+    这不是「Responses 少一个特性」，而是**同一事实两份定义**——本仓库反复修复的
+    缺陷类型（OPT-026/029/030/035 都属于这一类）。
+
+    断言方式：不看网关自己的响应体，而是看**上游实际收到的 `thinking` 标志**
+    （provider 的观察是唯一事实）。一个只在网关内部保持一致、却把不同标志交给
+    上游的修复，等于没修。
+    """
+    declarations = [
+        {"type": "adaptive"},
+        {"type": "enabled"},
+        {"type": "disabled"},
+        "adaptive",
+        True,
+        False,
+        None,
+    ]
+
+    def observed(path: str, body: dict, headers: dict) -> tuple[int, object]:
+        seen: list[object] = []
+
+        class Spy:
+            async def chat(self, *a, **kw):
+                seen.append(kw.get("thinking", "ABSENT"))
+                yield "ok", {"conversation_id": "c"}
+                yield "", {"conversation_id": "c"}
+
+        srv._make_provider = lambda key: Spy()
+        try:
+            client = TestClient(srv.app)
+            r = client.post(path, json=body, headers=headers)
+        finally:
+            srv._make_provider = _default_factory
+        return r.status_code, (seen[-1] if seen else "NO_UPSTREAM_CALL")
+
+    rows = []
+    for decl in declarations:
+        anthropic_body = {
+            "model": "claude-3-7-sonnet",
+            "max_tokens": 64,
+            "messages": [{"role": "user", "content": "hi"}],
+        }
+        chat_body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+        responses_body = {"model": "gpt-4o", "input": "hi", "stream": False}
+        if decl is not None:
+            anthropic_body["thinking"] = decl
+            chat_body["thinking"] = decl
+            responses_body["thinking"] = decl
+
+        a = observed("/v1/messages", anthropic_body, {"anthropic-version": "2023-06-01"})
+        b = observed("/v1/responses", responses_body, {})
+        rows.append((decl, a, b))
+
+    mismatches = [
+        f"  thinking={decl!r}: messages -> {a}, responses -> {b}"
+        for decl, a, b in rows
+        if a[0] != b[0] or (a[0] == 200 and b[0] == 200 and a[1] != b[1])
+    ]
+    assert not mismatches, (
+        "同一份 thinking 声明在 /v1/messages 与 /v1/responses 上得到了不同的处理：\n"
+        + "\n".join(mismatches)
+        + "\n（messages 侧是 _wants_thinking 的既定语义，responses 侧自行重推了一遍）"
+    )
+    print(
+        "test_thinking_declaration_means_the_same_thing_on_all_three_protocols: PASSED",
+        f"({len(rows)} declarations agree)",
+    )
+
+
 def test_empty_response_still_has_message_item():
     events = _run(
         {"model": "qwen3.7-max", "input": "nothing", "stream": True},
@@ -424,16 +506,79 @@ def test_mid_stream_failure_is_a_terminal_event_codex_reads():
     assert err.get("code"), "response.error.code 不能为空，客户端按它做重试分级"
 
 
+def test_failed_event_code_is_the_gateway_err_type_not_a_mapped_enum():
+    """[RESPONSES-STREAM] `response.failed.error.code` 的取值。
+
+    历史注释曾断言「`error_response` 已经做过 OpenAI 风格映射，客户端按它做
+    重试分级」——两句都不成立，而这个字段会被真实 Codex 分流，所以必须钉住。
+
+    实测（真实 codex-cli 0.145.0，同一台 mock，唯一变量是 `error.code`，
+    每次都吐 `insufficient_quota` 之外的同一个 message）：
+
+        code                      请求数  用户看到
+        server_error                 6    stream disconnected before completion: <msg>
+        rate_limit_exceeded          6    stream disconnected before completion: <msg>
+        upstream_error               6    stream disconnected before completion: <msg>
+        auth_error / waf_blocked     6    stream disconnected before completion: <msg>
+        insufficient_quota           1    "Quota exceeded. Check your plan and billing details."
+        usage_not_included           1    "To use Codex with your ChatGPT plan, upgrade to Plus"
+        context_length_exceeded      1    "Codex ran out of room in the model's context window"
+        invalid_prompt               1    <msg>（原样显示）
+        cyber_policy                 1    <msg>（原样显示）
+
+    也就是说**只有这 5 个值**会改变客户端行为；网关实际会发出的 err_type
+    （auth_error / waf_blocked / rate_limit_error / upstream_error /
+    upstream_timeout / credential_outage / quarantined / ring_exhausted /
+    disabled / upstream_incomplete）**一个都不在**这 5 个里，因此把它们
+    「翻译」成标准枚举不会有任何收益——编译出来的值要么落回重试分支（等于没改），
+    要么被客户端当成另一个原因显示。
+
+    反向证据：`error` 事件上放另一个 code 不改变分支（实测），即 Codex 只读
+    `response.failed`。所以这里同时锁住「code 就是 err_type」与「code 非空」。
+    """
+    events = _run(
+        {"model": "gpt-5-codex", "input": "hi", "stream": True},
+        MidStreamFailProvider(),
+    )
+    payload = dict(events)["response.failed"]
+    err = (payload.get("response") or {}).get("error") or {}
+
+    assert err.get("code") == "rate_limit_error", (
+        "response.failed.error.code 应原样携带网关的 err_type（实测 Codex 只对 "
+        "insufficient_quota / usage_not_included / context_length_exceeded / "
+        f"invalid_prompt / cyber_policy 这 5 个值分流），实际 {err.get('code')!r}"
+    )
+
+
+def test_error_response_never_invents_a_code():
+    """`error_response` 只产出 message/type——`failed()` 的回落分支依赖这一点。
+
+    历史注释写「`error_response` 已经做过 OpenAI 风格映射」，实际它从不写
+    `code` 键。这个断言把事实钉住：一旦它开始产 `code`，`failed()` 里那行
+    `err.get("code") or err.get("type") or err_type` 的语义就悄悄变了。
+    """
+    from providers.base import error_response
+
+    err = error_response("boom", 502, "upstream_error")["error"]
+    assert "code" not in err, (
+        f"error_response 不应产出 code（failed() 的回落依赖 type），实际 {sorted(err)}"
+    )
+    assert err["type"] == "upstream_error"
+
+
 def run_all():
     tests = [
         test_text_stream_event_contract,
         test_reasoning_stream_is_emitted,
         test_tool_call_stream_contract,
         test_empty_response_still_has_message_item,
+        test_thinking_declaration_means_the_same_thing_on_all_three_protocols,
         test_non_streaming_reasoning_item,
         test_interleaved_reasoning_and_text_never_collide,
         test_shapes_match_between_tool_and_plain_paths,
         test_mid_stream_failure_is_a_terminal_event_codex_reads,
+        test_failed_event_code_is_the_gateway_err_type_not_a_mapped_enum,
+        test_error_response_never_invents_a_code,
     ]
     for fn in tests:
         fn()

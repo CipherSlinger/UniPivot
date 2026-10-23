@@ -54,7 +54,10 @@ class AnthropicRequestBody(BaseModel):
     messages: List[AnthropicMessage]
     system: Optional[Union[str, List[Union[dict, str]]]] = None
     tools: Optional[List[dict]] = None
-    thinking: Optional[Union[dict, bool]] = None
+    # [PROTOCOL] 与 `_wants_thinking()` 的接受范围保持一致：`"adaptive"` 裸字符串
+    # 是 `{"type":"adaptive"}` 的另一种序列化，同一份声明在三条路径上必须得到
+    # 同一个结果，否则客户端换个序列化方式就会撞上 400。
+    thinking: Optional[Union[dict, bool, str]] = None
     # [TOOL-SCHEMA] Anthropic 的 count_tokens 请求与 messages 请求同构，同样可以
     # 携带 tool_choice；估算路径必须看到与真实请求相同的工具提示词，否则算出的
     # token 数在工具循环里系统性偏低，客户端会据此误判上下文预算。
