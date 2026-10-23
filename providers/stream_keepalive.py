@@ -26,11 +26,14 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from typing import AsyncGenerator, AsyncIterable, List, TypeVar
 
 from .base import get_stream_keepalive_interval
 
 T = TypeVar("T")
+
+logger = logging.getLogger("gateway.stream_keepalive")
 
 KEEPALIVE_FRAME = ": keepalive\n\n"
 
@@ -83,12 +86,26 @@ async def sse_keepalive(
     finally:
         # 客户端断连 / 上游出错时，取消仍在等待的拉取，避免泄漏一个持有上游
         # 流的幽灵任务（与 disconnect_guard 的资源回收语义一致）。
-        if pending is not None and not pending.done():
-            pending.cancel()
+        if pending is not None:
+            # 无论它是否已完成，都要**取回结局**。源恰好在我们离开时自行结束时，
+            # 这个任务已经完成且带着 `StopAsyncIteration`，取消它只是空操作，
+            # 而没人读取的异常会在回收时变成
+            # `Task exception was never retrieved`（实测网关日志里确实出现过）。
+            # 本项目所有资源泄漏都以「一条没人看的告警」的形式出现，这类噪声
+            # 正是真泄漏的藏身处，必须在源头消掉。
+            if not pending.done():
+                pending.cancel()
             try:
                 await pending
             except (asyncio.CancelledError, StopAsyncIteration):
                 pass
+            except asyncio.InvalidStateError:
+                # 已完成的任务无法再被取消（cancel 在 await 之前抛）：结局已取，
+                # 无需再做什么。
+                pass
+            except Exception as exc:  # noqa: BLE001 - 收尾路径必须绝对安全
+                # 拉取因上游异常结束：该异常已由主循环上抛过，这里只是取回结局。
+                logger.debug("挂起拉取的结局: %s: %s", type(exc).__name__, exc)
         # [C2] 取消拉取并不等于关闭源：若拉取任务在取消前刚好完成，或源本身
         # 从未被启动，取消是空操作，源生成器的 finally（上游连接、并发槽位）
         # 永远不会执行。这里显式关闭——对已结束的生成器是空操作，绝不多做。

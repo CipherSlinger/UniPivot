@@ -192,6 +192,47 @@ def test_end_to_end_slow_stream_delivers_everything():
     print("test_end_to_end_slow_stream_delivers_everything: PASSED")
 
 
+def test_outstanding_pull_exception_is_retrieved():
+    """[STREAM-KEEPALIVE] 关闭时挂起的那次拉取，其结局必须被读取。
+
+    复现：心跳插入一帧后，源恰好自行结束，消费者随即离开。`finally` 里取消的是
+    一个**已经完成**的任务——取消是空操作——而该任务的结果是
+    `StopAsyncIteration`，从未被读取。事件循环于是在回收时报告
+    `Task exception was never retrieved`。实测在真实网关日志里出现过：
+
+        Task exception was never retrieved
+        future: <Task finished ... exception=StopAsyncIteration()>
+
+    这不只是日志噪声：本项目所有异步资源泄漏都表现为「日志里一条没人看的告警」，
+    真实的泄漏就藏在这种噪声后面。取回结局后 cancel 可能因「任务已完成」而
+    抛 `InvalidStateError`，同样不能漏出去。
+    """
+    unretrieved = []
+    loop = None
+
+    async def _source():
+        yield "a"
+        await asyncio.sleep(0.12)  # 然后在心跳等待期间自然结束
+
+    async def _run():
+        nonlocal loop
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(
+            lambda l, ctx: unretrieved.append(ctx.get("exception") or ctx.get("message"))
+        )
+        gen = sse_keepalive(_source(), interval=0.05)
+        async for item in gen:
+            if item is KEEPALIVE_FRAME:
+                await asyncio.sleep(0.1)  # 让源在这里结束
+                break
+        await gen.aclose()
+        await asyncio.sleep(0.3)
+
+    asyncio.run(_run())
+    assert not unretrieved, f"挂起拉取的异常未被取回: {unretrieved}"
+    print("test_outstanding_pull_exception_is_retrieved: PASSED")
+
+
 def run_all():
     tests = [
         test_keepalive_frames_during_silence,
@@ -202,6 +243,7 @@ def run_all():
         test_all_streaming_responses_are_wrapped,
         test_keepalive_interval_reads_env,
         test_end_to_end_slow_stream_delivers_everything,
+        test_outstanding_pull_exception_is_retrieved,
     ]
     for fn in tests:
         fn()
