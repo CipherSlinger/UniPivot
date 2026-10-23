@@ -2323,6 +2323,28 @@ class FailoverRouter:
         """
         return self.cooldown_tracker._env_float("GATEWAY_STREAM_IDLE_TIMEOUT", 180.0)
 
+    def _handshake_budget(self) -> float:
+        """整条请求在**握手阶段**可以花掉的总时间（秒，默认 180）。
+
+        [BUDGET] `_first_chunk_timeout()` 是**每个候选**的上限，而派发循环会逐个
+        走完能力环里的候选——于是真正的等待是「候选数 × 每次上限」，五个节点就是
+        900 秒。这不是调参问题，是**边界挂错了层**：客户端等待的是「这条请求」，
+        而不是「第 N 次尝试」，它不知道网关内部还有几个候选；而这段时间里响应头
+        都还没发出（`execute_chat` 在构造响应之前被 await，见 H4），心跳没有运行
+        的机会，负载均衡配额与节点信号量一直被这条注定失败的请求占着。
+
+        实测（`GATEWAY_FIRST_CHUNK_TIMEOUT=1.0`，五节点全挂）：`failed after 5.0s`。
+        乘以默认的 180s 就是 900s，超过实测的客户端容忍上限（Claude Code 420s /
+        Codex 600s 仍未放弃，即 harness 先到点）。
+
+        预算**不改变**单次尝试的语义：它与每次上限取 `min()`，所以正常情况（首个
+        候选就成功）逐值不变；只有走到多个候选时才由预算封顶。剩余预算不足时不再
+        发起注定超时的尝试，直接如实报错——少一次无用上游调用，也少一次无效凭证
+        流量，这与整条避让线「不白白触碰上游」的立场一致。
+        `GATEWAY_HANDSHAKE_BUDGET=0` 关闭（回退为纯「候选数 × 每次上限」）。
+        """
+        return self.cooldown_tracker._env_float("GATEWAY_HANDSHAKE_BUDGET", 180.0)
+
     def _timeout_cooldown(self) -> float:
         """[M2] 超时失败后的冷却时长（秒，默认 60）。
 
@@ -2364,7 +2386,43 @@ class FailoverRouter:
         failover_event: Optional[FailoverEvent] = None
         primary_exc: Optional[Exception] = None
 
+        # [BUDGET] 握手总预算：整条请求（跨全部候选）在首包之前能花多久。
+        # 见 `_handshake_budget()`——单次上限乘以候选数才是缺陷，而候选数由能力环
+        # 定义决定，不由客户端决定。0 表示不设总预算（逐值回退旧行为）。
+        handshake_budget = self._handshake_budget()
+        deadline = (
+            asyncio.get_running_loop().time() + handshake_budget
+            if handshake_budget > 0
+            else None
+        )
+
         while True:
+            # [BUDGET] 握手总预算已耗尽：不再发起注定超时的尝试。
+            #
+            # 这一次判决必须发生在**进入 try 之前**。放在 try 内会让 `except` 分支
+            # 给一个从未被调用的节点记一次失败、上一份冷却——把一个「我们决定不打」
+            # 写成一个「上游失败了」，正是本项目反复记录的那类谎报。这里直接如实
+            # 报告：试过哪些节点、预算是多少。
+            if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0.05:
+                detail = "\n".join(f" - {e}" for e in composite_errors) or " - (无)"
+                logger.error(
+                    "[握手预算] 总预算 %.1fs 已耗尽（已尝试 %d 个节点），停止派发以保证"
+                    "客户端等待有上界。已记录的失败:\n%s",
+                    handshake_budget,
+                    len(tried_providers),
+                    detail,
+                )
+                raise ProviderError(
+                    f"握手总预算 {handshake_budget:.0f}s 已耗尽（已尝试 "
+                    f"{len(tried_providers)} 个节点: {', '.join(sorted(tried_providers))}），"
+                    f"剩余候选必然同样超时，故不再发起注定失败的上游调用——否则客户端"
+                    f"要再等过一整个单次上限才能拿到同一个结论。这属于上游健康问题"
+                    f"（非风控拦截，不会写入风控台账）。请检查网络与各节点状态，或用 "
+                    f"GATEWAY_HANDSHAKE_BUDGET 调整总预算。\n已记录的失败:\n{detail}",
+                    status=504,
+                    err_type="upstream_timeout",
+                )
+
             tried_providers.add(curr_provider_key)
 
             # [OPT-033] 闸门顺序的**唯一来源**：本循环不再自带一份 if/elif 副本，而是
@@ -2606,6 +2664,14 @@ class FailoverRouter:
                     # 给节点上风控冷却，只是普通的失败计数。
                     first_item: Optional[Tuple[str, dict]] = None
                     handshake_timeout = self._first_chunk_timeout()
+                    # [BUDGET] 本次尝试只能用「总预算的剩余部分」：整条请求的边界
+                    # 必须先于单次尝试的边界。这里只做**收紧**，不判决（判决在循环
+                    # 顶部，见 `_handshake_budget` 的说明）。
+                    if deadline is not None and handshake_timeout > 0:
+                        handshake_timeout = min(
+                            handshake_timeout,
+                            max(deadline - asyncio.get_running_loop().time(), 0.05),
+                        )
                     if handshake_timeout > 0:
                         # `wait_for` 的超时会取消被等待的协程——这里正是我们想要的：
                         # 超时即判定上游已死，主动取消拉取以防它作为幽灵任务持有连接。
