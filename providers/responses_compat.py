@@ -38,11 +38,12 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 
 from .anthropic_compat import (
     FREEFORM_TOOL_INPUT_KEY,
     _FREEFORM_TOOL_DECL_TYPES,
+    flatten_declared_tools,
     format_response_format_prompt,
     format_tools_system_prompt,
 )
@@ -80,6 +81,25 @@ class ResponsesRequest(BaseModel):
     # `gpt-5-codex` 这样的非推理前缀上，于是「想清楚再动手」的意图被静默丢弃。
     reasoning: Optional[Union[dict, str]] = None
     thinking: Optional[Union[dict, bool]] = None
+
+    @field_validator("tools")
+    @classmethod
+    def _flatten_namespaces(cls, tools: Optional[List[dict]]):
+        """[TOOL-LOOP] `namespace` 声明在**入口**展平成它的子工具（裸名 + 原样 schema）。
+
+        真实 Codex 0.145.0 会声明 `{"type":"namespace","name":"multi_agent_v1",
+        "tools":[{"type":"function","name":"spawn_agent",...}, ...]}`——一个装有五个
+        可调用 function 子工具的**容器**，它自身不可调用（实测客户端对
+        `name="multi_agent_v1"` 回 `unsupported call`，对裸名 `spawn_agent` 正常路由）。
+
+        在这里展平（而不是在各调用点各展一次），是因为下游有**两条**链路都要看到
+        展平结果，且它们必须一致：
+          - 提示词渲染（模型想调什么）；
+          - `resolve_allowed_tools` 的解析白名单（什么能被回传）。
+        只修提示词会让模型写出 `spawn_agent` 然后被白名单当作未声明工具丢弃，症状
+        与修复前完全一样、只是更难追。展平只有一份定义：`flatten_namespace_tools`。
+        """
+        return flatten_declared_tools(tools)
 
 
 def _responses_text_format(req: "ResponsesRequest") -> Optional[dict]:

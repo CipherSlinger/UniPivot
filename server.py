@@ -38,7 +38,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, field_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from providers import (
@@ -72,6 +72,7 @@ from providers import (
     format_anthropic_models,
     format_response_format_prompt,
     format_tools_system_prompt,
+    flatten_declared_tools,
     last_user_content,
     parse_tool_call,
     parse_tool_calls,
@@ -554,6 +555,22 @@ class ChatCompletionRequest(BaseModel):
     # 形状稍有差异的客户端在 422 上失手——判定统一交给 `_wants_thinking`。
     thinking: Union[bool, dict, str] = False
     search: bool = False
+
+    @field_validator("tools")
+    @classmethod
+    def _flatten_namespaces(cls, tools: Optional[List[dict]]):
+        """[TOOL-LOOP] `namespace` 容器展平，与 Anthropic / Responses 两条入口同一份实现。
+
+        为什么这条路径也必须展平：`format_tools_system_prompt` 自己会展平（所以提示词
+        是对的），而解析白名单 `resolve_allowed_tools` 读的是**这个模型**上的 `tools`。
+        不接这个 validator，同一条声明在提示词里是 `spawn_agent`、在白名单里是
+        `multi_agent_v1`——模型被正确告知可以调子工具，写出调用后却被当作未声明工具
+        丢弃并回传成文本，症状与修复前完全一样。
+
+        真实 Codex 只走 `/v1/responses`，因此这条路径当前不可达；但它是公开协议的
+        入口，任何 OpenAI SDK 客户端都能发出同样的声明。展平仍然只有一份定义。
+        """
+        return flatten_declared_tools(tools)
 
 
 class EmbeddingsRequest(BaseModel):

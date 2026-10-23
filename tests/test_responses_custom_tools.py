@@ -237,7 +237,7 @@ def test_stream_emits_custom_tool_events_end_to_end():
 
 
 def test_nameless_builtin_tools_do_not_render_as_empty_bullets():
-    """[TOOL-LOOP] 真实 Codex 请求里有两类**没有 `name`** 的内置工具声明。
+    r"""[TOOL-LOOP] 真实 Codex 请求里有两类**没有 `name`** 的内置工具声明。
 
     实测（codex-cli 0.145.0，`codex exec` 原始 `/v1/responses` 请求体）：
       - `{"type": "tool_search", "execution": "client", "parameters": {...}}`
@@ -275,6 +275,206 @@ def test_nameless_builtin_tools_do_not_render_as_empty_bullets():
     print("test_nameless_builtin_tools_do_not_render_as_empty_bullets: PASSED")
 
 
+# ---------------------------------------------------------------------------
+# [TOOL-LOOP] `namespace` 工具声明（真实 Codex 0.145.0 的 `multi_agent_v1`）
+#
+# 实测（`codex exec` 原始 `/v1/responses` 请求体，10 个工具里的第 6 个）：
+#
+#   {"type": "namespace", "name": "multi_agent_v1",
+#    "description": "Tools for spawning and managing sub-agents.",
+#    "tools": [{"type": "function", "name": "close_agent", "parameters": {...}},
+#              ... resume_agent / send_input / spawn_agent / wait_agent ...]}
+#
+# 也就是说：这不是一个工具，而是**五个可调用的 function 子工具的容器**。
+# 网关此前把 `namespace` 落进通用分支，取它的顶层 `name`/`description`、找不到
+# `parameters`，于是渲染成
+#
+#   - `multi_agent_v1`: Tools for spawning and managing sub-agents.
+#     Args: {}
+#
+# 两个独立的错误同时发生：
+#   1. 五个子工具的名字与**全部参数 schema** 消失 —— 模型不知道它们存在，即使
+#      猜得到名字也不知道参数（与 `apply_patch` 被告知 `Args: {}` 同一缺陷类）；
+#   2. 它被告知可调用的名字是 `multi_agent_v1`，而真实客户端**拒绝**这个名字。
+#
+# 客户端路由实测（同一个 mock 上游，只改回传的 call item 形状）：
+#   - `name="multi_agent_v1"`                    -> `unsupported call: multi_agent_v1`
+#   - `name="spawn_agent"`（裸名）                -> `collab: SpawnAgent`（已路由）
+#   - `name="close_agent"` 等裸名                 -> 路由，只有假 agent id 报错
+#   - 裸名 + `"namespace":"multi_agent_v1"`       -> `unsupported call: multi_agent_v1spawn_agent`
+#     （客户端把 namespace 与 name **无分隔符拼接**后再查表）
+#   - `multi_agent_v1.spawn_agent` / `::` / `__`  -> 全部 `unsupported call`
+#
+# 所以唯一正确的形状是：把子工具按**裸名**、带完整 schema 放进可调用列表，
+# namespace 自己不可调用（只作为分组说明）。
+# ---------------------------------------------------------------------------
+
+NS_FIXTURE = (
+    Path(__file__).resolve().parent / "fixtures" / "codex_multi_agent_v1_namespace.json"
+)
+NS_SUB_TOOLS = ("close_agent", "resume_agent", "send_input", "spawn_agent", "wait_agent")
+
+
+def _namespace_decl() -> dict:
+    return json.loads(NS_FIXTURE.read_text(encoding="utf-8"))
+
+
+def _tool_block(prompt: str, name: str) -> str:
+    """取出某个工具**自己那一块**（`- `name`: ...` 到下一个条目之前）。
+
+    断言必须打在该工具自己的块上：整段提示词里找 `"targets"` 之类的字符串，
+    可能由另一个工具的参数提供，用例就在为错误的原因通过。
+    """
+    marker = f"- `{name}`"
+    start = prompt.find(marker)
+    if start < 0:
+        return ""
+    nxt = prompt.find("\n- `", start + len(marker))
+    return prompt[start:] if nxt < 0 else prompt[start:nxt]
+
+
+def test_namespace_declaration_renders_its_sub_tools():
+    ns = _namespace_decl()
+    tools = [ns, {"type": "function", "name": "exec_command",
+                  "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}]
+
+    prompt = format_tools_system_prompt(tools)
+
+    assert "- `multi_agent_v1`: Tools for spawning and managing sub-agents." not in prompt, (
+        "namespace 仍被渲染成一个可调用工具，且参数是空的 Args: {}——"
+        "模型会去调 `multi_agent_v1`，而真实 Codex 回 `unsupported call: multi_agent_v1`。"
+        f"实测渲染:\n{_tool_block(prompt, 'multi_agent_v1')}"
+    )
+    for sub in NS_SUB_TOOLS:
+        block = _tool_block(prompt, sub)
+        assert block, (
+            f"namespace 的子工具 `{sub}` 完全没有出现在提示词里——模型不可能调用它。"
+            f"实测提示词里的工具条目: {[l for l in prompt.splitlines() if l.startswith('- `')]}"
+        )
+    # 参数 schema 必须真的到达模型（不是只补了名字）
+    assert '"required":["targets"]' in _tool_block(prompt, "wait_agent"), (
+        "wait_agent 的必填参数 targets 没有保真:\n" + _tool_block(prompt, "wait_agent")
+    )
+    assert '"required":["target"]' in _tool_block(prompt, "close_agent"), (
+        "close_agent 的必填参数 target 没有保真:\n" + _tool_block(prompt, "close_agent")
+    )
+    assert '"required":["id"]' in _tool_block(prompt, "resume_agent"), (
+        "resume_agent 的必填参数 id 没有保真:\n" + _tool_block(prompt, "resume_agent")
+    )
+    # spawn_agent 没有 required，但可选参数是它唯一的契约
+    spawn_block = _tool_block(prompt, "spawn_agent")
+    for prop in ("fork_context", "items", "message", "model", "service_tier"):
+        assert f'"{prop}"' in spawn_block, (
+            f"spawn_agent 的可选参数 `{prop}` 丢失:\n{spawn_block}"
+        )
+    # 嵌套结构（send_input.items 是对象数组）必须保真
+    send_block = _tool_block(prompt, "send_input")
+    assert '"audio_url"' in send_block and '"image_url"' in send_block, (
+        "send_input.items 的嵌套字段没有保真:\n" + send_block
+    )
+    # 同一个请求里的普通工具不受影响
+    assert "- `exec_command`" in prompt
+    print("test_namespace_declaration_renders_its_sub_tools: PASSED")
+
+
+def test_namespace_is_not_a_callable_name_but_is_explained():
+    ns = _namespace_decl()
+    prompt = format_tools_system_prompt([ns])
+    # 名字仍然让模型看得见（分组信息），但必须写明不可调用
+    ns_line = [l for l in prompt.splitlines() if "multi_agent_v1" in l]
+    assert ns_line, "namespace 的分组信息被静默丢弃了"
+    joined = " ".join(ns_line).lower()
+    assert "not callable" in joined or "not directly callable" in joined, (
+        "提示词提到了 multi_agent_v1，却没有说明它本身不可调用——"
+        f"模型会去调用它（真实客户端回 unsupported call）。实测: {ns_line}"
+    )
+    print("test_namespace_is_not_a_callable_name_but_is_explained: PASSED")
+
+
+def test_namespace_sub_tools_enter_the_parse_allowlist():
+    """解析层白名单必须与提示词一致。
+
+    [TOOL-LOOP] 提示词只是「降低概率」，白名单才是「保证结果」。如果只把子工具
+    渲染进提示词、白名单里仍是 `multi_agent_v1`，模型写出的 `spawn_agent` 调用会被
+    `_extract_tools_from_data(allowed=...)` 当作未声明工具丢弃，客户端什么也收不到
+    —— 症状与修复前一样，只是更难追。所以白名单的输入必须是**展平后**的声明，
+    而且展平只有一份定义（`flatten_namespace_tools`），由请求模型统一应用。
+    """
+    from providers.tool_streamer import resolve_allowed_tools
+
+    req = ResponsesRequest.model_validate({
+        "model": "gpt-5-codex",
+        "input": "spawn an agent",
+        "tools": [_namespace_decl(), {"type": "function", "name": "exec_command"}],
+    })
+    allowed = resolve_allowed_tools(req.tools, "auto")
+    assert allowed is not None
+    assert set(NS_SUB_TOOLS) <= allowed, (
+        f"namespace 子工具不在解析白名单里，模型调了也会被丢弃: {sorted(allowed)}"
+    )
+    assert "multi_agent_v1" not in allowed, (
+        "namespace 自己的名字进了白名单——那是一个真实客户端会拒绝的调用名"
+        f"（unsupported call）: {sorted(allowed)}"
+    )
+    assert "exec_command" in allowed, "普通工具被牵连"
+    print("test_namespace_sub_tools_enter_the_parse_allowlist: PASSED")
+
+
+class SpawnAgentProvider:
+    """上游模型按提示词契约写出 namespace 子工具的调用。"""
+
+    def __init__(self):
+        self.last_prompt = ""
+
+    async def chat(self, messages, model, conversation_id=None, **kw):
+        from providers.base import flatten_messages
+
+        self.last_prompt = flatten_messages(messages)
+        payload = json.dumps(
+            {"name": "spawn_agent", "arguments": {"message": "say pong"}},
+            ensure_ascii=False,
+        )
+        yield f"```tool_call\n{payload}\n```", {}
+        yield "", {"conversation_id": None}
+
+
+def test_namespace_sub_tool_call_round_trips_end_to_end():
+    provider = SpawnAgentProvider()
+    original = srv._make_provider
+    srv._make_provider = lambda key, client=None, **kw: provider
+    try:
+        client = TestClient(srv.app)
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "spawn an agent to say pong",
+                "tools": [_namespace_decl()],
+                "stream": False,
+            },
+        )
+        assert r.status_code == 200, r.text
+        body = r.json()
+    finally:
+        srv._make_provider = original
+
+    # 1) 模型确实被告知了这个工具的参数契约
+    assert "`spawn_agent`" in provider.last_prompt, (
+        "上游真正收到的提示词里没有 spawn_agent——模型无从调用它"
+    )
+    # 2) 调用被解析并通过白名单（否则会被当作未声明工具，作为文本返回）
+    calls = [i for i in body.get("output", []) if i.get("type") == "function_call"]
+    assert calls, (
+        "namespace 子工具的调用没有作为 function_call 回给客户端（被白名单丢弃了？）: "
+        f"{json.dumps(body, ensure_ascii=False)[:800]}"
+    )
+    assert calls[0]["name"] == "spawn_agent", (
+        f"调用名不是裸名，客户端会拒收: {calls[0]['name']!r}"
+    )
+    assert json.loads(calls[0]["arguments"])["message"] == "say pong"
+    print("test_namespace_sub_tool_call_round_trips_end_to_end: PASSED")
+
+
 def run_all():
     test_freeform_declaration_gets_an_executable_schema()
     test_freeform_call_replay_is_assistant_not_user()
@@ -283,6 +483,10 @@ def run_all():
     test_completion_emits_custom_tool_call_item()
     test_stream_emits_custom_tool_events_end_to_end()
     test_nameless_builtin_tools_do_not_render_as_empty_bullets()
+    test_namespace_declaration_renders_its_sub_tools()
+    test_namespace_is_not_a_callable_name_but_is_explained()
+    test_namespace_sub_tools_enter_the_parse_allowlist()
+    test_namespace_sub_tool_call_round_trips_end_to_end()
     print("\n✅ All Responses custom/freeform tool tests passed!")
 
 

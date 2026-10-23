@@ -382,6 +382,80 @@ def test_oversized_tool_set_still_degrades_to_a_bounded_prompt():
         assert f"Tool{i}" in text, f"工具 Tool{i} 被整条丢弃"
 
 
+# ------------------------------------------------- 7b. namespace 展平在三条协议上一致
+
+def test_namespace_declaration_flattens_on_the_openai_chat_path_too():
+    """`namespace` 的展平必须覆盖**全部三个**请求模型，而提示词与白名单必须一致。
+
+    [TOOL-LOOP] 上一轮把 `flatten_namespace_tools` 接到了 `AnthropicRequestBody` 与
+    `ResponsesRequest` 的 `tools` field_validator 上，但 OpenAI chat 的
+    `ChatCompletionRequest` 定义在 `server.py`，没有接。后果是那条路径上
+    **两处不一致**——而它们的不一致恰好是最难追的那种：
+
+        提示词里 `spawn_agent` 有完整契约（因为 `format_tools_system_prompt` 自己
+        会展平），解析白名单里却只有 `multi_agent_v1`（因为它读的是未展平的
+        `req.tools`）。
+
+    于是模型被正确告知去调 `spawn_agent`，写出调用，然后在解析端被当作「未声明
+    工具」丢弃、回传给用户当文本。症状与修复前完全一样（工具没跑起来），只是多绕
+    了一圈。实测（修复前）：
+
+        PROMPT declares spawn_agent: True     <-- 提示词说可以调
+        ALLOWLIST: ['exec_command', 'multi_agent_v1']  <-- 白名单里没有它
+
+    真实 Codex 只走 `/v1/responses`，所以这条路径当前不可达；但它是一个**公开
+    协议的入口**，任何 OpenAI SDK 客户端都可以发同样的声明。修复只需在该字段上
+    加同一个 validator——展平仍然只有一份定义。
+    """
+    import server as srv
+
+    decl = {
+        "type": "namespace",
+        "name": "multi_agent_v1",
+        "description": "Tools for spawning and managing sub-agents.",
+        "tools": [
+            {
+                "type": "function",
+                "name": "spawn_agent",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"message": {"type": "string"}},
+                },
+            }
+        ],
+    }
+    body = {
+        "model": "gpt-4o",
+        "messages": [{"role": "user", "content": "spawn an agent"}],
+        "tools": [decl, {"type": "function", "name": "exec_command",
+                         "parameters": {"type": "object", "properties": {}}}],
+    }
+
+    req = srv.ChatCompletionRequest.model_validate(body)
+    allowed = resolve_allowed_tools(req.tools, "auto")
+    assert allowed is not None
+    assert "spawn_agent" in allowed, (
+        "OpenAI chat 路径上 namespace 的子工具不在解析白名单里——模型被提示词告知"
+        f"可以调它，写出调用后会被当作未声明工具丢弃。白名单实测: {sorted(allowed)}"
+    )
+    assert "multi_agent_v1" not in allowed, (
+        "namespace 名字进了 OpenAI chat 路径的白名单——那是一个真实客户端会拒绝的"
+        f"调用名（unsupported call）: {sorted(allowed)}"
+    )
+    assert "exec_command" in allowed, f"普通工具被牵连: {sorted(allowed)}"
+
+    # 提示词与白名单来自同一份展平结果：提示词声明的东西必须能被回传。
+    prompt = format_tools_system_prompt(req.tools)
+    assert "- `spawn_agent`" in prompt, prompt
+    # 判据必须打在**可调用条目**的形状上（`- \`name\`: 描述` + `Args:`）。namespaced
+    # 说明行 `- \`multi_agent_v1\` (namespace, **not callable**)` 是刻意保留的分组
+    # 信息，把它一并否掉等于要求网关丢弃客户端明明白白声明过的事实。
+    assert "- `multi_agent_v1`:" not in prompt, (
+        "namespace 仍被渲染成可调用工具（`- `name`: 描述` + Args）:\n" + prompt
+    )
+    print("test_namespace_declaration_flattens_on_the_openai_chat_path_too: PASSED")
+
+
 # ------------------------------------------------- 8. tool_use id 往返
 
 def test_tool_use_id_is_carried_into_transcript():
@@ -423,6 +497,7 @@ def run_all():
         test_schema_budget_does_not_silently_drop_required_param_semantics,
         test_degradation_keeps_structure_enums_and_required_list,
         test_oversized_tool_set_still_degrades_to_a_bounded_prompt,
+        test_namespace_declaration_flattens_on_the_openai_chat_path_too,
         test_tool_use_id_is_carried_into_transcript,
     ]
     for fn in tests:

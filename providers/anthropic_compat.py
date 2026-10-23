@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 import re
 from typing import Any, Dict, List, Optional, Tuple, Union
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 from .base import (
     FILE_PLACEHOLDER_TEMPLATE,
     IMAGE_PLACEHOLDER,
@@ -59,6 +59,18 @@ class AnthropicRequestBody(BaseModel):
     # 携带 tool_choice；估算路径必须看到与真实请求相同的工具提示词，否则算出的
     # token 数在工具循环里系统性偏低，客户端会据此误判上下文预算。
     tool_choice: Optional[Union[str, dict]] = None
+
+    @field_validator("tools")
+    @classmethod
+    def _flatten_namespaces(cls, tools: Optional[List[dict]]):
+        """`namespace` 容器展平（对普通声明逐值不变，见 `flatten_namespace_tools`）。
+
+        Anthropic 协议本身没有 `namespace`，但「声明 → 提示词 / 白名单」这条链是
+        三个协议共用的；把展平放在请求模型上，保证任何入口的 `tools` 都只有一种
+        解释——否则同一条声明在提示词里展平、在白名单里没展平，模型写出的子工具
+        调用会被当作未声明工具丢弃（症状与修复前完全一样，只是更难追）。
+        """
+        return flatten_declared_tools(tools)
 
 
 class AnthropicMessagesRequest(AnthropicRequestBody):
@@ -467,6 +479,118 @@ _FREEFORM_TOOL_DECL_TYPES = frozenset({"custom"})
 # 两个；上限存在只是为了不让客户端用任意多个无名条目撑大提示词）。
 _NAMELESS_TOOL_NOTE_LIMIT = 8
 
+# [TOOL-LOOP] Responses 的 `namespace` 声明：**一个容器，不是工具**。
+#
+# 实测（codex-cli 0.145.0 的原始 `/v1/responses` 请求体，10 个工具里的第 6 个）：
+#
+#   {"type": "namespace", "name": "multi_agent_v1",
+#    "description": "Tools for spawning and managing sub-agents.",
+#    "tools": [{"type": "function", "name": "close_agent", "parameters": {...}},
+#              ... resume_agent / send_input / spawn_agent / wait_agent ...]}
+#
+# 旧实现把它当普通声明走通用分支：取顶层 `name`/`description`，找不到
+# `parameters`，于是渲染成 `- \`multi_agent_v1\`: …` + `Args: {}`。两个错误同时发生：
+# 五个子工具的名字与**全部参数 schema** 消失（模型无从调用），而它被告知可调用的
+# 名字是 `multi_agent_v1` —— 一个真实客户端会拒绝的名字。客户端路由实测：
+#   `name="multi_agent_v1"`                  -> `unsupported call: multi_agent_v1`
+#   `name="spawn_agent"`（裸名）              -> `collab: SpawnAgent`（已路由）
+#   裸名 + `"namespace":"multi_agent_v1"`     -> `unsupported call: multi_agent_v1spawn_agent`
+#     （客户端把 namespace 与 name **无分隔符拼接**后再查表）
+#   `multi_agent_v1.spawn_agent` / `::` / `__` -> 全部 `unsupported call`
+#
+# 所以唯一正确的形状是：子工具按**裸名**、带完整 schema 进入可调用列表；namespace
+# 本身不可调用，只作为分组说明。展平只有一份定义（`flatten_namespace_tools`），
+# 请求模型与提示词渲染都调它 —— 提示词决定「模型想调什么」，白名单决定「什么能被
+# 回传」，两者必须来自同一份展平结果，否则模型写出的 `spawn_agent` 会被当作未声明
+# 工具丢弃，症状与修复前完全一样。
+_NAMESPACE_TOOL_DECL_TYPE = "namespace"
+
+# 展平后子工具携带的分组标记（网关内部键，前缀 `_` 表示不来自客户端）。
+# 它只用于渲染「这些工具属于哪个 namespace」的说明行；客户端永远看不到工具列表。
+_NAMESPACE_GROUP_KEY = "_namespace"
+
+# 嵌套 namespace 的展开深度上限：真实抓包只有一层，上限只为防御自引用报文。
+_NAMESPACE_MAX_DEPTH = 4
+_NAMESPACE_GROUP_NOTE_LIMIT = 8
+
+
+def flatten_declared_tools(tools: Any) -> Any:
+    """请求体里 `tools` 字段的统一入口：`None` 原样返回，其余走 namespace 展平。
+
+    两个请求模型（`AnthropicRequestBody` / `ResponsesRequest`）共用这一份，
+    避免「同一份声明有两种解释」——提示词已经展平、白名单没有展平的话，模型写出的
+    子工具调用会被当作未声明工具丢弃，症状与修复前一样。
+    """
+    if tools is None:
+        return None
+    return flatten_namespace_tools(tools)
+
+
+def flatten_namespace_tools(tools: Any, _depth: int = 0) -> list:
+    """把 `namespace` 容器展平成其可调用的子工具（裸名 + 原样 schema）。
+
+    不修改调用方的 dict（请求体属于客户端，展平结果是网关内部视图）；返回的每个
+    子工具都带上 `_namespace` 标记，供提示词渲染分组说明。非 `namespace` 的声明
+    原样保留，顺序不变——普通工具不该因为这条规则被重排。
+    """
+    if not isinstance(tools, list):
+        return tools if isinstance(tools, list) else []
+
+    out: list = []
+    for t in tools:
+        if not (isinstance(t, dict) and t.get("type") == _NAMESPACE_TOOL_DECL_TYPE):
+            out.append(t)
+            continue
+
+        sub = t.get("tools")
+        if not isinstance(sub, list) or not sub or _depth >= _NAMESPACE_MAX_DEPTH:
+            # 空的 / 过深的 namespace 没有可调用的子工具。它本身不可调用，也没有
+            # 任何 schema 可以交给模型，静默丢弃是唯一不产生错误契约的选择。
+            continue
+
+        ns_name = t.get("name")
+        ns_name = ns_name.strip() if isinstance(ns_name, str) else ""
+        for child in flatten_namespace_tools(sub, _depth + 1):
+            if isinstance(child, dict):
+                child = dict(child)
+                if ns_name and not child.get(_NAMESPACE_GROUP_KEY):
+                    child[_NAMESPACE_GROUP_KEY] = ns_name
+            out.append(child)
+    return out
+
+
+def _namespace_group_notes(tools: Any) -> List[str]:
+    """按声明顺序汇总「哪些工具属于哪个 namespace」的说明行。
+
+    namespace 本身**不是**可调用的名字（真实 Codex 会回 `unsupported call`），
+    但它携带的分组信息是客户端明明白白声明过的，不该静默消失。说明行必须写明
+    「不可调用」，否则模型会去调它——那正是修复前的错误输出形态。
+    """
+    groups: List[tuple] = []
+    for t in tools if isinstance(tools, list) else []:
+        if not isinstance(t, dict):
+            continue
+        ns = t.get(_NAMESPACE_GROUP_KEY)
+        if not (isinstance(ns, str) and ns):
+            continue
+        name = t.get("function", {}).get("name") if isinstance(t.get("function"), dict) else t.get("name")
+        if isinstance(name, str) and name.strip():
+            for g_name, members in groups:
+                if g_name == ns:
+                    members.append(name.strip())
+                    break
+            else:
+                groups.append((ns, [name.strip()]))
+
+    notes = []
+    for ns, members in groups[:_NAMESPACE_GROUP_NOTE_LIMIT]:
+        listed = ", ".join(f"`{m}`" for m in members)
+        notes.append(
+            f"- `{ns}` (namespace, **not callable**): its tools {listed} are declared "
+            "above under their own names — call those directly, never the namespace."
+        )
+    return notes
+
 
 def _nameless_tool_note(tool: dict, desc: str) -> str:
     """给「没有 name、因此不可调用」的内置工具生成一句说明。
@@ -516,6 +640,10 @@ def format_tools_system_prompt(
     """
     if not tools:
         return ""
+    # [TOOL-LOOP] `namespace` 是容器不是工具：先展平，子工具按裸名、带完整 schema
+    # 进入可调用列表。在这里（而不是只在上游请求模型里）展平，是为了让**任何**
+    # 把原始声明直接喂进来的调用方也得到正确的提示词——提示词是模型唯一的契约。
+    tools = flatten_namespace_tools(tools)
     lines = [
         "## Tools Available\n"
         "You have access to the following tools to accomplish tasks:",
@@ -523,6 +651,10 @@ def format_tools_system_prompt(
 
     rendered: List[str] = []
     nameless_notes: List[str] = []
+    # namespace 的分组说明与「无名内置工具」是两件事：后者根本没有名字，前者有名字
+    # 但**不可调用**（真实 Codex 对 `multi_agent_v1` 回 `unsupported call`）。放进同一
+    # 个「没有可调用名字」的标题下会把原因说错，而模型的下一步动作正是由原因决定的。
+    namespace_notes: List[str] = _namespace_group_notes(tools)
 
     # 第一遍：规范化每条声明（取名字/描述/schema，合成 freeform schema，
     # 抽出不可调用的无名条目）。先全量规范化再定档，是因为「档位」必须由**整份
@@ -593,6 +725,13 @@ def format_tools_system_prompt(
             rendered.append(f"- `{name}`: {desc}\n  Args: {schema_json}")
 
     lines.extend(rendered)
+    if namespace_notes:
+        lines.append(
+            "\n## Tool Namespaces (not callable)\n"
+            "The client grouped some of the tools above into a namespace. The namespace "
+            "name itself is NOT a tool: call the member tools directly by their own names."
+        )
+        lines.extend(namespace_notes)
     if nameless_notes:
         lines.append(
             "\n## Client-Side Internal Tools (not directly callable)\n"

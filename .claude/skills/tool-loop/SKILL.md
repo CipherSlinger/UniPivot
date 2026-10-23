@@ -29,6 +29,57 @@ description: Tool-calling correctness ownership — prompt schema fidelity, pars
 - **「工具 schema 超预算时按位置降级是可接受的取舍」**：**证伪，是真实缺陷**（本轮已修）。实测真实 Claude Code 抓包（20 工具，schema 合计 14700 > 12000 预算）：`WebFetch/WebSearch/Workflow/Write` 被整条降级成 `Write(file_path: string (required), content: string (required))`，`file_path` 那句「must be absolute, not relative」**整句消失**。这是最高频的写文件工具，而**网关不做任何参数校验**（`grep jsonschema/validate` 全仓零命中），所以提示词是唯一契约。更根本的判据是**任意性**：把同一数组反过来，保真的变成 `Write/WebFetch`，降级的变成 `Bash/Agent` —— 哪个工具能拿到自己的契约由数组下标决定，没有任何依据。
 - **「升预算（12000 → 更大）是正确修法」**：证伪。升预算是**把悬崖推远一格**：真实抓包 20 工具就要 14700，再多几个工具照样溢出，且溢出时仍然是「整条丢结构」。且预算存在的理由是上下文有限，不该用调参掩盖降级策略错误。
 
+## 本轮已关闭（[TOOL-LOOP] `namespace` 工具声明 → 子工具被整段吞掉）
+
+- **实测抓包**（`codex exec` 0.145.0 原始 `/v1/responses` 请求体，10 个工具里的第 6 个）：
+  ```json
+  {"type":"namespace","name":"multi_agent_v1",
+   "description":"Tools for spawning and managing sub-agents.",
+   "tools":[{"type":"function","name":"close_agent","parameters":{...}},
+            ... resume_agent / send_input / spawn_agent / wait_agent ...]}
+  ```
+  它**不是工具，是容器**：五个带完整 schema 的 function 子工具。抓包存为
+  `tests/fixtures/codex_multi_agent_v1_namespace.json`。
+- **缺陷**：`format_tools_system_prompt` 把它当普通声明走通用分支，取顶层
+  `name`/`description`、找不到 `parameters`，实测渲染成
+  ```
+  - `multi_agent_v1`: Tools for spawning and managing sub-agents.
+    Args: {}
+  ```
+  两个错误叠加：(a) 五个子工具的名字与**全部参数 schema** 消失，模型根本不知道
+  它们存在；(b) 被告知可调用的名字是 `multi_agent_v1`，而真实客户端**拒绝**它。
+  这与 `apply_patch` 被告知 `Args: {}` 属同一缺陷类，只是多了一个错名。
+- **客户端路由实测**（同一 mock 上游，只改回传 call item 的形状）：
+  | 回传的 call | 真实 Codex 结果 |
+  |---|---|
+  | `name="multi_agent_v1"` | `unsupported call: multi_agent_v1`（重试数百次） |
+  | `name="spawn_agent"`（裸名） | `collab: SpawnAgent` → `agent thread limit reached`（**已路由**） |
+  | `close_agent`/`resume_agent`/`send_input`/`wait_agent` 裸名 | 已路由，只有假 agent id 报错 |
+  | 裸名 + `"namespace":"multi_agent_v1"` | `unsupported call: multi_agent_v1spawn_agent`（客户端把 namespace 与 name **无分隔符拼接**再查表） |
+  | `multi_agent_v1.spawn_agent` / `::` / `__` | 全部 `unsupported call` |
+  结论：唯一正确形状是**裸名 + 完整 schema**。
+- **修法**：`flatten_namespace_tools()`（`providers/anthropic_compat.py`）是展平的
+  唯一实现，两处调用：(1) `format_tools_system_prompt` 入口（任何调用方都能拿到
+  正确提示词）；(2) `AnthropicRequestBody` / `ResponsesRequest` 的
+  `tools` field_validator（**解析白名单**必须看到同一份展平结果）。只修提示词会让
+  模型写出 `spawn_agent` 然后被 `resolve_allowed_tools` 当作未声明工具丢弃——症状与
+  修复前一样，只是更难追。namespace 自己的名字**不进**可调用列表，改为单独一节
+  `## Tool Namespaces (not callable)` 说明分组，与「无名内置工具」分开（原因不同：
+  后者没有名字，前者有名字但不可调用）。
+- **零回归**：非 `namespace` 声明原样透传、顺序不变；展平只发生在请求模型入口，
+  不修改客户端报文。真实抓包 10 工具 → 13 个可调用工具，`(None, 300)` 档装下
+  （12154 < 12000+ 预算），`spawn_agent` 的可选参数与 `send_input.items` 的嵌套字段
+  全部保真。
+- **测试**：`tests/test_responses_custom_tools.py` 新增 4 例（真实 fixture + 提示词
+  保真/不可调用说明/白名单/端到端往返）。修复前实测红，报错原文：
+  `namespace 仍被渲染成一个可调用工具，且参数是空的 Args: {}——模型会去调
+  \`multi_agent_v1\`，而真实 Codex 回 \`unsupported call: multi_agent_v1\``。
+- **遗留（需 PM 决策，不在本模块可改范围）**：OpenAI chat 协议的
+  `ChatCompletionRequest` 定义在 `server.py`，它的 `req.tools` 没有经过展平，���以
+  那条路径上提示词正确、白名单仍只有 `multi_agent_v1`。真实 Codex 只走
+  `/v1/responses`，因此当前不可达；修法是在 `server.py` 的该字段上加同一个
+  validator（或让 `resolve_allowed_tools` 内部展平，但那会把展平散到第二处）。
+
 ## 本轮已关闭（[TOOL-SCHEMA] 预算降级保真度）
 - **缺陷**：`format_tools_system_prompt` 超预算时按**声明位置**整条降级为 `_compact_args_summary`（`param: type (required)`），丢掉参数描述、`enum`、嵌套对象字段名、数组元素类型。实测 16 个 FULL / 4 个 COMPACT，切点固定在 index 16。
 - **修法**：改为**统一的描述压缩阶梯** `_TOOL_SCHEMA_DESCRIPTION_LADDER`（`(必填参数描述上限, 其他描述上限)`，从「完全不压」到 `(0,0)`）。先规范化全部声明，再按**整份工具集的总成本**选「刚好装进预算」的最轻一档，所有工具**同一档**渲染。结构（type/required/enum/items/properties/nested）在任何档位都完整保留；只有自然语言描述被压缩，且**必填参数的描述拿更高额度**（必填参数的语义是「填错就失败」，可选参数更多是「什么时候用它」）。
