@@ -142,6 +142,39 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
 _TOOL_SCHEMA_MAX_DESCRIPTION = 300      # 单个参数/字段 description 的截断长度
 _TOOL_SCHEMA_TOTAL_BUDGET = 12000       # 所有工具 schema 渲染文本的总预算（字符）
 _TOOL_SCHEMA_DROP_KEYS = ("$schema", "title", "definitions", "$defs")
+
+# [TOOL-SCHEMA] 预算不够时**怎么**降级：先压描述文本，永远不丢结构。
+#
+# 旧实现按**声明位置**整条降级：预算一满，后面每个工具都退回
+# `name(param: type (required))`，参数描述、enum、嵌套结构、数组元素类型全部消失。
+# 真实 Claude Code 抓包（20 个工具，schema 合计 14700 字符 > 12000 预算）因此精确地
+# 把最后四个工具（WebFetch/WebSearch/Workflow/Write）挤成摘要 —— 于是 `Write` 的
+# `file_path` 只剩 `file_path: string (required)`，那句「**必须是绝对路径，不能是
+# 相对路径**」整句消失。`Write` 是最常用的 agent 工具，而网关**不做任何参数校验**
+# （全仓没有 schema 校验器），所以这句提示词就是唯一的契约。
+#
+# 更根本的问题是**任意性**：把同一个数组反过来，保真的变成 Write/WebFetch，降级的
+# 变成 Bash/Agent —— 一个工具能不能拿到自己的契约，不能由它在数组里的下标决定。
+#
+# 现在改为**统一的描述压缩阶梯**：所有工具走同一档，档位由「让整体刚好装进预算」的
+# 最小压缩量决定。结构性信息（type/required/enum/items/properties/nested）在任何
+# 档位都完整保留，被压缩的只有**自然语言描述**，而且**必填参数的描述拿到更高额度**：
+# 必填参数是模型必须填的，它的语义约束（绝对路径、格式、范围）是「填错就失败」的
+# 信息；可选参数的描述更多是「什么时候用它」的偏好。
+#
+# 实测（真实 20 工具抓包）：opt=300 -> 14700（超），opt=100 -> 11586（装得下），
+# 于是整份抓包**全部 20 个工具都保住完整结构**，且必填参数描述保留原文。
+_TOOL_SCHEMA_DESCRIPTION_LADDER = (
+    # (必填参数描述上限, 其他描述上限)；None 表示不压缩（用 _TOOL_SCHEMA_MAX_DESCRIPTION）
+    (None, _TOOL_SCHEMA_MAX_DESCRIPTION),   # 先试完全不压（常规情形）
+    (None, 160),
+    (None, 120),
+    (None, 100),
+    (None, 80),
+    (160, 40),
+    (80, 0),
+    (0, 0),                                  # 只留结构，描述全压掉
+)
 # 字面量键：其值是**数据**而非子 schema，必须原样保留、不得递归裁剪。
 _TOOL_SCHEMA_LITERAL_KEYS = ("default", "const", "enum", "examples")
 
@@ -238,6 +271,77 @@ def _render_schema_json(schema: Any) -> str:
     if pruned in ({"type": "object"}, {}):
         return "{}"
     return json.dumps(pruned, separators=(",", ":"), ensure_ascii=False)
+
+
+def _cap_descriptions(
+    schema: Any,
+    *,
+    required_cap: Optional[int],
+    other_cap: Optional[int],
+) -> Any:
+    """按「必填参数 / 其他」两档压缩 schema 里的 description 文本。
+
+    只动 `description` 字段本身，**绝不**删键、删结构或删 enum：type / required /
+    items / properties / enum / 嵌套对象在任何档位下都原样保留。`None` 表示该档
+    不压缩（沿用 `_TOOL_SCHEMA_MAX_DESCRIPTION` 的既有截断）。
+
+    必填与否是**在每一层 properties 上**判定的：嵌套对象里的必填字段同样享受
+    更高额度 —— 判断依据始终是「这个字段对模型是不是必填」，而不是它位于第几层。
+    """
+    if not isinstance(schema, dict):
+        return schema
+
+    def walk(node: Any, this_cap: Optional[int]) -> Any:
+        if isinstance(node, list):
+            return [walk(v, this_cap) for v in node]
+        if not isinstance(node, dict):
+            return node
+        required = {
+            r for r in (node.get("required") or []) if isinstance(r, str)
+        } if isinstance(node.get("required"), list) else set()
+        out: Dict[str, Any] = {}
+        for key, value in node.items():
+            if key == "description":
+                text = value if isinstance(value, str) else str(value)
+                if this_cap is not None and len(text) > this_cap:
+                    text = text[:this_cap]
+                # 压到空串的 description 是纯噪声（`"description":""`），直接丢弃：
+                # `_prune_schema` 保留 description 是有信息量时才有意义。
+                if text:
+                    out[key] = text
+                continue
+            if key == "properties" and isinstance(value, dict):
+                out[key] = {
+                    prop: walk(
+                        sub,
+                        required_cap if prop in required else other_cap,
+                    )
+                    for prop, sub in value.items()
+                }
+                continue
+            if key == "required":
+                out[key] = value
+                continue
+            out[key] = walk(value, this_cap)
+        return out
+
+    return walk(schema, other_cap)
+
+
+def _render_schema_json_capped(
+    schema: Any,
+    *,
+    required_cap: Optional[int],
+    other_cap: Optional[int],
+) -> str:
+    """先按两档压缩描述，再走既有的确定性裁剪/渲染流程。"""
+    if not isinstance(schema, dict):
+        return "{}"
+    return _render_schema_json(
+        _cap_descriptions(
+            schema, required_cap=required_cap, other_cap=other_cap
+        )
+    )
 
 
 def _compact_args_summary(schema: Any) -> str:
@@ -358,7 +462,10 @@ def format_tools_system_prompt(
     参数描述、required/additionalProperties 等全部保留），只在信息量为零处裁剪：
     丢弃 `$schema`/`title`/`additionalProperties: true`/未被引用的 `definitions`/`$defs`，
     截断超过 300 字符的 description、丢弃空 `properties`/`required`。整体渲染文本超过
-    {budget} 字符时，溢出的工具退回旧的 `param: type (required)` 摘要，前 N 个保持保真。
+    {budget} 字符时**不按位置降级**，而是对所有工具统一走
+    `_TOOL_SCHEMA_DESCRIPTION_LADDER`：取「刚好装进预算」的最轻一档压缩**描述文本**，
+    结构（type/required/enum/items/嵌套）在任何档位都完整保留，且必填参数的描述
+    拿到更高额度。工具能否拿到自己的契约因此与它在数组里的下标无关。
 
     `tool_choice` 为仅关键字参数，用于追加一条客户端约束指令（none/required/指定工具）；
     无法识别的形状不追加任何内容，绝不抛错。
@@ -372,9 +479,11 @@ def format_tools_system_prompt(
 
     rendered: List[str] = []
     nameless_notes: List[str] = []
-    schema_budget_used = 0
-    budget_exhausted = False
 
+    # 第一遍：规范化每条声明（取名字/描述/schema，合成 freeform schema，
+    # 抽出不可调用的无名条目）。先全量规范化再定档，是因为「档位」必须由**整份
+    # 工具集**的成本决定，而不是边遍历边判断 —— 按位置决定就是旧缺陷本身。
+    callable_tools: List[Tuple[str, str, dict]] = []
     for t in tools:
         if not isinstance(t, dict):
             continue
@@ -413,16 +522,30 @@ def format_tools_system_prompt(
             if note and len(nameless_notes) < _NAMELESS_TOOL_NOTE_LIMIT:
                 nameless_notes.append(note)
             continue
-        name = name.strip()
+        callable_tools.append((name.strip(), desc, schema))
 
-        schema_json = _render_schema_json(schema)
-        if budget_exhausted or schema_budget_used + len(schema_json) > _TOOL_SCHEMA_TOTAL_BUDGET:
-            # 预算耗尽后的溢出工具：降级为旧摘要。降级是粘性的——一旦触发，
-            # 后续工具一律走摘要，保证「前 N 个保真」的确定性切分。
-            budget_exhausted = True
+    # 第二遍：选档。取「整体刚好装进预算」的最轻压缩档；所有工具**同一档**渲染。
+    # 一档都装不下（>=40 个巨型工具）时才退回紧凑摘要兜底，保证提示词仍有界。
+    tier: Optional[Tuple[Optional[int], Optional[int]]] = None
+    for required_cap, other_cap in _TOOL_SCHEMA_DESCRIPTION_LADDER:
+        costs = [
+            len(_render_schema_json_capped(
+                schema, required_cap=required_cap, other_cap=other_cap))
+            for _, _, schema in callable_tools
+        ]
+        if sum(costs) <= _TOOL_SCHEMA_TOTAL_BUDGET:
+            tier = (required_cap, other_cap)
+            break
+
+    if tier is None:
+        # 病态集合：结构保真也装不下，退回紧凑摘要（每个工具仍保留名字与类型骨架）。
+        for name, desc, schema in callable_tools:
             rendered.append(f"- `{name}({_compact_args_summary(schema)})`: {desc}")
-        else:
-            schema_budget_used += len(schema_json)
+    else:
+        required_cap, other_cap = tier
+        for name, desc, schema in callable_tools:
+            schema_json = _render_schema_json_capped(
+                schema, required_cap=required_cap, other_cap=other_cap)
             rendered.append(f"- `{name}`: {desc}\n  Args: {schema_json}")
 
     lines.extend(rendered)

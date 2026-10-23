@@ -336,6 +336,57 @@ def test_tool_choice_named_tool_reaches_prompt():
 
 # ---------------------------------------------------------------- F. 伪造防护
 
+def test_required_param_semantics_reach_the_upstream_prompt():
+    """**端到端**：真实 20 工具集下，`Write.file_path` 的「绝对路径」要求必须出现在
+    上游**真正收到**的提示词里。
+
+    [TOOL-SCHEMA] 只断言 `format_tools_system_prompt` 的返回值是不够的：修复若只
+    活在辅助函数里、而真实请求路径没调用它，单点测试照样绿。这里走完整的
+    `/v1/messages` 路径，断言 provider 收到的 messages 里含有那句语义约束。
+
+    实测（修复前）：真实抓包 20 个工具、schema 合计 14700 字符 > 12000 预算，
+    旧实现按位置把后 4 个（WebFetch/WebSearch/Workflow/Write）降级成
+    `Write(file_path: string (required), content: string (required))` ——
+    `file_path` 的「must be absolute, not relative」整句消失。网关不做任何参数
+    校验，所以这段提示词是**唯一**的契约。
+    """
+    with open(Path(__file__).resolve().parent / "fixtures" / "claude_code_20_tools.json",
+              encoding="utf-8") as f:
+        claude_tools = json.load(f)
+
+    captured = _with_provider(
+        [("ok", {})],
+        lambda: _client().post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-7-sonnet",
+                "max_tokens": 128,
+                "messages": [{"role": "user", "content": "write a file"}],
+                "tools": claude_tools,
+            },
+        ),
+    )
+    prompt = "\n".join(str(m.get("content", "")) for m in captured)
+
+    # 必须断言 **Write 自己那一块**，而不是整段提示词里能找到这句话：
+    # `NotebookEdit.notebook_path` 的描述里也有「(must be absolute, not relative)」，
+    # 用整段搜索会在修复前就为错误的原因通过（实测：整段搜索 pre-fix 也是 True）。
+    lines = prompt.split("\n")
+    write_idx = next((i for i, l in enumerate(lines) if l.startswith("- `Write")), None)
+    assert write_idx is not None, "上游提示词里根本没有 Write 声明"
+    write_block = "\n".join(lines[write_idx:write_idx + 2])
+    assert "must be absolute, not relative" in write_block, (
+        "上游收到的提示词里丢失了 Write.file_path 的绝对路径要求（预算降级按位置吃掉了它）:\n"
+        f"{write_block[:1500]}"
+    )
+    assert '"required":["file_path","content"]' in write_block, (
+        f"Write 的 required 结构丢失:\n{write_block[:1500]}"
+    )
+    # 结构同时必须在：枚举不能被降级吃掉。
+    assert '"enum":["sonnet","opus","haiku","fable"]' in prompt, "Agent.model 的 enum 丢失"
+    print("test_required_param_semantics_reach_the_upstream_prompt: PASSED")
+
+
 def test_reasoning_replay_is_not_a_user_message():
     """Codex 回放的 reasoning item 不得变成一段 JSON 用户输入。
 
@@ -752,6 +803,7 @@ def run_all():
         test_tool_choice_named_tool_reaches_prompt,
         test_tool_choice_none_suppresses_tool_calls_everywhere,
         test_tool_choice_named_tool_filters_other_tools,
+        test_required_param_semantics_reach_the_upstream_prompt,
         test_reasoning_replay_is_not_a_user_message,
         test_adaptive_thinking_is_not_silently_disabled,
         test_codex_reasoning_object_enables_thinking,
