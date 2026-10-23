@@ -147,10 +147,73 @@ def test_shared_budget_still_bounds_total_time():
     print(f"test_shared_budget_still_bounds_total_time: PASSED ({elapsed:.2f}s)")
 
 
+def test_fast_failures_leave_the_whole_remainder_to_the_survivor():
+    """先失败的候选必须**把时间还回去**，让后面的节点拿到更大份额。
+
+    这是公平分摊的安全性质：真实故障里前几个节点通常「立刻断/立刻 5xx」，
+    几十毫秒就结束，若它们预占了份额而不归还，真正健康的那个节点反而只能拿到
+    一小份、被误判为超时。份额按**剩余预算 / 剩余未尝试数**计算，每失败一次
+    分母就变小，所以最后一个候选恒拿到全部剩余预算。
+
+    这里用「4 个立刻失败 + 1 个需要 2.5s 才吐首包」验证：若份额不归还，
+    健康节点只有 budget/5 = 1.0s，会被杀掉。
+    """
+    router = _router()
+    _env(
+        GATEWAY_FIRST_CHUNK_TIMEOUT="30",
+        GATEWAY_HANDSHAKE_BUDGET="5.0",
+        GATEWAY_STREAM_IDLE_TIMEOUT="5",
+    )
+
+    class _FastFail:
+        def __init__(self, key):
+            self.key = key
+
+        async def chat(self, *a, **kw):
+            raise RuntimeError(f"{self.key} 立刻失败")
+            yield "", {}  # noqa: unreachable - 让它保持异步生成器
+
+    class _SlowButHealthy:
+        def __init__(self, key):
+            self.key = key
+
+        async def chat(self, *a, **kw):
+            await asyncio.sleep(2.5)
+            yield "慢但健康", {"conversation_id": f"{self.key}_c"}
+            yield "", {"conversation_id": f"{self.key}_c"}
+
+    # FLAGSHIP 环序固定为 qwen -> glm -> kimi -> doubao -> deepseek，因此把慢节点放在
+    # **最后一位**：前面四个各自立刻失败，每失败一个分母就小一，最后一位拿全部剩余。
+    providers = {
+        "qwen": _FastFail("qwen"),
+        "glm": _FastFail("glm"),
+        "kimi": _FastFail("kimi"),
+        "doubao": _FastFail("doubao"),
+        "deepseek": _SlowButHealthy("deepseek"),
+    }
+
+    async def go():
+        stream, _e, _p = await router.execute_chat(
+            "qwen", "Qwen", lambda k: providers[k], {"model": "Qwen"}
+        )
+        return [item async for item in stream]
+
+    try:
+        got = asyncio.run(asyncio.wait_for(go(), timeout=25.0))
+    except ProviderError as exc:
+        raise AssertionError(
+            f"健康但较慢的候选被误杀（{exc.err_type}）：失败候选没有把预占的"
+            f"份额还回来，导致它只拿到 budget/5 = 1.0s，而它需要 2.5s"
+        )
+    assert any("慢但健康" in d for d, _m in got), got
+    print("test_fast_failures_leave_the_whole_remainder_to_the_survivor: PASSED")
+
+
 def run_all():
     test_budget_is_shared_so_a_late_candidate_still_gets_a_chance()
     test_shared_budget_still_bounds_total_time()
-    print("\n✅ All handshake budget fairness tests passed! (2 cases)")
+    test_fast_failures_leave_the_whole_remainder_to_the_survivor()
+    print("\n✅ All handshake budget fairness tests passed! (3 cases)")
 
 
 if __name__ == "__main__":
