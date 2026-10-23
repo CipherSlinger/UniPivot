@@ -338,6 +338,173 @@ def test_stop_sequence_is_never_reported_as_an_empty_string():
     print("test_stop_sequence_is_never_reported_as_an_empty_string: PASSED")
 
 
+# ------------------------------------------- 9. count_tokens 与 messages 同构
+
+
+def test_count_tokens_accepts_every_system_shape_messages_accepts():
+    """[PROTOCOL] 同一个请求体，`/v1/messages` 接受而 `/v1/messages/count_tokens` 400。
+
+    两个端点描述的是**同一个** Anthropic 请求体，却各有一份 pydantic 模型：
+    `AnthropicCountTokensRequest.system` 是 `Optional[Union[str, List[dict]]]`，
+    `AnthropicMessagesRequest.system` 是 `Optional[Union[str, List[Union[dict, str]]]]`。
+    于是 `"system": ["you are terse"]`（字符串列表，Claude Code 与 SDK 都会发）
+    在 messages 上合法、在 count_tokens 上被 400 拒绝：
+
+        system -> list[dict[any,any]] -> 0: Input should be a valid dictionary
+
+    Claude Code 在每次请求前用 count_tokens 做上下文预算判断，400 会让它直接
+    失败，而用户看到的只是「agent 不动了」。这里断言的是**性质**：凡是 messages
+    接受的 system 形状，count_tokens 必须接受（两处同构，不是逐个补类型）。
+    """
+    shapes = [
+        "you are terse",                                            # 裸字符串
+        ["you are terse"],                                          # 字符串列表（实测 400）
+        [{"type": "text", "text": "you are terse"}],                # 块列表
+        [{"type": "text", "text": "a"}, {"type": "text", "text": "b"}],
+        ["a", {"type": "text", "text": "b"}],                       # 混合
+    ]
+
+    default_factory = srv._make_provider
+    ScriptedProvider.script = [("ok", {})]
+    srv._make_provider = lambda key: ScriptedProvider()
+    try:
+        client = TestClient(srv.app)
+        for system in shapes:
+            body = {
+                "model": "claude-3-7-sonnet",
+                "max_tokens": 16,
+                "system": system,
+                "messages": [{"role": "user", "content": "hi"}],
+            }
+            r_msg = client.post("/v1/messages", json=body)
+            assert r_msg.status_code == 200, (
+                f"/v1/messages 拒绝了 system={system!r}: {r_msg.status_code} {r_msg.text[:200]}"
+            )
+            r_cnt = client.post("/v1/messages/count_tokens", json=body)
+            assert r_cnt.status_code == 200, (
+                f"/v1/messages/count_tokens 拒绝了 messages 接受的 system={system!r}: "
+                f"{r_cnt.status_code} {r_cnt.text[:200]}"
+            )
+            assert isinstance(r_cnt.json().get("input_tokens"), int), r_cnt.text[:200]
+    finally:
+        srv._make_provider = default_factory
+    print("test_count_tokens_accepts_every_system_shape_messages_accepts: PASSED")
+
+
+def test_count_tokens_cache_key_covers_tool_choice():
+    """[PROTOCOL] 同一端点上的第二处「同一份事实两种解释」：`tool_choice` 不进指纹。
+
+    `compute_count_key` 只取 messages/system/tools，而 `tool_choice` 会改变送给
+    模型的工具提示词（`_tool_choice_directive` 追加一句约束）。于是缓存键相同、
+    实际提示词不同：先到的 `auto` 估计被 `none` 请求命中。实测（清空缓存后逐个
+    测量）：`none` = 314、`auto` = 290；先发 `none` 再发 `auto`，两次都得到 314，
+    `hits` 涨了 1——第二个请求拿到的是一个它自己的提示词算不出来的数。
+
+    Claude Code 用这个数判断上下文预算，系统性偏低/偏高都会让它误判何时压缩。
+    与 SingleFlight 的 `compute_key` 同一条纪律：**能改变输出的字段必须进指纹**，
+    且加入字段只会减少共享、永远不会造成错误共享。
+    """
+    from providers.token_counter_cache import token_counter_cache
+
+    tools = [{"name": "Read", "description": "read",
+              "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}}]
+    base = {"model": "claude-3-7-sonnet",
+            "messages": [{"role": "user", "content": "hi"}], "tools": tools}
+
+    client = TestClient(srv.app)
+    token_counter_cache.clear()
+
+    # 逐个清空缓存测量：这两个请求的提示词不同，token 数必须不同。
+    token_counter_cache.clear()
+    none_only = client.post("/v1/messages/count_tokens",
+                            json={**base, "tool_choice": "none"}).json()["input_tokens"]
+    token_counter_cache.clear()
+    auto_only = client.post("/v1/messages/count_tokens",
+                            json={**base, "tool_choice": "auto"}).json()["input_tokens"]
+    assert none_only != auto_only, (
+        f"tool_choice 会改变工具提示词，估计值却相同 ({none_only})——"
+        "说明估算路径根本没看到 tool_choice"
+    )
+
+    # 不清缓存连发：若指纹漏掉 tool_choice，第二个请求会命中第一个的缓存。
+    token_counter_cache.clear()
+    first = client.post("/v1/messages/count_tokens",
+                        json={**base, "tool_choice": "none"}).json()["input_tokens"]
+    second = client.post("/v1/messages/count_tokens",
+                         json={**base, "tool_choice": "auto"}).json()["input_tokens"]
+    assert (first, second) == (none_only, auto_only), (
+        "缓存命中把不同 tool_choice 的估计混为一谈："
+        f"逐测 ({none_only}, {auto_only}) vs 连发 ({first}, {second})"
+    )
+    token_counter_cache.clear()
+    print("test_count_tokens_cache_key_covers_tool_choice: PASSED")
+
+
+def test_count_tokens_sees_the_same_tools_prompt_as_messages():
+    """[PROTOCOL] 估算路径与真实路径必须看到同一份提示词。
+
+    `tool_choice.disable_parallel_tool_use: true` 会让 `/v1/messages` 在工具提示词
+    末尾追加「Do NOT emit more than one tool call in a turn」一段，而 `count_tokens`
+    从不传 `parallel_allowed`，于是同一份请求报文在两条路径上生成**不同**的提示词
+    （实测 1267 字符 vs 1122 字符）。估算值系统性偏低，而 Claude Code 正是用它判断
+    上下文预算、决定何时压缩——偏低的数字会让它在该压缩时继续硬塞。
+
+    断言选的是**方向**（带约束的提示词必然更长），而不是具体数值：数值会随提示词
+    文案演进漂移，方向不会。
+    """
+    from providers.token_counter_cache import token_counter_cache
+
+    tools = [{"name": "Read", "description": "read",
+              "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}}}]
+    base = {"model": "claude-3-7-sonnet",
+            "messages": [{"role": "user", "content": "hi"}], "tools": tools}
+
+    client = TestClient(srv.app)
+
+    # 用同一份请求分别走两条路径，比较真正送给模型的提示词，而不是比较接口返回。
+    seen: list = []
+    original = srv.convert_anthropic_to_gateway_messages
+
+    def spy(messages, system=None, tools=None, tool_choice=None, parallel_allowed=None):
+        out = original(messages, system=system, tools=tools,
+                       tool_choice=tool_choice, parallel_allowed=parallel_allowed)
+        seen.append(srv.flatten_messages(out))
+        return out
+
+    # `/v1/messages` 必须被打桩：本套件此前有测试因漏装脚本 provider 而向真实 Qwen
+    # 发了请求（CLAUDE.md 记录的 tripwire 事故），这里显式装上，绝不让提示词断言
+    # 以一次真实上游调用为代价。
+    ScriptedProvider.script = [("ok", {})]
+    default_factory = srv._make_provider
+    srv._make_provider = lambda key: ScriptedProvider()
+    srv.convert_anthropic_to_gateway_messages = spy
+    try:
+        token_counter_cache.clear()
+        named = {"type": "tool", "name": "Read"}
+        parallel = {"type": "tool", "name": "Read", "disable_parallel_tool_use": True}
+
+        client.post("/v1/messages/count_tokens", json={**base, "tool_choice": named})
+        count_named = seen[-1]
+        client.post("/v1/messages/count_tokens", json={**base, "tool_choice": parallel})
+        count_serial = seen[-1]
+
+        client.post("/v1/messages", json={**base, "tool_choice": parallel})
+        msg_serial = seen[-1]
+    finally:
+        srv.convert_anthropic_to_gateway_messages = original
+        srv._make_provider = default_factory
+        token_counter_cache.clear()
+
+    assert count_serial == msg_serial, (
+        "count_tokens 与 /v1/messages 对同一份报文生成了不同的提示词"
+        f"（{len(count_serial)} vs {len(msg_serial)} 字符）——估算的是另一个请求"
+    )
+    assert len(count_serial) > len(count_named), (
+        "`disable_parallel_tool_use` 的约束段没有进入估算路径的提示词"
+    )
+    print("test_count_tokens_sees_the_same_tools_prompt_as_messages: PASSED")
+
+
 def run_all():
     tests = [
         test_plain_text_stream_is_valid,
@@ -350,6 +517,9 @@ def run_all():
         test_stop_sequence_stream_keeps_block_lifecycle_valid,
         test_stop_sequence_stream_does_not_fabricate_empty_blocks,
         test_stop_sequence_is_never_reported_as_an_empty_string,
+        test_count_tokens_accepts_every_system_shape_messages_accepts,
+        test_count_tokens_cache_key_covers_tool_choice,
+        test_count_tokens_sees_the_same_tools_prompt_as_messages,
     ]
     for fn in tests:
         fn()

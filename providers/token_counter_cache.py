@@ -116,11 +116,24 @@ def compute_count_key(req: Any) -> str:
     """为 count_tokens 请求计算确定性 SHA-256 指纹。
 
     仅取参与 token 计算的语义字段，并以 sort_keys 规范化，保证同义请求命中同一键。
+
+    [PROTOCOL] `tool_choice` 也必须进指纹：它会被 `format_tools_system_prompt`
+    翻译成工具提示词里的一句约束指令（`tool_choice:"none"` 追加「本回合不要调用
+    任何工具」），因此两个 `tool_choice` 不同的请求，送给模型的提示词并不相同。
+    漏掉它就会把后到请求的估计直接返回成先到请求的数字——实测（清空缓存后逐个
+    测量）`none` = 314、`auto` = 290，先 `none` 后 `auto` 连发时两次都是 314。
+    与 SingleFlight `compute_key` 同一条纪律：改变输出的字段必须进指纹，且加入
+    字段只会减少共享，绝不会造成错误共享。
+
+    `parallel_allowed`（由 `tool_choice.disable_parallel_tool_use` 派生）不需要单独
+    入键：`parallel_calls_disallowed(None, tool_choice)` 是 `tool_choice` 的纯函数，
+    上面已经覆盖。派生量另立一项只会制造「同一事实两份键」的漂移机会。
     """
     payload = {
         "messages": _normalize(getattr(req, "messages", None)),
         "system": _normalize(getattr(req, "system", None)),
         "tools": _normalize(getattr(req, "tools", None)),
+        "tool_choice": _normalize(getattr(req, "tool_choice", None)),
     }
     try:
         canonical = json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str)

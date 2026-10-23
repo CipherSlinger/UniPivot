@@ -236,6 +236,45 @@ def test_stream_emits_custom_tool_events_end_to_end():
     print("test_stream_emits_custom_tool_events_end_to_end: PASSED")
 
 
+def test_nameless_builtin_tools_do_not_render_as_empty_bullets():
+    """[TOOL-LOOP] 真实 Codex 请求里有两类**没有 `name`** 的内置工具声明。
+
+    实测（codex-cli 0.145.0，`codex exec` 原始 `/v1/responses` 请求体）：
+      - `{"type": "tool_search", "execution": "client", "parameters": {...}}`
+      - `{"type": "web_search", "external_web_access": false}`
+    两者都没有 `name` 字段。旧的渲染分支无条件 `t.get("name", "")`，于是提示词
+    末尾出现 `- \`\`: ` + `Args: {}` 这样的**空名条目**——模型看到的是一个可以
+    调用、却没有任何名字的工具。这正是「声明列表末尾的空名条目」的真正来源：
+    它不是名字被损坏，而是内置工具本来就没有名字。
+
+    处理必须与「模型能调用什么」一致：没有名字的声明**不可能**被调用（模型写不出
+    调用名，`tool_names_of` 也不会放行），所以它不该作为可调用工具出现在提示词里。
+    但它携带的信息（`tool_search` 会「让下一轮看到更多工具」）仍然值得让模型知道，
+    因此降级为一段说明，而不是静默丢弃，更不能是空名条目。
+    """
+    tool_search = {
+        "type": "tool_search",
+        "execution": "client",
+        "description": "# Tool discovery\n\nSearches over deferred tool metadata.",
+        "parameters": {"type": "object", "properties": {"query": {"type": "string"}}},
+    }
+    web_search = {"type": "web_search", "external_web_access": False}
+    real = {
+        "type": "function",
+        "name": "exec_command",
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+    }
+
+    prompt = format_tools_system_prompt([real, tool_search, web_search])
+
+    assert "- ``" not in prompt, (
+        "提示词里出现了空名工具条目——模型看到一个可调用却没有名字的工具:\n"
+        + prompt
+    )
+    assert "`exec_command`" in prompt, "有名字的正常工具不该被牵连"
+    print("test_nameless_builtin_tools_do_not_render_as_empty_bullets: PASSED")
+
+
 def run_all():
     test_freeform_declaration_gets_an_executable_schema()
     test_freeform_call_replay_is_assistant_not_user()
@@ -243,6 +282,7 @@ def run_all():
     test_freeform_names_only_custom_declarations()
     test_completion_emits_custom_tool_call_item()
     test_stream_emits_custom_tool_events_end_to_end()
+    test_nameless_builtin_tools_do_not_render_as_empty_bullets()
     print("\n✅ All Responses custom/freeform tool tests passed!")
 
 

@@ -3661,8 +3661,19 @@ async def count_tokens(req: AnthropicCountTokensRequest):
         if cached is not None:
             return {"input_tokens": cached}
 
+    # [PROTOCOL] 估算路径必须看到与 `/v1/messages` **完全相同**的提示词：
+    # `tool_choice.disable_parallel_tool_use` 会让 messages 路径给工具提示词追加一句
+    # 「本回合不要发出多个工具调用」的约束，这里却从不传 `parallel_allowed`，两份
+    # 提示词实测长度 1267 vs 1122。Claude Code 用这个数字判断上下文预算，系统性
+    # 偏低会让它在该压缩时继续硬塞。与 `tool_choice` 进指纹是同一条纪律——上报给
+    # 客户端的是一个它自己的请求算不出来的数，就是错。
+    parallel_disallowed = parallel_calls_disallowed(None, req.tool_choice)
     gateway_messages = convert_anthropic_to_gateway_messages(
-        req.messages, system=req.system, tools=req.tools, tool_choice=req.tool_choice
+        req.messages,
+        system=req.system,
+        tools=req.tools,
+        tool_choice=req.tool_choice,
+        parallel_allowed=not parallel_disallowed,
     )
     prompt = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(prompt)

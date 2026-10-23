@@ -872,10 +872,61 @@ class ResponsesEventStream:
             data["failover"] = failover
         return self._frame("response.completed", data)
 
-    def error(self, message: str, status: int = 502, err_type: str = "upstream_error") -> str:
-        """Responses 规范的错误事件：`type:error` + code/message/param。"""
+    def failed(
+        self,
+        message: str,
+        status: int = 502,
+        err_type: str = "upstream_error",
+    ) -> str:
+        """[RESPONSES-STREAM] 流中途失败的**终局**事件。
+
+        为什么必须发它：Codex CLI 0.145.0 的 SSE 分派只处理 `response.*` 分支，
+        `event: error` 落进 `_ => trace!("unhandled responses event")` 被整条丢弃。
+        流里因此没有任何终局事件，生成器结束时客户端只能说
+
+            stream disconnected before completion: stream closed before response.completed
+
+        上游给的真实原因（配额超限、上下文超限、风控拦截）**全部丢失**。
+
+        实测（真实 codex-cli 0.145.0，同一台 mock，唯一变量是终局事件的形状）：
+
+            `error` only（修复前） → stream closed before response.completed
+            `response.failed` only → upstream quota exceeded
+            `error` + `response.failed`（当前） → upstream quota exceeded
+
+        三组的请求数都是 6：**这个修复恢复的是原因，不是减少重试次数**。客户端对
+        一次已开始的流失败仍按自己的策略重连，网关无法也不应替它决定中途是否重试
+        （内容已经发出去了，重试只会产生半包重放）。之前的记录把「减少重试」记在
+        它头上是不准确的。
+
+        `error.code` 取 OpenAI 风格的 code（`error_response` 已经做过映射），而不是
+        内部 `err_type`——客户端按前者做重试分级。
+        """
         err = error_response(message, status, err_type)["error"]
-        return self._frame(
+        resp_obj = self._response_shell("failed")
+        resp_obj["error"] = {
+            "code": err.get("code") or err.get("type") or err_type,
+            "message": err.get("message") or message,
+        }
+        return self._frame("response.failed", {"response": resp_obj})
+
+    def error(
+        self,
+        message: str,
+        status: int = 502,
+        err_type: str = "upstream_error",
+        *,
+        terminal: bool = True,
+    ) -> str:
+        """Responses 规范的错误事件：`type:error` + code/message/param。
+
+        `terminal=True`（默认）时**额外**补一条 `response.failed`：`error` 事件
+        在 Codex 0.145.0 上被整条丢弃，只有把失败作为 `response.failed` 再报一次，
+        原因才真正到达用户（实测见 `failed()` 的 docstring）。保留 `error` 是因为
+        Codex 之外的 SDK 确实读它，且它是 Responses 规范里的标准错误事件。
+        """
+        err = error_response(message, status, err_type)["error"]
+        frame = self._frame(
             "error",
             {
                 "code": err.get("type") or err_type,
@@ -883,6 +934,9 @@ class ResponsesEventStream:
                 "param": None,
             },
         )
+        if terminal:
+            frame += self.failed(message, status, err_type)
+        return frame
 
 
 def sse_done() -> str:

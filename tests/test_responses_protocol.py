@@ -39,6 +39,7 @@ os.environ["DOUBAO_AUTH_TOKEN"] = "fake_doubao"
 from fastapi.testclient import TestClient  # noqa: E402
 
 import server as srv  # noqa: E402
+from providers.base import ProviderError  # noqa: E402
 
 
 class EchoProvider:
@@ -361,6 +362,68 @@ def test_shapes_match_between_tool_and_plain_paths():
     print("test_shapes_match_between_tool_and_plain_paths: PASSED")
 
 
+
+class MidStreamFailProvider:
+    """先吐出一点正文，再在上游失败——这是 429/配额/上下文超限最真实的形状。"""
+
+    async def chat(self, *a, **kw):
+        yield "Here is the start of an answer. ", {}
+        raise ProviderError("upstream quota exceeded", status=429, err_type="rate_limit_error")
+
+
+def test_mid_stream_failure_is_a_terminal_event_codex_reads():
+    """[RESPONSES-STREAM] 流中断的失败必须是 Codex **能读到的终局事件**。
+
+    实测（真实 codex-cli 0.145.0，同一台 mock，唯一变量是终局事件的形状，
+    每组都是 6 次请求——**这个修复恢复的是原因，不是减少重试**）：
+
+        `error` only（修复前） → stream disconnected before completion:
+                                 stream closed before response.completed
+        `response.failed` only → stream disconnected before completion:
+                                 upstream quota exceeded
+        `error` + `response.failed`（当前） → upstream quota exceeded
+
+    根因：网关在上游中途失败时发出 `event: error`，而 Codex 的 SSE 分派只有
+    `response.*` 分支，`error` 落进 `_ => trace!("unhandled responses event")` 被
+    整条丢弃；随后生成器结束、没有终局事件，客户端只能报「流在 completed 之前关闭」。
+    于是上游给的真实原因（配额超限、上下文超限、风控拦截）全部丢失——用户看到的
+    是一句「流莫名关闭」，而真正该看到的是 `upstream quota exceeded`。
+
+    客户端对一次**已经开始**的流失败仍会按自己的策略重连（6 次，三种形状都一样）；
+    网关不该也没有替它决定中途是否重试——内容已经发出去，重试只会产生半包重放。
+    所以这里断言的是「原因有没有到达」，不是「重试有没有减少」。
+
+    这条断言因此同时要求：终局事件是 `response.failed`、它是**最后一个**事件、
+    它带着上游的真实 message，并且后面不再有 `[DONE]`（否则客户端会把一次失败
+    的流当成正常收尾）。
+    """
+    events = _run(
+        {"model": "gpt-5-codex", "input": "hi", "stream": True},
+        MidStreamFailProvider(),
+    )
+    names = [n for n, _ in events]
+
+    assert "response.failed" in names, (
+        "流中途失败没有发出 Codex 能识别的终局事件，实际事件序列: "
+        f"{names}"
+    )
+    assert names[-1] == "response.failed", (
+        f"response.failed 必须是最后一个事件，实际的最后一个事件是 {names[-1]!r}"
+    )
+    assert "done" not in names, (
+        "失败的流不得发送 [DONE]：那会让客户端把半截答案当成正常收尾"
+    )
+
+    payload = dict(events)["response.failed"]
+    resp = payload.get("response") or {}
+    assert resp.get("status") == "failed", f"response.status 应为 failed，实际 {resp.get('status')!r}"
+    err = resp.get("error") or {}
+    assert "quota" in (err.get("message") or "").lower(), (
+        f"上游的真实失败原因没有传到客户端，实际 error={err!r}"
+    )
+    assert err.get("code"), "response.error.code 不能为空，客户端按它做重试分级"
+
+
 def run_all():
     tests = [
         test_text_stream_event_contract,
@@ -370,6 +433,7 @@ def run_all():
         test_non_streaming_reasoning_item,
         test_interleaved_reasoning_and_text_never_collide,
         test_shapes_match_between_tool_and_plain_paths,
+        test_mid_stream_failure_is_a_terminal_event_codex_reads,
     ]
     for fn in tests:
         fn()

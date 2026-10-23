@@ -38,17 +38,33 @@ class AnthropicMessage(BaseModel):
     cache_control: Optional[dict] = None
 
 
-class AnthropicMessagesRequest(BaseModel):
+class AnthropicRequestBody(BaseModel):
+    """`/v1/messages` 与 `/v1/messages/count_tokens` 共享的请求体定义。
+
+    [PROTOCOL] 这两个端点描述的是**同一个** Anthropic 请求体，原先却各有一份
+    模型，且 `system` 的类型不同（`List[dict]` vs `List[Union[dict, str]]`）。
+    于是 `"system": ["you are terse"]` 在 messages 上合法、在 count_tokens 上被
+    400 拒绝——而 Claude Code 每次请求前都用 count_tokens 做上下文预算判断，
+    400 只会表现为「agent 不动了」。同一份报文有第二份解释，必然漂移；这里只留
+    一份，端点各自的特有字段放在子类里。
+    """
+
     model_config = ConfigDict(extra="allow")
     model: str
     messages: List[AnthropicMessage]
-    max_tokens: int = 4096
     system: Optional[Union[str, List[Union[dict, str]]]] = None
+    tools: Optional[List[dict]] = None
+    thinking: Optional[Union[dict, bool]] = None
+    # [TOOL-SCHEMA] Anthropic 的 count_tokens 请求与 messages 请求同构，同样可以
+    # 携带 tool_choice；估算路径必须看到与真实请求相同的工具提示词，否则算出的
+    # token 数在工具循环里系统性偏低，客户端会据此误判上下文预算。
+    tool_choice: Optional[Union[str, dict]] = None
+
+
+class AnthropicMessagesRequest(AnthropicRequestBody):
+    max_tokens: int = 4096
     stream: bool = False
     temperature: Optional[float] = None
-    tools: Optional[List[dict]] = None
-    tool_choice: Optional[Union[str, dict]] = None
-    thinking: Optional[Union[dict, bool]] = None
     top_p: Optional[float] = None
     top_k: Optional[int] = None
     metadata: Optional[dict] = None
@@ -57,17 +73,8 @@ class AnthropicMessagesRequest(BaseModel):
     cache_control: Optional[dict] = None
 
 
-class AnthropicCountTokensRequest(BaseModel):
-    model_config = ConfigDict(extra="allow")
-    model: str
-    messages: List[AnthropicMessage]
-    system: Optional[Union[str, List[dict]]] = None
-    tools: Optional[List[dict]] = None
-    thinking: Optional[Union[dict, bool]] = None
-    # [TOOL-SCHEMA] Anthropic 的 count_tokens 请求与 messages 请求同构，同样可以
-    # 携带 tool_choice；估算路径必须看到与真实请求相同的工具提示词，否则算出的
-    # token 数在工具循环里系统性偏低，客户端会据此误判上下文预算。
-    tool_choice: Optional[Union[str, dict]] = None
+class AnthropicCountTokensRequest(AnthropicRequestBody):
+    """count_tokens 与 messages 同构；独有字段为空（估算只读 messages/system/tools）。"""
 
 
 def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None]) -> str:
@@ -308,6 +315,36 @@ def freeform_tool_input_schema() -> dict:
 # 包装」的工具，回放时同样不能当成未知 JSON 丢给模型（见 responses_compat）。
 _FREEFORM_TOOL_DECL_TYPES = frozenset({"custom"})
 
+# 无名内置工具说明行的条数上限（真实 Codex 请求只有 `tool_search` / `web_search`
+# 两个；上限存在只是为了不让客户端用任意多个无名条目撑大提示词）。
+_NAMELESS_TOOL_NOTE_LIMIT = 8
+
+
+def _nameless_tool_note(tool: dict, desc: str) -> str:
+    """给「没有 name、因此不可调用」的内置工具生成一句说明。
+
+    [TOOL-LOOP] 真实 Codex CLI 请求里会出现 `{"type":"tool_search", ...}` 与
+    `{"type":"web_search", ...}` 这类声明：它们由客户端在本地处理，没有 `name`，
+    模型写不出调用名。渲染成可调用条目就是空名噪声；静默丢弃又会让模型完全不知道
+    客户端具备该能力。这里按 `type` 给一句准确的说明，未知类型则只说它由客户端处理。
+    """
+    t = (tool.get("type") or "").strip() if isinstance(tool.get("type"), str) else ""
+    if t == "tool_search":
+        return (
+            "- Tool discovery (`tool_search`, executed by the client): deferred tools "
+            "outside this list can be exposed to you by the client itself; you cannot "
+            "invoke the search directly."
+        )
+    if t == "web_search":
+        return (
+            "- Web search (`web_search`, executed by the client): available to the client "
+            "but not as a callable tool in this turn."
+        )
+    if not t:
+        return ""
+    detail = f" — {desc}" if desc else ""
+    return f"- Client-handled tool (`{t}`): not callable from this turn{detail}"
+
 
 def format_tools_system_prompt(
     tools: List[dict],
@@ -334,6 +371,7 @@ def format_tools_system_prompt(
     ]
 
     rendered: List[str] = []
+    nameless_notes: List[str] = []
     schema_budget_used = 0
     budget_exhausted = False
 
@@ -359,6 +397,24 @@ def format_tools_system_prompt(
                 if not desc:
                     desc = "Freeform tool: pass its complete raw input text in the `input` field."
 
+        # [TOOL-LOOP] 没有名字的声明**不可能被调用**：模型写不出调用名，
+        # `tool_names_of` 也不会把它放进白名单。真实 Codex 请求里恰好有两个这样的
+        # 内置工具——`{"type":"tool_search", ...}` 与 `{"type":"web_search", ...}`
+        # 都没有 `name` 字段。旧代码无条件 `t.get("name", "")`，于是提示词末尾多出
+        # `- \`\`: ` + `Args: {}` 的空名条目：一个模型能「调用」却无名可写的工具，
+        # 纯噪声，还诱导模型编造工具名（规则 6 明确禁止）。
+        # 处理与「可调用性」一致：不进可调用列表；但把已知的内置工具降级成一句说明，
+        # 让模型知道它存在（例如 tool_search 会让下一轮看到更多工具），而不是
+        # 静默吞掉客户端明明白白声明过的东西。
+        if not isinstance(name, str) or not name.strip():
+            # 说明行同样要受预算约束：客户端可以声明任意多个无名条目，而这段文本
+            # 是要送进上下文的。超出上限后只计数，不再追加。
+            note = _nameless_tool_note(t, desc)
+            if note and len(nameless_notes) < _NAMELESS_TOOL_NOTE_LIMIT:
+                nameless_notes.append(note)
+            continue
+        name = name.strip()
+
         schema_json = _render_schema_json(schema)
         if budget_exhausted or schema_budget_used + len(schema_json) > _TOOL_SCHEMA_TOTAL_BUDGET:
             # 预算耗尽后的溢出工具：降级为旧摘要。降级是粘性的——一旦触发，
@@ -370,6 +426,13 @@ def format_tools_system_prompt(
             rendered.append(f"- `{name}`: {desc}\n  Args: {schema_json}")
 
     lines.extend(rendered)
+    if nameless_notes:
+        lines.append(
+            "\n## Client-Side Internal Tools (not directly callable)\n"
+            "The client declared the following tools without a callable name. They are "
+            "handled by the client itself; do not attempt to call them."
+        )
+        lines.extend(nameless_notes)
 
     rules = (
         "\n## Tool Calling Rules\n"
