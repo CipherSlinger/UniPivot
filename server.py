@@ -845,6 +845,39 @@ def _wants_thinking(thinking: object) -> bool:
     return bool(thinking)
 
 
+def _thinking_display(thinking: object) -> str:
+    """客户端希望**如何展示**思考——`"omitted"` / `"summarized"` / `""`（未声明）。
+
+    [PROTOCOL] 这是 `_wants_thinking` 的第二问，两者正交：前者是「要不要思考」，
+    这里是「思考了要不要给客户端看」。
+
+    实测（真实 `claude` 2.1.293，`--model claude-opus-5-5`）：Claude Code 的
+    **每一个**请求都带 `{"type":"adaptive","display":"omitted"}`，而网关只回答了
+    第一问、完全忽略第二问，于是照常把思考文本以 `thinking_delta` 发出去。后果
+    不止是「多显示了内容」：客户端把它存进对话历史，下一轮 `messages` 里就多出
+    一个 `{"type":"thinking",...}` 块，**尽管它明确要求 omitted**——实测一次工具
+    循环里该块被反复回放，会话涨到 154 个 assistant 轮次、每轮都带思考块，每一轮
+    都要重新付这几百 token 的输入成本。
+
+    `display` 的语义取自 Claude Code 自己的 schema：
+    `display: z(["summarized","omitted"]).optional()`，二进制内文档写明
+    `'omitted'（no thinking text）`、`'highlights'` 是「每段思考只给一个短标题」。
+
+    只认**明确的** `omitted`：其余取值（含 `summarized`、缺省、无法识别的形状）
+    一律照常发出——失败开放，与 `_wants_thinking` 同一条纪律。
+    """
+    if isinstance(thinking, dict):
+        display = thinking.get("display")
+        if isinstance(display, str):
+            return display.strip().lower()
+    return ""
+
+
+def _thinking_suppressed(thinking: object) -> bool:
+    """本回合是否应当**不向客户端发送**思考文本。"""
+    return _thinking_display(thinking) == "omitted"
+
+
 def _make_thinking_headers(
     thinking_duration_ms: Optional[float] = None,
     thinking_tokens: Optional[int] = None,
@@ -2976,6 +3009,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
     # 判定 thinking 意图
     enable_thinking = _wants_thinking(req.thinking)
+    # [PROTOCOL] 与「要不要思考」正交的第二问：思考了，要不要发给客户端。
+    suppress_thinking = _thinking_suppressed(req.thinking)
 
     # 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
@@ -3137,6 +3172,15 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             continue
 
                         is_reasoning = bool(_meta and _meta.get("reasoning"))
+                        # [PROTOCOL] 抑制只在**发送边界**：思考照常累积进
+                        # `accumulated_thinking`（思考通道兜底与 usage 都要用它），
+                        # 只是不开块、不发 delta。客户端明确要求 omitted 时，
+                        # 一个 thinking 块都不该出现在事件流里。
+                        if is_reasoning and suppress_thinking:
+                            accumulated_thinking.append(delta)
+                            if _meta and _meta.get("conversation_id"):
+                                conv_id = _meta["conversation_id"]
+                            continue
                         target_type = "thinking" if is_reasoning else "text"
 
                         # [PROTOCOL] 停用词必须在**开块之前**判定，且判定后立刻收口。
@@ -3277,6 +3321,10 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         # Anthropic 事件流，SDK 客户端会拒绝或错位后续内容。实测复现：
                         # start(1,text) → start(1,thinking) → stop(1) → stop(2)。
                         if act.action_type == "reasoning_delta":
+                            # [PROTOCOL] display=omitted：不发思考文本，也不开块。
+                            # 流式器照常累积（工具兜底要用），这里只是不发送。
+                            if suppress_thinking:
+                                continue
                             if in_text_block:
                                 yield sse_content_block_stop(block_idx)
                                 in_text_block = False
@@ -3580,7 +3628,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         })
 
     blocks: list[dict] = []
-    if full_thinking:
+    # [PROTOCOL] display=omitted：思考照常参与 usage 与思考通道兜底，只是不进
+    # 响应体——客户端会把它存进历史，下一轮再发回来。
+    if full_thinking and not suppress_thinking:
         blocks.append({"type": "thinking", "thinking": full_thinking})
 
     if req.tools:

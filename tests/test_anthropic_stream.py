@@ -54,7 +54,7 @@ class ScriptedProvider:
             yield delta, meta
 
 
-def _events(script, *, tools=None) -> list[dict]:
+def _events(script, *, tools=None, thinking=None) -> list[dict]:
     """跑一次 /v1/messages 流式请求，返回全部 data 事件（按序）。"""
     from fastapi.testclient import TestClient as _TC
 
@@ -69,6 +69,8 @@ def _events(script, *, tools=None) -> list[dict]:
     }
     if tools is not None:
         body["tools"] = tools
+    if thinking is not None:
+        body["thinking"] = thinking
     try:
         client = _TC(srv.app)
         with client.stream("POST", "/v1/messages", json=body) as r:
@@ -505,6 +507,155 @@ def test_count_tokens_sees_the_same_tools_prompt_as_messages():
     print("test_count_tokens_sees_the_same_tools_prompt_as_messages: PASSED")
 
 
+# ------------------------------------------- 14. thinking.display = "omitted"
+
+
+def _thinking_text(events: list[dict]) -> str:
+    return "".join(
+        e["delta"]["thinking"] for e in events
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "thinking_delta"
+    )
+
+
+def test_thinking_display_omitted_sends_no_thinking_text():
+    """Claude Code 每一轮都发 `{"type":"adaptive","display":"omitted"}`。
+
+    实测（真实 claude 2.1.293，`--model claude-opus-5-5`）修复前：网关照常把
+    思考文本作为 `thinking_delta` 发给客户端，客户端把它存进对话历史，下一轮
+    `messages` 里就多出一个 `{"type":"thinking","thinking":"Let me think..."}`
+    块——**尽管它明确要求 omitted**。工具循环里这个块被反复回放（实测一次会话
+    长到 154 个 assistant 轮次、每个都带 thinking 块）。
+
+    `display` 的语义由 Claude Code 二进制自己的 schema 定义：
+    `display: z(["summarized","omitted"]).optional()`，且文档写
+    "'omitted'（no thinking text）"。所以 omitted 时**一个 thinking_delta
+    都不该出现**——不是少发，是零发。
+    """
+    events = _events(
+        [("thinking...", {"reasoning": True}), ("answer", {"conversation_id": "c1"})],
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+    _assert_block_lifecycle(events)
+    assert _thinking_text(events) == "", (
+        f"客户端要求 display=omitted，网关仍然发出了思考文本: {_thinking_text(events)!r}"
+    )
+    # 正文必须照常送达——抑制思考不能把答案一起吞掉
+    text = "".join(
+        e["delta"]["text"] for e in events
+        if e.get("type") == "content_block_delta" and e["delta"]["type"] == "text_delta"
+    )
+    assert text == "answer", f"抑制思考时正文被吞: {text!r}"
+
+
+def test_thinking_display_summarized_still_sends_thinking():
+    """对照组：没有 display 或 display != omitted 时，思考照常发出。
+
+    这条是上一条的**反向保险**：如果实现写成「只要有 thinking 字段就抑制」，
+    这里会立刻变红。
+    """
+    for thinking in (
+        {"type": "adaptive", "display": "summarized"},
+        {"type": "adaptive"},
+        {"type": "enabled"},
+        True,
+    ):
+        events = _events(
+            [("thinking...", {"reasoning": True}), ("answer", {"conversation_id": "c1"})],
+            thinking=thinking,
+        )
+        _assert_block_lifecycle(events)
+        assert _thinking_text(events) == "thinking...", (
+            f"thinking={thinking} 时思考文本不该被抑制，实际: {_thinking_text(events)!r}"
+        )
+
+
+def test_thinking_display_omitted_still_recovers_tool_from_reasoning():
+    """抑制**只在发送边界**，绝不在累积边界。
+
+    这一条守住的是 [TOOL-LOOP] 的思考通道兜底：推理模型把整个 ```tool_call
+    写在思考流里、正文为空时，网关要从思考流把它救回来。如果实现图省事在
+    `accumulated_thinking` 那一层就把内容丢掉，这里会变成「两者都空」的回合
+    ——客户端既没有答案也没有调用，循环当场停住。
+    """
+    events = _events(
+        [
+            ("```tool_call\n", {"reasoning": True}),
+            ('{"name": "Read", "arguments": {"file_path": "/tmp/x"}}\n', {"reasoning": True}),
+            # 收尾的 ``` 也必须带 reasoning 标记：思考流里的每一块都是思考，
+            # 漏标会让它落进正文通道，正文不再为空，兜底规则自然不触发
+            # （这正是这条用例第一版写错的地方——它测的其实不是抑制）。
+            ("```", {"reasoning": True, "conversation_id": "c1"}),
+        ],
+        tools=TOOLS,
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+    _assert_block_lifecycle(events)
+    starts = [e for e in events if e.get("type") == "content_block_start"]
+    assert [b["content_block"]["type"] for b in starts] == ["tool_use"], (
+        f"omitted 抑制了思考文本，却把思考流里的工具调用也一起丢了: "
+        f"{[b['content_block']['type'] for b in starts]}"
+    )
+    assert starts[0]["content_block"]["name"] == "Read"
+    assert _thinking_text(events) == "", "工具路径同样不能发思考文本"
+
+
+def test_non_streaming_thinking_display_omitted_sends_no_thinking_block():
+    """非流式路径同一条语义：`content` 里不能有 thinking 块。"""
+    from fastapi.testclient import TestClient as _TC
+
+    ScriptedProvider.script = [
+        ("thinking...", {"reasoning": True}),
+        ("answer", {"conversation_id": "c1"}),
+    ]
+    default_factory = srv._make_provider
+    srv._make_provider = lambda key: ScriptedProvider()
+    try:
+        client = _TC(srv.app)
+        r = client.post(
+            "/v1/messages",
+            json={
+                "model": "claude-3-7-sonnet",
+                "max_tokens": 256,
+                "stream": False,
+                "thinking": {"type": "adaptive", "display": "omitted"},
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        )
+    finally:
+        srv._make_provider = default_factory
+    assert r.status_code == 200, r.text
+    data = r.json()
+    kinds = [b["type"] for b in data["content"]]
+    assert "thinking" not in kinds, (
+        f"非流式路径把思考块发给了要求 omitted 的客户端: {data['content']}"
+    )
+    assert any(b["type"] == "text" and b["text"] == "answer" for b in data["content"]), (
+        f"正文丢失: {data['content']}"
+    )
+
+
+def test_thinking_omitted_does_not_change_the_token_count():
+    """抑制发送不改 `usage`：思考确实发生了，只是不展示。
+
+    客户端用 output_tokens 做预算判断；把被抑制的思考从 usage 里也扣掉，
+    会让它对上下文的估计系统性偏低。
+    """
+    suppressed = _events(
+        [("thinking...", {"reasoning": True}), ("answer", {"conversation_id": "c1"})],
+        thinking={"type": "adaptive", "display": "omitted"},
+    )
+    shown = _events(
+        [("thinking...", {"reasoning": True}), ("answer", {"conversation_id": "c1"})],
+        thinking={"type": "adaptive", "display": "summarized"},
+    )
+    sup_tok = [e for e in suppressed if e.get("type") == "message_delta"][0]["usage"]["output_tokens"]
+    shown_tok = [e for e in shown if e.get("type") == "message_delta"][0]["usage"]["output_tokens"]
+    assert sup_tok == shown_tok, (
+        f"抑制展示改变了 output_tokens（{sup_tok} vs {shown_tok}）——"
+        "思考确实产生了，只是不展示"
+    )
+
+
 def run_all():
     tests = [
         test_plain_text_stream_is_valid,
@@ -520,6 +671,11 @@ def run_all():
         test_count_tokens_accepts_every_system_shape_messages_accepts,
         test_count_tokens_cache_key_covers_tool_choice,
         test_count_tokens_sees_the_same_tools_prompt_as_messages,
+        test_thinking_display_omitted_sends_no_thinking_text,
+        test_thinking_display_summarized_still_sends_thinking,
+        test_thinking_display_omitted_still_recovers_tool_from_reasoning,
+        test_non_streaming_thinking_display_omitted_sends_no_thinking_block,
+        test_thinking_omitted_does_not_change_the_token_count,
     ]
     for fn in tests:
         fn()
