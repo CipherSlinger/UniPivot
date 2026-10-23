@@ -1399,16 +1399,32 @@ class CooldownTracker:
         """
         async with self._lock:
             limit = self.budget_capped_limit()
+            if limit == 0:
+                # 机制关闭：不积攒任何证据。留着一个永远无法兑现的连续计数会让
+                # `budget_capped_report()` 出现「enabled: false，却有 streaks」的
+                # 自相矛盾读数（关闭开关也要能被证明是关闭）。
+                self._budget_capped_streak.pop(provider_key, None)
+                self._persist_state()
+                return 0.0
             streak = self._budget_capped_streak.get(provider_key, 0) + 1
             self._budget_capped_streak[provider_key] = streak
-            if limit == 0 or streak < limit:
+            if streak < limit:
                 self._persist_state()
                 return 0.0
 
-            # 达到阈值：按**上游超时**计一次失败（成因 timeout），并清空连续计数
-            # ——冷却本身就是接下来 N 次请求不再碰它，继续累加没有意义，反而会让
-            # 冷却一到期就立刻再次升级。
-            self._budget_capped_streak.pop(provider_key, None)
+            # 达到阈值：按**上游超时**计一次失败（成因 timeout）。
+            #
+            # [BUDGET-5] 连续计数**不清零，而是饱和在阈值上**。第一版把它清零，于是
+            # 每个冷却周期都重新发放 `limit` 次完整的份额尝试：请求间隔一旦大于冷却
+            # 时长（长程 agent 的两次工具调用之间往往是分钟级），节点就退化回
+            # 「每次请求都白等一整份」，只是周期从「每请求」变成了「每冷却窗口」。
+            # 实测（份额 1.0s、冷却 1s、轮间 1.2s）：**14/14 轮全部停顿 1 秒**。
+            #
+            # 饱和之后，冷却到期后的**第一次**尝试就是金丝雀：它同时是唯一的恢复
+            # 探测点。若它在份额内吐首包，`record_success` 会把计数清零（节点已自证
+            # 恢复）；若它再次被裁短，那就是「刚为这个原因冷却过、立刻复现」——这一次
+            # 尝试本身就足够定罪，不需要再攒够 `limit` 次。
+            self._budget_capped_streak[provider_key] = limit
             self._budget_capped_escalations[provider_key] = (
                 self._budget_capped_escalations.get(provider_key, 0) + 1
             )

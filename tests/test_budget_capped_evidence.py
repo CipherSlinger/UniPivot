@@ -284,6 +284,114 @@ def test_recovery_clears_the_accumulated_evidence():
     print("test_recovery_clears_the_accumulated_evidence: PASSED")
 
 
+def test_a_node_already_cooled_for_this_is_reconvicted_on_the_first_attempt():
+    """冷却到期后的**第一次**被裁短就必须再次冷却，不能又白等三份。
+
+    [BUDGET-4] 第一版把冷却后的连续计数清零，于是每个冷却周期都重新发放
+    `GATEWAY_BUDGET_CAPPED_LIMIT`（3）次完整的份额尝试。实测（份额 1.0s、冷却 1s、
+    每轮之间等 1.2s 让窗口真正过期）：**14/14 轮全部停顿 1 秒**、qwen 被真实触碰
+    14 次。也就是说请求间隔一旦大于冷却时长（长程 agent 的两次工具调用之间往往
+    是分钟级），缺陷就退化成「每次请求都白等一份」——正是本套件要消灭的那个形状，
+    只是周期从「每请求」变成了「每冷却窗口」。
+
+    正确语义是**恢复观察期**（OPT-022 的同一个思想）：冷却到期后的第一次尝试就是
+    金丝雀，它同时是唯一的恢复探测点。它若在份额内吐首包，`record_success` 会把
+    升级历史一并清空（节点已自证恢复）；它若再次被裁短，就是「刚为这个原因冷却过，
+    立刻复现」——这一次尝试本身就足够定罪，不需要再攒三次。
+    """
+    tracker = _fresh_state()
+    _env(
+        GATEWAY_FIRST_CHUNK_TIMEOUT="30",
+        GATEWAY_HANDSHAKE_BUDGET="5",
+        GATEWAY_STREAM_IDLE_TIMEOUT="5",
+        GATEWAY_BUDGET_CAPPED_LIMIT="3",
+        GATEWAY_TIMEOUT_COOLDOWN="0.2",
+    )
+    hung = _HungProvider()
+    fast = _fast_set()
+
+    # 前 3 轮：攒够证据、升级冷却。
+    _turns(hung, fast, 3)
+    assert tracker.budget_actions("qwen") == 1, tracker.budget_actions("qwen")
+    calls_after_first_cycle = hung.calls
+
+    # 等到冷却真的过期（真实路径上由负载均衡改派健康节点后，这里直接推进时钟）。
+    import time as _t
+
+    while tracker.get_remaining_cooldown("qwen") > 0:
+        _t.sleep(0.05)
+
+    # 冷却过期后的第一次尝试：必须只白等**一份**就再次冷却。
+    results = _turns(hung, fast, 1)
+    assert tracker.budget_actions("qwen") == 2, (
+        f"冷却到期后的第一次被裁短没有再次定罪（升级次数仍是 "
+        f"{tracker.budget_actions('qwen')}，qwen 又被尝试了 "
+        f"{hung.calls - calls_after_first_cycle} 次）。每个冷却周期重新发放 3 次完整"
+        f"份额，等价于「只要请求间隔大于冷却时长，每次请求都要白等一份」——"
+        f"实测各轮耗时 {[round(e, 2) for e, _ in results]}"
+    )
+    assert hung.calls - calls_after_first_cycle == 1, (
+        f"冷却到期后白等了 {hung.calls - calls_after_first_cycle} 份份额才再次冷却；"
+        f"应为 1 份（金丝雀）"
+    )
+
+    # 反方向：一次成功必须清空连续计数，否则恢复了的节点下一次单次被裁短
+    # 就会被立刻定罪（`budget_actions` 是累计遥测，不随成功清零）。
+    async def recover():
+        await tracker.record_success("qwen")
+
+    asyncio.run(recover())
+    assert tracker.budget_capped_count("qwen") == 0, (
+        f"节点成功后连续计数没有清零（仍是 {tracker.budget_capped_count('qwen')}）——"
+        f"一个已经自证恢复的节点下一次单次被裁短就会被立刻冷却"
+    )
+    print(
+        "test_a_node_already_cooled_for_this_is_reconvicted_on_the_first_attempt: PASSED",
+        f"(canary stalls=1, escalations cleared on success)",
+    )
+
+
+def test_the_saturated_streak_survives_a_restart():
+    """重启不得成为一步绕过：饱和的连续计数必须与冷却一起持久化。
+
+    本仓库对每一份「避免触碰上游」的证据都要求跨重启存活（OPT-011/022/027），
+    这条也不例外。否则运维重启一次网关，就把节点在冷却到期后的金丝雀资格
+    重新换成了 `limit` 次免费的完整份额尝试。
+    """
+    tracker = _fresh_state()
+    _env(
+        GATEWAY_TIMEOUT_COOLDOWN="0.5",
+        GATEWAY_BUDGET_CAPPED_LIMIT="3",
+    )
+
+    async def main():
+        for _ in range(3):
+            await tracker.note_budget_capped("qwen")
+        assert tracker.budget_capped_count("qwen") == 3, tracker.budget_capped_count("qwen")
+        snapshot = tracker._state_snapshot()
+        assert snapshot["budget_capped_streak"].get("qwen") == 3, (
+            f"达到阈值后连续计数没有写进状态快照：{snapshot['budget_capped_streak']}"
+        )
+
+        # 模拟重启：清空内存后按状态快照的同一字段恢复（`_restore_persisted_state`
+        # 从磁盘读，这里直接驱动它读取的那个字段，避免用例写进真实 session/ 目录）。
+        tracker._budget_capped_streak.clear()
+        tracker._budget_capped_escalations.clear()
+        for pk, streak in (snapshot.get("budget_capped_streak") or {}).items():
+            if isinstance(streak, int) and streak > 0:
+                tracker._budget_capped_streak[pk] = streak
+        for pk, count in (snapshot.get("budget_capped_escalations") or {}).items():
+            if isinstance(count, int) and count > 0:
+                tracker._budget_capped_escalations[pk] = count
+        assert tracker.budget_capped_count("qwen") == 3, (
+            f"重启后连续计数丢失（{tracker.budget_capped_count('qwen')}）——"
+            f"节点又拿到了 3 次免费的完整份额尝试，重启成了绕过本机制的捷径"
+        )
+
+    asyncio.run(main())
+    print("test_the_saturated_streak_survives_a_restart: PASSED")
+
+
 def test_the_mechanism_is_observable_on_diagnostics():
     """「机制有没有在做事」必须在诊断里看得见，而不是靠翻日志推断。
 
@@ -323,8 +431,10 @@ def run_all():
     test_a_single_capped_timeout_still_does_not_convict_the_node()
     test_threshold_zero_restores_the_never_escalate_behaviour()
     test_recovery_clears_the_accumulated_evidence()
+    test_a_node_already_cooled_for_this_is_reconvicted_on_the_first_attempt()
+    test_the_saturated_streak_survives_a_restart()
     test_the_mechanism_is_observable_on_diagnostics()
-    print("\n✅ All budget-capped evidence tests passed! (5 cases)")
+    print("\n✅ All budget-capped evidence tests passed! (7 cases)")
 
 
 if __name__ == "__main__":
