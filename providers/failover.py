@@ -227,6 +227,50 @@ PROVIDER_RISK_SPECS: Dict[str, ProviderRiskMeta] = {
 }
 
 
+# [BUDGET-3] 一次握手尝试的**最低有意义时长**（秒）。
+#
+# 低于它，任何真实上游都不可能返回首包（这五家的首包以秒计），于是这次尝试的结果
+# 是确定的：超时。确定必败的调用没有任何收益，只有一次白打的上游凭证流量和一次
+# 假的超时冷却，与整条避让线「不白白触碰上游」相反。因此它没有第二种用法：
+# 份额低于地板时**不派发**，而不是按地板派发。
+#
+# 取 0.05s 是因为这就是原实现里那个地板值——它此前被当作「本次上限」使用（于是
+# 派发了一次必败尝试）。现在同一个数字被移到了正确的判据上：低于它就别打。
+_MIN_HANDSHAKE_ATTEMPT_SECONDS = 0.05
+
+
+class BudgetCappedTimeout(ProviderError):
+    """[BUDGET-3] 这次超时是**网关的总预算**裁出来的，不是节点的能力边界。
+
+    为什么必须是一个独立类型而不是一句文案：`execute_chat` 的 `except` 分支会对每一次
+    失败 `record_failure`（冷却 + 失败计数），而「份额 0.1s 到了」这个事实只说明
+    **我们**只肯等 0.1s，不说明节点有故障——推理模型正常思考几十秒是健康状态
+    （`_first_chunk_timeout` 的 docstring 写得很清楚）。把它按节点故障记账，一个健康
+    节点会被冻结 60 秒，而冻结它的正是我们自己的预算决定。这正是本项目反复记录的
+    那类谎报（「我们决定不打」写成「上游失败了」），只不过这次发生在 try 内部。
+
+    因此它**继续往后故障转移**（这一次尝试确实没拿到首包，客户端等不到东西），但
+    不进冷却、不增失败计数。
+    """
+
+    budget_capped = True
+
+
+class BudgetExhaustedRefusal(ProviderError):
+    """[BUDGET-3] 预算在**进入尝试之前**就不够——零上游调用，一次都不该发生。
+
+    与 `BudgetCappedTimeout` 的区别是「是否真的打了上游」：这个类型表示我们根本
+    没有调用任何节点，因此它既不是节点失败，也不该继续往后故障转移（后面的候选
+    同样拿不到份额）。抛出后派发循环立刻终止。
+    """
+
+    zero_upstream = True
+
+
+def _is_budget_capped(exc: BaseException) -> bool:
+    return bool(getattr(exc, "budget_capped", False))
+
+
 # 对等能力环模型成员定义 (provider_key, wire_model)
 RING_DEFINITIONS: Dict[CapabilityRing, List[Tuple[str, str]]] = {
     CapabilityRing.REASONING: [
@@ -2350,23 +2394,110 @@ class FailoverRouter:
         primary_provider: str,
         primary_model: str,
         excluded_providers: Optional[Set[str]] = None,
+        current_provider: Optional[str] = None,
     ) -> int:
-        """还没有被尝试过、且此刻仍可被派发的候选数量。
+        """除 `excluded_providers` 与 `current_provider` 之外、此刻仍可被派发的候选数。
 
         [BUDGET-2] 只用于把总预算**公平分摊**给尚未尝试的候选：`get_fallback_candidates`
         已经排除了已尝试节点、运维禁用、封禁租约与长效避让，所以这里的计数与派发循环
         真正会再走几轮是同一个集合。用作除数而不是用来判决——判决仍只看时钟。
+
+        `current_provider` 必须显式传入：`get_fallback_candidates` **恒排除初选节点**，
+        所以「当前节点是否已经记进 `tried_providers`」会让返回值差一（当前节点是初选时
+        永远不在返回值里，是后备候选时才可能在里面）。把它作为参数排除掉之后，调用点
+        在派发循环的顶部与 `try` 内部都可以用同一个除数 `返回值 + 1`——两处的份额因此
+        逐值相同，不会出现「顶部按 1/5 判决、内部按 1/4 计时」这种自相矛盾。
         """
+        excluded = set(excluded_providers or ())
+        if current_provider:
+            excluded.add(current_provider)
         try:
             return len(
                 self.get_fallback_candidates(
                     primary_provider,
                     primary_model,
-                    excluded_providers=set(excluded_providers or ()),
+                    excluded_providers=excluded,
                 )
             )
         except Exception:  # noqa: BLE001 - 预算分摊失败不应影响派发
-            return 1
+            return 0
+
+    def _handshake_share(
+        self,
+        deadline: float,
+        primary_provider: str,
+        primary_model: str,
+        tried: Set[str],
+        current_provider: str,
+    ) -> Tuple[float, float]:
+        """返回 `(剩余总预算, 本次尝试的公平份额)`（秒）。
+
+        「本次尝试」是剩余候选中的一员，故份额 = 剩余预算 / (后续候选数 + 1)：
+        最后一个候选拿走全部剩余，所以总时长的上界仍严格成立。
+        """
+        remaining_budget = deadline - asyncio.get_running_loop().time()
+        later = self._count_untried_candidates(
+            primary_provider,
+            primary_model,
+            excluded_providers=set(tried),
+            current_provider=current_provider,
+        )
+        return remaining_budget, remaining_budget / max(later + 1, 1)
+
+    def _budget_exhausted_error(
+        self,
+        handshake_budget: float,
+        tried_providers: Set[str],
+        composite_errors: List[str],
+        remaining_budget: float,
+        share: float,
+    ) -> ProviderError:
+        """构造「预算不足以再发起一次有意义的尝试」的拒绝。
+
+        这是**零上游**结论，因此文案必须让运维能自己判断该做什么：试过哪些节点、
+        预算多少、为什么剩下的时间连一次尝试都不够。只说「超时」会让人去查网络，
+        而实际问题可能是预算配小了（默认 180s 分摊到五节点每份 36s）。
+        `retry_after` 取已尝试节点里**最早**可能恢复的冷却窗口——与「环已走完」
+        同一条纪律（H7），不编一个常量倒计时。
+        """
+        detail = "\n".join(f" - {e}" for e in composite_errors) or " - (无)"
+        if remaining_budget > 0.0:
+            shortfall = (
+                f"剩余 {remaining_budget:.2f}s，分摊给当前及后续候选后每次仅 "
+                f"{share:.3f}s，低于一次有意义的尝试下限 "
+                f"{_MIN_HANDSHAKE_ATTEMPT_SECONDS:.2f}s"
+            )
+        else:
+            shortfall = f"剩余预算 {max(remaining_budget, 0.0):.2f}s 已不足一次尝试"
+        logger.error(
+            "[握手预算] 总预算 %.1fs 已用尽（已尝试 %d 个节点；%s），停止派发以保证"
+            "客户端等待有上界。已记录的失败:\n%s",
+            handshake_budget,
+            len(tried_providers),
+            shortfall,
+            detail,
+        )
+        return BudgetExhaustedRefusal(
+            f"握手总预算 {handshake_budget:.0f}s 已用尽（已尝试 "
+            f"{len(tried_providers)} 个节点: {', '.join(sorted(tried_providers))}；"
+            f"{shortfall}），故不再发起注定失败的上游调用——否则客户端要对每个候选"
+            f"白等一次、再拿到同一个结论。这属于上游健康问题（非风控拦截，不会写入"
+            f"风控台账）。请检查网络与各节点状态，或用 GATEWAY_HANDSHAKE_BUDGET 调整"
+            f"总预算。\n已记录的失败:\n{detail}",
+            status=504,
+            err_type="upstream_timeout",
+            retry_after=min(
+                [
+                    r
+                    for r in (
+                        self.cooldown_tracker.get_remaining_cooldown(p)
+                        for p in tried_providers
+                    )
+                    if r and r > 0
+                ],
+                default=self._timeout_cooldown(),
+            ),
+        )
 
     def _timeout_cooldown(self) -> float:
         """[M2] 超时失败后的冷却时长（秒，默认 60）。
@@ -2420,45 +2551,36 @@ class FailoverRouter:
         )
 
         while True:
-            # [BUDGET] 握手总预算已耗尽：不再发起注定超时的尝试。
+            # [BUDGET] 握手总预算已耗尽 / 不足以完成一次有意义的尝试：不再派发。
             #
             # 这一次判决必须发生在**进入 try 之前**。放在 try 内会让 `except` 分支
             # 给一个从未被调用的节点记一次失败、上一份冷却——把一个「我们决定不打」
             # 写成一个「上游失败了」，正是本项目反复记录的那类谎报。这里直接如实
             # 报告：试过哪些节点、预算是多少。
-            if deadline is not None and deadline - asyncio.get_running_loop().time() <= 0.05:
-                detail = "\n".join(f" - {e}" for e in composite_errors) or " - (无)"
-                logger.error(
-                    "[握手预算] 总预算 %.1fs 已耗尽（已尝试 %d 个节点），停止派发以保证"
-                    "客户端等待有上界。已记录的失败:\n%s",
-                    handshake_budget,
-                    len(tried_providers),
-                    detail,
+            #
+            # [BUDGET-3] 判据是**本次可用份额**，不是裸的剩余时长。曾在 try 内部用
+            # `max(剩余预算, 0.05)` 作为本次上限，于是份额为 0.024s 时仍按 50ms 派发：
+            # 对任何真实上游都是必败，只换来一次白打的上游调用、一次假的超时冷却，
+            # 而请求结局与「零上游拒绝」一模一样（504 upstream_timeout）。0.05s 于是
+            # 从「兜底」变成了「一定会浪费一次上游触碰」——与整条避让线「不白白触碰
+            # 上游」的立场相反。份额低于该地板时，与其它零上游拒绝一致：如实报错、
+            # 不派发、不记任何节点的失败。
+            if deadline is not None:
+                remaining_budget, share = self._handshake_share(
+                    deadline,
+                    primary_provider_key,
+                    primary_wire_model,
+                    tried_providers,
+                    curr_provider_key,
                 )
-                raise ProviderError(
-                    f"握手总预算 {handshake_budget:.0f}s 已耗尽（已尝试 "
-                    f"{len(tried_providers)} 个节点: {', '.join(sorted(tried_providers))}），"
-                    f"剩余候选必然同样超时，故不再发起注定失败的上游调用——否则客户端"
-                    f"要再等过一整个单次上限才能拿到同一个结论。这属于上游健康问题"
-                    f"（非风控拦截，不会写入风控台账）。请检查网络与各节点状态，或用 "
-                    f"GATEWAY_HANDSHAKE_BUDGET 调整总预算。\n已记录的失败:\n{detail}",
-                    status=504,
-                    err_type="upstream_timeout",
-                    # [H7] 与「环已走完」同一个道理：这是确定性结论，客户端重试
-                    # 只会再等过一整个预算并得到同一答案。报出已尝试节点里**最早**
-                    # 可能恢复的冷却窗口，而不是让网关层回退到一个编出来的常量。
-                    retry_after=min(
-                        [
-                            r
-                            for r in (
-                                self.cooldown_tracker.get_remaining_cooldown(p)
-                                for p in tried_providers
-                            )
-                            if r and r > 0
-                        ],
-                        default=self._timeout_cooldown(),
-                    ),
-                )
+                if remaining_budget <= 0.0 or share < _MIN_HANDSHAKE_ATTEMPT_SECONDS:
+                    raise self._budget_exhausted_error(
+                        handshake_budget,
+                        tried_providers,
+                        composite_errors,
+                        remaining_budget,
+                        share,
+                    )
 
             tried_providers.add(curr_provider_key)
 
@@ -2652,6 +2774,25 @@ class FailoverRouter:
             wire_model = curr_wire_model
 
             try:
+                # [BUDGET-3] 在**占用任何资源之前**把本次份额再判一次。
+                #
+                # 循环顶部已经判过，但顶部与本处之间还隔着频控等待与信号量排队
+                # （并发满载时可以到秒级）——份额会在这段时间里继续缩水。若等到
+                # 握手那一刻才发现不足，信号量与上游生成器都已在手上，虽能回收却
+                # 白花一次排队。这里提前判，零资源占用。
+                if deadline is not None:
+                    rem, share_now = self._handshake_share(
+                        deadline,
+                        primary_provider_key,
+                        primary_wire_model,
+                        tried_providers,
+                        curr_provider_key,
+                    )
+                    if rem <= 0.0 or share_now < _MIN_HANDSHAKE_ATTEMPT_SECONDS:
+                        raise self._budget_exhausted_error(
+                            handshake_budget, tried_providers, composite_errors, rem, share_now
+                        )
+
                 # 1. 频控规避 (Pacing & Jitter)
                 await self.cooldown_tracker.apply_pacing_and_acquire(provider_key)
 
@@ -2676,6 +2817,8 @@ class FailoverRouter:
                 probation_held = False
                 sem_held = False
                 sem_handed_off = False
+                budget_capped = False
+                capped_at = 0.0
                 try:
                     if probation_lock is not None:
                         await probation_lock.acquire()
@@ -2714,19 +2857,27 @@ class FailoverRouter:
                     # 「第一个节点慢、第二个节点快」这种最常见故障形态反而不自愈了。
                     # 公平份额 = 剩余预算 / 剩余未尝试候选数，且不高于单次上限；
                     # 最后一个候选拿走全部剩余，故总时长上界仍严格成立。
+                    #
+                    # [BUDGET-3] 份额在这里**必定**已经判过下限（进入 try 时就判了），
+                    # 所以不再需要 `max(share, 0.05)` 那个地板——它此前把「不足」变成
+                    # 了「按 50ms 派发」，即一次确定必败的上游调用。份额在排队期间
+                    # 缩水到地板以下的极端情况，交给下面的超时分支按「预算裁短」处置。
                     if deadline is not None and handshake_timeout > 0:
-                        remaining_budget = deadline - asyncio.get_running_loop().time()
-                        # `tried_providers` 已包含当前候选，故它的候选数**不含**本次；
-                        # 本次的份额是「剩余预算 / (后续候选数 + 1)」，与后续候选等分。
-                        later = self._count_untried_candidates(
+                        remaining_budget, share = self._handshake_share(
+                            deadline,
                             primary_provider_key,
                             primary_wire_model,
-                            excluded_providers=set(tried_providers),
+                            tried_providers,
+                            curr_provider_key,
                         )
-                        share = remaining_budget / max(later + 1, 1)
-                        handshake_timeout = min(
-                            handshake_timeout, max(share, 0.05)
-                        )
+                        if share < handshake_timeout:
+                            handshake_timeout = max(share, _MIN_HANDSHAKE_ATTEMPT_SECONDS)
+                            # [BUDGET-3] 被总预算裁剪过 = 本次上限**不是**节点的能力边界。
+                            # 记账时必须区分：否则一个健康但比份额慢的节点会拿到 60s
+                            # 冷却（实测：份额 0.1s、节点 0.4s 应答 → qwen 冷却 60s、
+                            # 成因 timeout、failure_count 1），被后续请求无谓绕开。
+                            budget_capped = True
+                            capped_at = handshake_timeout
                     if handshake_timeout > 0:
                         # `wait_for` 的超时会取消被等待的协程——这里正是我们想要的：
                         # 超时即判定上游已死，主动取消拉取以防它作为幽灵任务持有连接。
@@ -2735,14 +2886,25 @@ class FailoverRouter:
                                 raw_stream.__anext__(), timeout=handshake_timeout
                             )
                         except asyncio.TimeoutError:
-                            raise ProviderError(
-                                # 保留一位小数：公平分摊后份额可以小于 1s，用 `:.0f`
-                                # 会把 0.3s 写成「在 0s 内未返回首包」——报告的数字
-                                # 与真实等待不符，正是本项目反复记录的谎报类型。
+                            # 保留一位小数：公平分摊后份额可以小于 1s，用 `:.0f`
+                            # 会把 0.3s 写成「在 0s 内未返回首包」——报告的数字
+                            # 与真实等待不符，正是本项目反复记录的谎报类型。
+                            message = (
                                 f"节点 [{provider_key}:{wire_model}] 在 "
-                                f"{handshake_timeout:.1f}s 内未返回首包（握手超时）",
-                                status=504,
-                                err_type="upstream_timeout",
+                                f"{handshake_timeout:.1f}s 内未返回首包（握手超时）"
+                            )
+                            if budget_capped:
+                                message += (
+                                    "；本次上限由握手总预算裁剪得出"
+                                    "（节点本身未表现出故障，故不计冷却）"
+                                )
+                                err = BudgetCappedTimeout(
+                                    message, status=504, err_type="upstream_timeout"
+                                )
+                                err.handshake_timeout = capped_at
+                                raise err from None
+                            raise ProviderError(
+                                message, status=504, err_type="upstream_timeout"
                             ) from None
                         except StopAsyncIteration:
                             first_item = None
@@ -2929,6 +3091,11 @@ class FailoverRouter:
                 # 故障：若落进下面的兜底分支，会被记成 502 并给健康节点上冷却。
                 raise
             except (ProviderError, Exception) as exc:
+                # [BUDGET-3] 零上游拒绝：预算在进入尝试之前就不够，一个节点都没碰过。
+                # 不能落进下面的记账分支（那会给一个从未被调用的节点上冷却），也不能
+                # 继续往后故障转移（后续候选同样没有份额）。直接如实上抛。
+                if getattr(exc, "zero_upstream", False):
+                    raise
                 if primary_exc is None:
                     primary_exc = exc
                 status_code = getattr(exc, "status", 502)
@@ -2939,14 +3106,29 @@ class FailoverRouter:
 
                 # 记录失败并进入动态冷却
                 # [M2] 超时（握手 / 空闲）用专门的冷却时长，其余维持原判据。
-                is_timeout = status_code == 504
-                await self.cooldown_tracker.record_failure(
-                    curr_provider_key,
-                    status_code,
-                    err_msg,
-                    custom_cooldown=self._timeout_cooldown() if is_timeout else None,
-                    is_timeout=is_timeout,
-                )
+                #
+                # [BUDGET-3] 被**我们家**的预算裁出来的超时不在此列：份额 0.1s 到了
+                # 只说明我们只肯等 0.1s，不说明节点有故障。按节点失败记账会让一个
+                # 健康节点白拿 60s 冷却（实测：0.4s 应答的健康节点 → 冷却 60s、
+                # failure_count 1），下一轮请求绕开它——我们自己的预算决定被写成了
+                # 上游的罪状，正是本项目反复记录的那类谎报。继续故障转移（这次确实
+                # 没拿到首包），但不进冷却、不增失败计数。
+                if _is_budget_capped(exc):
+                    logger.warning(
+                        "[握手预算] 节点 [%s] 的本次上限被总预算裁剪至 %.1fs（节点本身"
+                        "未表现出故障，不计冷却），继续故障转移",
+                        curr_provider_key,
+                        getattr(exc, "handshake_timeout", 0.0) or 0.0,
+                    )
+                else:
+                    is_timeout = status_code == 504
+                    await self.cooldown_tracker.record_failure(
+                        curr_provider_key,
+                        status_code,
+                        err_msg,
+                        custom_cooldown=self._timeout_cooldown() if is_timeout else None,
+                        is_timeout=is_timeout,
+                    )
 
                 # 寻找同能力环内的下一个健康备用节点
                 candidates = self.get_fallback_candidates(
