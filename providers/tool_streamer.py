@@ -433,7 +433,7 @@ class SpeculativeToolStreamer:
             return [StreamAction("text_delta", content=delta)]
         return self.feed_chunk(delta)
 
-    def truncate_at_stop(self, stop: Any) -> bool:
+    def truncate_at_stop(self, stop: Any) -> Optional[str]:
         """[PROTOCOL] 客户端停用词命中后，把内部累积截断到命中点之前。
 
         为什么必须在 `finalize()` **之前**做：命中点之后的正文对客户端不存在，而
@@ -442,17 +442,20 @@ class SpeculativeToolStreamer:
         却收到了一次它没有预期的执行。同时清空工具缓冲与文本窗口，否则 `finalize()`
         会把这段残料当作普通文本重新吐出来。
 
-        返回是否命中了停用词。
+        返回**命中的那个停用词**（未命中返回 `None`）。此前只返回布尔值，调用方
+        于是只能 `mark_hit()` 无参调用，最终 `message_delta` 发出
+        `{"stop_reason":"stop_sequence","stop_sequence":""}`——线契约要求这里带着
+        命中的原文，而 `truncate_final` 本来就已经算出了它，只是被丢掉了。
         """
         joined = "".join(self.accumulated_text)
         kept, matched = truncate_final(joined, stop)
         if matched is None:
-            return False
+            return None
         self.accumulated_text = [kept] if kept else []
         self.accumulated_tool_buffer.clear()
         self.tool_detected = False
         self.text_window = ""
-        return True
+        return matched
 
     def finalize(self) -> Tuple[str, Optional[List[Tuple[str, dict]]], bool]:
         """流结束时调用。

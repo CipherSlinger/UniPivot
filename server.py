@@ -547,8 +547,11 @@ class ChatCompletionRequest(BaseModel):
     stop: Optional[Union[str, List[str]]] = None
     # [PROTOCOL] 结构化输出：此前同样只被解析、从未进入提示词
     response_format: Optional[dict] = None
-    # 网页端专属能力，经 extra_body 传入
-    thinking: bool = False
+    # 网页端专属能力，经 extra_body 传入。
+    # [AGENT-LOOP] 类型放宽到对象：Anthropic 一侧的现行写法已经是
+    # `{"type": "adaptive"}`，把同一字段在 OpenAI 协议上钉成 bool 只会让
+    # 形状稍有差异的客户端在 422 上失手——判定统一交给 `_wants_thinking`。
+    thinking: Union[bool, dict, str] = False
     search: bool = False
 
 
@@ -812,6 +815,34 @@ async def _conversation_gc_loop() -> None:
             raise
         except Exception as exc:  # noqa: BLE001 - 后台循环必须永不退出
             print(f"[会话回收] 周期排空异常 (已忽略): {type(exc).__name__}: {exc}")
+
+
+def _wants_thinking(thinking: object) -> bool:
+    """客户端是否要求本回合开启思考——三个协议共用这一个判定。
+
+    [AGENT-LOOP] 实测：当前 Claude Code（2.1.293）发出的是
+    `{"type": "adaptive", "display": "omitted"}`，而网关此前只认
+    `type == "enabled"`，于是**静默**把思考关掉：请求照常成功、客户端收到一个
+    非思考的回答，没有任何错误或日志可看。Claude Code 自己的二进制里写着
+    "`thinking.type=enabled` is deprecated. Use `thinking.type=adaptive`
+    instead"——只认 enabled 等于对着新客户端永久失效。
+
+    另一侧同样错：OpenAI 路径的 `bool(req.thinking)` 把 `{"type":
+    "disabled"}`（一个非空 dict）判成「要思考」，而客户端明确要求关闭。两处
+    合起来说明「要不要思考」缺一个统一判定，而不是某一处写错了。
+
+    无法识别时失败开放：只有**明确**的 `disabled`/`false` 才关闭思考。
+    """
+    if not thinking:
+        return False
+    if isinstance(thinking, str):
+        return thinking.strip().lower() not in ("disabled", "none", "off")
+    if isinstance(thinking, dict):
+        t_type = thinking.get("type")
+        if isinstance(t_type, str):
+            return t_type.strip().lower() not in ("disabled", "none", "off")
+        return True
+    return bool(thinking)
 
 
 def _make_thinking_headers(
@@ -2079,7 +2110,7 @@ async def chat_completions(req: ChatCompletionRequest):
         else flatten_messages(messages)
     )
     prompt_tokens = _est_tokens(prompt_text)
-    is_thinking = bool(req.thinking)
+    is_thinking = _wants_thinking(req.thinking)
 
     # 2. 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
@@ -2109,7 +2140,7 @@ async def chat_completions(req: ChatCompletionRequest):
         "conversation_id": affinity_decision.upstream_conv_id,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "thinking": req.thinking,
+        "thinking": _wants_thinking(req.thinking),
         "search": req.search,
         "stream": req.stream,
     }
@@ -2447,8 +2478,11 @@ async def chat_completions(req: ChatCompletionRequest):
 
                 # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
                 # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
-                if streamer.truncate_at_stop(stop_seq):
-                    stop_scan.mark_hit()
+                _matched_stop = streamer.truncate_at_stop(stop_seq)
+                if _matched_stop is not None:
+                    # [PROTOCOL] 把命中的原文交给扫描器：线契约要求 stop_sequence
+                    # 带着它，只报告「被截了」而不说被什么截，客户端无法定位。
+                    stop_scan.mark_hit(_matched_stop)
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
@@ -2860,12 +2894,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     max_tokens = req.max_tokens or 4096
 
     # 判定 thinking 意图
-    enable_thinking = False
-    if req.thinking:
-        if isinstance(req.thinking, dict):
-            enable_thinking = req.thinking.get("type") == "enabled"
-        else:
-            enable_thinking = bool(req.thinking)
+    enable_thinking = _wants_thinking(req.thinking)
 
     # 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
@@ -3028,6 +3057,23 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         is_reasoning = bool(_meta and _meta.get("reasoning"))
                         target_type = "thinking" if is_reasoning else "text"
 
+                        # [PROTOCOL] 停用词必须在**开块之前**判定，且判定后立刻收口。
+                        # 原实现是在开完块之后才 feed，于是：块被打开 → feed 返回空
+                        # （尾巴还在保留窗口里）→ 关掉这个空块 → 继续开下一个空块；
+                        # 命中之后仍然把上游残余流读完，收口处再拿硬编码索引 0 开一个
+                        # 空块——而索引 0 早已使用并关闭过。实测 Claude Code 对重复
+                        # 索引的反应是保留后一块、**静默丢弃**前一块的正文。
+                        if is_reasoning:
+                            accumulated_thinking.append(delta)
+                        else:
+                            delta = stop_scan.feed(delta)
+                            if not delta:
+                                if stop_scan.hit is not None:
+                                    # 命中：本回合到此为止，不再读上游残料
+                                    break
+                                continue
+                            accumulated_chunks.append(delta)
+
                         if current_block_type != target_type:
                             if current_block_type is not None:
                                 yield sse_content_block_stop(current_block_index)
@@ -3043,23 +3089,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                                 )
 
                         if is_reasoning:
-                            accumulated_thinking.append(delta)
                             yield sse_content_block_delta(
                                 current_block_index,
                                 {"type": "thinking_delta", "thinking": delta},
                             )
                         else:
-                            accumulated_chunks.append(delta)
-                            # [PROTOCOL] 先判定再开块，命中时这一块根本不该存在
-                            safe_delta = stop_scan.feed(delta)
-                            if not safe_delta:
-                                if current_block_type == "text" and current_block_index >= 0:
-                                    yield sse_content_block_stop(current_block_index)
-                                    current_block_type = None
-                                continue
                             yield sse_content_block_delta(
                                 current_block_index,
-                                {"type": "text_delta", "text": safe_delta},
+                                {"type": "text_delta", "text": delta},
                             )
 
                         if _meta and _meta.get("conversation_id"):
@@ -3081,7 +3118,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                     if current_block_type is not None:
                         yield sse_content_block_stop(current_block_index)
-                    else:
+                    elif current_block_index < 0:
+                        # 只有**从未开过任何块**时才补一个空正文块（客户端要求至少有
+                        # 一个块）。若是因为被扣住尾巴/命中停用词而关过块，索引已经
+                        # 用掉了，这里再开一个就是复用索引——实测 Claude Code 会因此
+                        # 丢弃前一块的正文。
                         yield sse_content_block_start(0, {"type": "text", "text": ""})
                         yield sse_content_block_stop(0)
 
@@ -3180,8 +3221,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                 # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
                 # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
-                if streamer.truncate_at_stop(stop_seq):
-                    stop_scan.mark_hit()
+                _matched_stop = streamer.truncate_at_stop(stop_seq)
+                if _matched_stop is not None:
+                    # [PROTOCOL] 把命中的原文交给扫描器：线契约要求 stop_sequence
+                    # 带着它，只报告「被截了」而不说被什么截，客户端无法定位。
+                    stop_scan.mark_hit(_matched_stop)
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)
@@ -3904,8 +3948,11 @@ async def responses_endpoint(req: ResponsesRequest):
 
                 # [PROTOCOL] 停用词必须先截断累积再 finalize：命中点之后的
                 # ```tool_call 对客户端不存在，解析出来就是一次没有预期的执行
-                if streamer.truncate_at_stop(stop_seq):
-                    stop_scan.mark_hit()
+                _matched_stop = streamer.truncate_at_stop(stop_seq)
+                if _matched_stop is not None:
+                    # [PROTOCOL] 把命中的原文交给扫描器：线契约要求 stop_sequence
+                    # 带着它，只报告「被截了」而不说被什么截，客户端无法定位。
+                    stop_scan.mark_hit(_matched_stop)
                 rem_text, tool_list, was_healed = streamer.finalize()
                 # [TOOL-LOOP] 客户端禁止并行调用时只回传第一个（见 cap_parallel_tool_calls）
                 tool_list = cap_parallel_tool_calls(tool_list, parallel_disallowed)

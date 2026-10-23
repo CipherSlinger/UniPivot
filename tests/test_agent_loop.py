@@ -430,6 +430,66 @@ def test_tool_choice_named_tool_filters_other_tools():
     print("test_tool_choice_named_tool_filters_other_tools: PASSED")
 
 
+def test_adaptive_thinking_is_not_silently_disabled():
+    """[AGENT-LOOP] Claude Code 现行写法 `{"type":"adaptive"}` 必须开启思考。
+
+    实测（2.1.293）：Claude Code 发出的就是
+    `{"type": "adaptive", "display": "omitted"}`，而网关此前只认
+    `type == "enabled"`，于是**静默**关掉了思考——请求照常成功，客户端拿到一个
+    非思考的回答，既没有错误也没有日志。Claude Code 的二进制里明确写着
+    `thinking.type=enabled is deprecated，use adaptive instead`，所以这不是
+    「旧字段没兼容」，而是对着现行客户端长期失效。
+
+    反向同样要钉住：OpenAI 路径的 `bool(req.thinking)` 把 `{"type":"disabled"}`
+    （非空 dict）判成「要思考」，与客户端的明确要求相反。
+    """
+    seen: dict = {}
+
+    class _P:
+        async def chat(self, messages, model, **kw):
+            seen.clear()
+            seen.update(kw)
+            yield "ok", {"conversation_id": "c"}
+
+    srv._make_provider = lambda key: _P()
+    try:
+        client = _client()
+        # Anthropic：现状是 adaptive，历史写法是 enabled，两者都必须开
+        for thinking, expected in [
+            ({"type": "adaptive", "display": "omitted"}, True),
+            ({"type": "adaptive"}, True),
+            ({"type": "enabled", "budget_tokens": 2048}, True),
+            ({"type": "disabled"}, False),
+            (None, False),
+        ]:
+            body = {"model": "claude-3-7-sonnet", "max_tokens": 128,
+                    "messages": [{"role": "user", "content": "hi"}]}
+            if thinking is not None:
+                body["thinking"] = thinking
+            resp = client.post("/v1/messages", json=body)
+            assert resp.status_code == 200, resp.text
+            assert seen.get("thinking") is expected, (
+                f"anthropic thinking={thinking!r} -> {seen.get('thinking')}"
+            )
+
+        # OpenAI / Responses 路径共用同一个判定
+        for thinking, expected in [
+            (True, True), (False, False), ({"type": "adaptive"}, True),
+            ({"type": "disabled"}, False), (None, False),
+        ]:
+            body = {"model": "gpt-4o", "messages": [{"role": "user", "content": "hi"}]}
+            if thinking is not None:
+                body["thinking"] = thinking
+            resp = client.post("/v1/chat/completions", json=body)
+            assert resp.status_code == 200, resp.text
+            assert seen.get("thinking") is expected, (
+                f"openai thinking={thinking!r} -> {seen.get('thinking')}"
+            )
+    finally:
+        srv._make_provider = _default_factory
+    print("test_adaptive_thinking_is_not_silently_disabled: PASSED")
+
+
 def test_codex_reasoning_object_enables_thinking():
     """Codex 的 `reasoning:{"effort": ...}` 必须与 `reasoning_effort` 等价。
 
@@ -693,6 +753,7 @@ def run_all():
         test_tool_choice_none_suppresses_tool_calls_everywhere,
         test_tool_choice_named_tool_filters_other_tools,
         test_reasoning_replay_is_not_a_user_message,
+        test_adaptive_thinking_is_not_silently_disabled,
         test_codex_reasoning_object_enables_thinking,
         test_parallel_tool_calls_false_caps_to_one_everywhere,
         test_tool_call_in_reasoning_channel_is_not_lost,

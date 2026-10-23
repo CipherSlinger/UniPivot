@@ -227,6 +227,117 @@ def test_terminal_delta_carries_usage():
     print("test_terminal_delta_carries_usage: PASSED")
 
 
+# ------------------------------------------- 8. 停用词下的块生命周期
+
+
+def _events_with_stop(script, stop_sequences, *, tools=None) -> list[dict]:
+    """同 `_events`，但带上客户端停用词（Claude Code 常同时给 tools + stop_sequences）。"""
+    from fastapi.testclient import TestClient as _TC
+
+    ScriptedProvider.script = script
+    default_factory = srv._make_provider
+    srv._make_provider = lambda key: ScriptedProvider()
+    body = {
+        "model": "claude-3-7-sonnet",
+        "max_tokens": 256,
+        "stream": True,
+        "messages": [{"role": "user", "content": "hi"}],
+        "stop_sequences": stop_sequences,
+    }
+    if tools is not None:
+        body["tools"] = tools
+    try:
+        client = _TC(srv.app)
+        with client.stream("POST", "/v1/messages", json=body) as r:
+            assert r.status_code == 200, r.read()
+            raw = "".join(r.iter_text())
+    finally:
+        srv._make_provider = default_factory
+
+    out = []
+    for block in raw.split("\n\n"):
+        for line in block.splitlines():
+            if line.startswith("data: "):
+                try:
+                    out.append(json.loads(line[len("data: "):]))
+                except json.JSONDecodeError:
+                    pass
+    return out
+
+
+def _text_of(events: list[dict]) -> str:
+    return "".join(
+        e["delta"].get("text", "") for e in events
+        if e.get("type") == "content_block_delta" and e["delta"].get("type") == "text_delta"
+    )
+
+
+def test_stop_sequence_stream_keeps_block_lifecycle_valid():
+    """[ANTHROPIC-STREAM] 停用词扫描器扣住尾巴时，不能把已关闭的块重新打开。
+
+    实测缺陷：`feed()` 在尾巴短于保留长度时返回空串，调用方于是**关掉刚打开的
+    正文块**并把 `current_block_type` 置空；命中之后走到收口处，`else` 分支又用
+    硬编码的索引 0 开了一个空块——索引 0 早已被使用并关闭过。对 Claude Code 来说
+    这是非法事件流：实测同一索引被复用后，客户端只留下了后一个块的内容，前面
+    整段正文被静默丢弃（用户看到的是「答到一半没了」，没有任何报错）。
+    """
+    # 第一块短于保留窗口（"END" 保留 2 字符），必然触发空返回
+    script = [("Hi", {}), (" there", {}), ("END", {}), ("never mind", {})]
+    events = _events_with_stop(script, ["END"])
+    opened = _assert_block_lifecycle(events)
+    assert opened, "停用词路径必须产出至少一个正文块"
+    text = _text_of(events)
+    assert text == "Hi there", f"命中点之后的正文泄漏或正文丢失: {text!r}"
+    md = [e for e in events if e.get("type") == "message_delta"][-1]
+    assert md["delta"]["stop_reason"] == "stop_sequence", md
+    print("test_stop_sequence_stream_keeps_block_lifecycle_valid: PASSED")
+
+
+def test_stop_sequence_stream_does_not_fabricate_empty_blocks():
+    """命中后不得继续把上游残料切成成串的空块：那既浪费事件、又踩到索引复用的路径。"""
+    script = [("short", {}), ("END", {}), ("x" * 50, {}), ("y" * 50, {})]
+    events = _events_with_stop(script, ["END"])
+    opened = _assert_block_lifecycle(events)
+    assert len(opened) == 1, [b["content_block"]["type"] for b in opened]
+    assert _text_of(events) == "short"
+    print("test_stop_sequence_stream_does_not_fabricate_empty_blocks: PASSED")
+
+
+def test_stop_sequence_is_never_reported_as_an_empty_string():
+    """[PROTOCOL] 只要 `stop_reason` 是 `stop_sequence`，就必须带上命中的原文。
+
+    `SpeculativeToolStreamer.truncate_at_stop()` 此前只返回布尔值，调用方于是
+    `mark_hit()` 无参调用，扫描器用默认的 `matched=""` 建了一条命中记录——线契约
+    要求这个字段是命中的字符串，空串只告诉客户端「被截了」，不说被什么截。
+    `truncate_final()` 本来就算出了命中的原文，只是被丢掉了。
+
+    这里断言的是**性质**而不是某一个形状：两个模式 × 各种分块方式，凡是报告
+    `stop_sequence` 的，`stop_sequence` 必须非空。单点用例只能守住想得到的那
+    一条路径，而这条字段由两个模式、四个收口点共同产出。
+    """
+    scripts = [
+        [("just prose", {}), ("STOPHERE", {})],
+        [("pro", {}), ("se STOP", {}), ("HERE tail", {})],
+        [("ok\n```tool_call\n", {}), ('{"name": "Read"}\n```\n', {}), ("STOPHERE", {})],
+    ]
+    checked = 0
+    for script in scripts:
+        for tools in (None, TOOLS):
+            events = _events_with_stop(script, ["STOPHERE"], tools=tools)
+            _assert_block_lifecycle(events)
+            mds = [e for e in events if e.get("type") == "message_delta"]
+            assert mds, f"缺少 message_delta: {script}"
+            delta = mds[-1]["delta"]
+            if delta.get("stop_reason") == "stop_sequence":
+                assert delta.get("stop_sequence"), (
+                    f"报告了 stop_sequence 却没带命中的原文 (tools={bool(tools)}): {delta}"
+                )
+                assert delta["stop_sequence"] == "STOPHERE", delta
+                checked += 1
+    assert checked >= 2, f"样本没有覆盖到 stop_sequence 报告路径，只命中 {checked} 次"
+    print("test_stop_sequence_is_never_reported_as_an_empty_string: PASSED")
+
+
 def run_all():
     tests = [
         test_plain_text_stream_is_valid,
@@ -236,6 +347,9 @@ def run_all():
         test_tool_stream_produces_valid_tool_use_block,
         test_tool_stream_with_reasoning_is_valid,
         test_terminal_delta_carries_usage,
+        test_stop_sequence_stream_keeps_block_lifecycle_valid,
+        test_stop_sequence_stream_does_not_fabricate_empty_blocks,
+        test_stop_sequence_is_never_reported_as_an_empty_string,
     ]
     for fn in tests:
         fn()
