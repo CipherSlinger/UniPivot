@@ -25,8 +25,12 @@ description: OpenAI Responses wire contract ownership — what Codex CLI actuall
 ## 已被证伪，不要再提
 - **`response.incomplete` 终止事件**：真实 Codex 实测 → 5 次重连后硬失败。当前 `response.completed` 是正确选择。
 - **`max_tokens`**：上游不支持长度控制，见 wire-anthropic 同一条。
+- **`apply_patch` 被渲染成普通 function 工具**：已修（commit 87b1230）。真实抓包里它是 `{"type":"custom","name":"apply_patch"}`，网关渲染出 `{"input": ...}` freeform 契约，端到端实测文件真被创建。
+- **`response.failed` 能减少重试**：不能。实测三种终局事件形状的重试次数都是 6。它修复的是**失败原因能否到达用户**（`stream closed before response.completed` → `upstream quota exceeded`）。
+- **`gpt-5-codex` 的抓包能代表 Codex 的工具声明**：不能。该模型不在 Codex 自己的 catalog 里，会退回无 `apply_patch_tool_type` 的元数据，于是**根本不声明 `apply_patch`**。要看完整声明必须用 catalog 内的模型。
+
+## 工作方法补充
+- `codex` 的 `base_url` 来自 `CODEX_HOME/config.toml` 的 `[model_providers.*]`，**`OPENAI_BASE_URL` 环境变量被忽略**。测不同端口必须复制一份 config 改 `base_url`，否则所有测量都打在同一个旧端口上（曾因此得出「两种形状没区别」的错误结论）。
 
 ## 待办队列（PM 维护，从上往下做）
-1. **实锤可疑**：真实 Codex 的原始请求里，`apply_patch` 是一个 **freeform custom 工具**，但网关把它渲染成了普通 function 工具。
-2. 工具声明列表末尾出现空名条目 `- ``: `（`Args: {}`）—— 实测截图可见，来源待查。
-3. 跑通真实 Codex 的 `apply_patch` 端到端（文件必须真的被创建）。
+1. `response.failed` 的 `error.code` 是否该用 OpenAI 标准枚举（`rate_limit_exceeded` 等）而非内部 `err_type`，影响客户端重试分级 —— 需要真实 Codex 验证。
