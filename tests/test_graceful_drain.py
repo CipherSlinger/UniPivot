@@ -135,6 +135,47 @@ def test_health_and_diagnostics_expose_inflight():
     print("test_health_and_diagnostics_expose_inflight: PASSED")
 
 
+def test_observer_endpoints_do_not_count_themselves():
+    """[OPT-015] 一台空闲网关的在途数必须是 0，而不是「1」或「N」。
+
+    实测缺陷：诊断请求把自己计进了被读的量里，空闲网关永远报 1；并发 n 个
+    诊断请求就报 n。这同时破坏了优雅停机的判据——`_drain_inflight_requests`
+    以「计数归零」认定排空，而计数永远不会归零，于是每次停机都白等满
+    GATEWAY_SHUTDOWN_DRAIN_TIMEOUT。
+    """
+    _reset()
+
+    async def _send(message):
+        return None
+
+    async def _app(scope, receive, send):
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+        await send({"type": "http.response.body", "body": b"{}", "more_body": False})
+
+    mw = srv.InflightTrackerMiddleware(_app)
+    for path in ("/health", "/v1/diagnostics", "/diagnostics"):
+        asyncio.run(mw({"type": "http", "path": path}, None, _send))
+        assert srv._inflight_requests == 0, f"{path} 不得计入在途数"
+
+    # 普通业务路径照常计数，且观测端点**不改变**它读到的值
+    seen = []
+
+    async def _work(scope, receive, send):
+        seen.append(srv._inflight_requests)
+        await _app(scope, receive, send)
+
+    mw_work = srv.InflightTrackerMiddleware(_work)
+    asyncio.run(mw_work({"type": "http", "path": "/v1/messages"}, None, _send))
+    assert seen == [1], f"业务请求在途时应读到 1，实际 {seen}"
+    assert srv._inflight_requests == 0
+
+    # 端到端：空闲网关读诊断为 0
+    client = TestClient(srv.app)
+    assert client.get("/v1/diagnostics").json()["inflight_requests"] == 0
+    assert client.get("/health").json()["inflight_requests"] == 0
+    print("test_observer_endpoints_do_not_count_themselves: PASSED")
+
+
 def run_all():
     test_drain_when_idle_returns_immediately()
     test_drain_waits_for_completion()
@@ -143,6 +184,7 @@ def run_all():
     test_middleware_spans_streaming_response()
     test_middleware_ignores_non_http_scope()
     test_health_and_diagnostics_expose_inflight()
+    test_observer_endpoints_do_not_count_themselves()
     print("\n✅ All graceful in-flight drain tests (OPT-015) passed!")
 
 

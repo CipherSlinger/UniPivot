@@ -731,6 +731,15 @@ app.add_middleware(
 
 _inflight_requests = 0
 
+# 观测端点自身不得计入在途数。它们的存在意义就是**读数**：读数请求把自己算进
+# 被读的量里，量表就不再是「现在有多少工作在做」，而是「有多少工作 + 1」。
+# 实测缺陷：一台完全空闲的网关，`GET /v1/diagnostics` 永远返回
+# `inflight_requests: 1`（三个并发诊断请求返回 1/2/3/4，即每个请求都数到了
+# 自己）。这个数字同时是优雅停机的完成判据（`_drain_inflight_requests` 以 0
+# 为排空），一个不可能为 0 的量表既无法验证排空，也无法回答运维唯一想问的
+# 那个问题——「现在忙不忙」。
+_INFLIGHT_OBSERVER_PATHS = frozenset({"/health", "/v1/diagnostics", "/diagnostics"})
+
 
 class InflightTrackerMiddleware:
     """纯 ASGI 中间件：精确统计在途请求数（含流式响应全程）。
@@ -738,6 +747,9 @@ class InflightTrackerMiddleware:
     相比 BaseHTTPMiddleware，纯 ASGI 中间件会 await 整个应用调用，
     因此流式响应只有在全部帧发送完毕后才会释放计数，
     从而保证停机排空能真正等到长连接流式响应收尾。
+
+    观测端点（见 `_INFLIGHT_OBSERVER_PATHS`）不计入：它们是读表的人，
+    不是表里的数。
     """
 
     def __init__(self, app):
@@ -746,6 +758,9 @@ class InflightTrackerMiddleware:
     async def __call__(self, scope, receive, send):
         global _inflight_requests
         if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+        if scope.get("path", "") in _INFLIGHT_OBSERVER_PATHS:
             await self.app(scope, receive, send)
             return
         _inflight_requests += 1
