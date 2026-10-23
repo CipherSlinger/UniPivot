@@ -79,6 +79,7 @@ from providers import (
     cap_parallel_tool_calls,
     parallel_calls_disallowed,
     recover_tools_from_reasoning,
+    resolve_client_session_id,
     resolve_allowed_tools,
     StopSequenceScanner,
     truncate_final,
@@ -2989,6 +2990,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         )
 
     parallel_disallowed = parallel_calls_disallowed(None, req.tool_choice)
+    # [SESSION-ID] 本请求的客户端线程标识：`conversation_id` 是显式字段，但它并非
+    # 所有客户端都会发——真实 Claude Code 2.1.293 driver 19 份抓包里出现 0 次，
+    # 身份全在 `metadata.user_id` 的 JSON 串里。此前只读前者，于是整条粘滞/续聊/
+    # 匿名回收链路对 Claude Code 完全空转（实测每轮新建上游会话 + 重发全量历史）。
+    client_session_id = resolve_client_session_id(req.conversation_id, req.metadata)
     # [PROTOCOL] Anthropic 的 stop_sequences 是硬语义，网关侧截断（见 stop_sequences.py）
     stop_seq = req.stop_sequences
     gateway_messages = convert_anthropic_to_gateway_messages(
@@ -3025,7 +3031,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
     # 2.1 智能会话粘滞解析与跨模型状态迁移
     affinity_decision = session_affinity_manager.resolve_affinity(
-        session_id=req.conversation_id,
+        session_id=client_session_id,
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
@@ -3262,15 +3268,15 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     )
                     yield sse_message_stop()
 
-                    if req.conversation_id or conv_id:
+                    if client_session_id or conv_id:
                         session_affinity_manager.record_turn(
-                            req.conversation_id or conv_id,
+                            client_session_id or conv_id,
                             dispatched_provider,
                             dispatched_model,
                             conv_id,
                         )
 
-                    if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
+                    if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
                         conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                     success = True
                     return
@@ -3428,7 +3434,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
 
                 yield sse_message_stop()
 
-                if req.conversation_id or conv_id:
+                if client_session_id or conv_id:
                     # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
                     keep_provider = (
                         affinity_decision.provider_key
@@ -3436,13 +3442,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         else dispatched_provider
                     )
                     session_affinity_manager.record_turn(
-                        req.conversation_id or conv_id,
+                        client_session_id or conv_id,
                         keep_provider,
                         dispatched_model,
                         None if affinity_decision.status == "degraded" else conv_id,
                     )
 
-                if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
+                if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                 success = True
             except ProviderError as e:
@@ -3580,7 +3586,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         if not success and not group_finalized and flight_decision and flight_decision.is_leader:
             terminate_aborted_group(flight_decision.group)
 
-    if req.conversation_id or conv_id:
+    if client_session_id or conv_id:
         # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
         keep_provider = (
             affinity_decision.provider_key
@@ -3588,13 +3594,13 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             else dispatched_provider
         )
         session_affinity_manager.record_turn(
-            req.conversation_id or conv_id,
+            client_session_id or conv_id,
             keep_provider,
             dispatched_model,
             None if affinity_decision.status == "degraded" else conv_id,
         )
 
-    if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
+    if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
         conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
 
     full_output = "".join(chunks)
@@ -3665,7 +3671,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 input_tokens=input_tokens,
                 output_tokens=output_tokens,
                 stop_reason="tool_use",
-                conversation_id=req.conversation_id or conv_id,
+                conversation_id=client_session_id or conv_id,
             )
             if failover_event:
                 msg_data["failover"] = failover_event.to_dict()
@@ -3687,7 +3693,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         output_tokens=output_tokens,
         # [PROTOCOL] Anthropic 的枚举里有 stop_sequence，如实报告截断原因
         stop_reason="stop_sequence" if _stop_matched else "end_turn",
-        conversation_id=req.conversation_id or conv_id,
+        conversation_id=client_session_id or conv_id,
         stop_sequence=_stop_matched or None,
     )
     if failover_event:

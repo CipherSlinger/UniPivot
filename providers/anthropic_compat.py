@@ -77,6 +77,50 @@ class AnthropicCountTokensRequest(AnthropicRequestBody):
     """count_tokens 与 messages 同构；独有字段为空（估算只读 messages/system/tools）。"""
 
 
+def resolve_client_session_id(
+    conversation_id: Optional[str], metadata: Optional[dict]
+) -> Optional[str]:
+    """本请求的**客户端线程标识**——粘滞、续聊判定、匿名会话回收都以它为键。
+
+    [SESSION-ID] Claude Code 从不发送 `conversation_id`：实测 19 份真实抓包
+    （`/tmp/e2e/claude_bodies.jsonl`、`/tmp/e2e/anth/rr_bodies.jsonl`、
+    `/tmp/e2e/think_replayed.jsonl`、`/tmp/e2e/sigprobe/client_bodies.jsonl`）
+    里该键出现 **0 次**，会话身份全部放在 `metadata.user_id` 这个 JSON 字符串里：
+    `{"device_id":"29c47c8b…","account_uuid":"","session_id":"<uuid>"}`，
+    其中 `device_id` 跨会话恒定、`session_id` 每个会话一个。
+
+    网关此前只读 `req.conversation_id`，于是对 Claude Code 而言这条身份
+    **一个字符都没被读过**，后果全部可测（同一份抓包驱动 5 轮）：
+    上游收到的 `conversation_id` 恒为 `None`（每轮新建会话）、每轮重发全量展平
+    历史（20852/21643/22434/23225/24016 字符，合计 112,170，而带上身份只需
+    20852+4×10 = 20,892）、每轮把本该续用的上游会话当成匿名临时会话排进删除队列。
+
+    `conversation_id` 优先——它是显式字段，语义无歧义；`metadata` 是兜底，
+    因为其它客户端不一定会填。任何解析失败都退回 `None`（失败开放：宁可新建
+    一次会话，也不要把一个坏值当成上游会话 id 回放出去）。
+    """
+    if conversation_id:
+        return conversation_id
+    if not isinstance(metadata, dict):
+        return None
+    user_id = metadata.get("user_id")
+    if isinstance(user_id, dict):
+        ident = user_id
+    elif isinstance(user_id, str) and user_id.strip():
+        try:
+            ident = json.loads(user_id)
+        except (ValueError, TypeError):
+            return None
+    else:
+        return None
+    if not isinstance(ident, dict):
+        return None
+    session_id = ident.get("session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        return session_id.strip()
+    return None
+
+
 def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None]) -> str:
     """从 Anthropic content（字符串或 content block 列表）中提取纯文本。"""
     if content is None:

@@ -656,6 +656,82 @@ def test_thinking_omitted_does_not_change_the_token_count():
     )
 
 
+def test_metadata_session_id_keys_the_conversation():
+    """`metadata.user_id.session_id` 是 Claude Code **唯一**的会话身份，必须被用上。
+
+    实测（真实 `claude` 2.1.293，19 份抓包，见 `/tmp/e2e/claude_bodies.jsonl` 等）：
+    Claude Code 从不发送 `conversation_id` —— 它把会话身份放在
+    `metadata.user_id` 这个 JSON 字符串里（`{"device_id":…, "session_id":"<uuid>"}`，
+    device_id 跨会话恒定，session_id 每个会话一个）。而网关的会话粘滞、续聊判定、
+    匿名临时会话删除全部只读 `req.conversation_id`，于是这条身份**一个字符都没被读过**。
+
+    修复前的实测症状（同一份抓包驱动，5 轮）：
+      - 每轮 `conversation_id` 传给上游都是 `None` → provider 永远走「新建会话」分支；
+      - 每轮都重发**全量展平历史**：20852 / 21643 / 22434 / 23225 / 24016 字符，
+        合计 112,170 字符；而带上会话身份后是 20852 + 4×10 = 20,892 字符
+        （5.4 倍的输入 token 白付，且随轮次线性增长）；
+      - 每轮都把「匿名临时会话」排进删除队列（实测 3 轮 = 3 次删除），
+        而上游会话其实本该被续用。
+
+    这条测试断言的是**上游真的收到了会话身份**，不是网关自己的头部：
+    一个只改了遥测、没改 `chat_args` 的修复会在这里红。
+    """
+    from fastapi.testclient import TestClient as _TC
+
+    seen = []
+
+    class _ConvProvider:
+        async def chat(self, messages, model, **kw):
+            seen.append(kw.get("conversation_id"))
+            yield "ok", {}
+            yield "", {"conversation_id": "UPSTREAM-CONV"}
+
+        async def delete_conversation(self, *a, **kw):
+            seen.append("DELETED")
+            return True
+
+    default_factory = srv._make_provider
+    srv._make_provider = lambda key: _ConvProvider()
+    srv.session_affinity_manager.clear()
+    # 真实 Claude Code 的形状：没有 conversation_id，只有 metadata。
+    meta = {
+        "user_id": json.dumps(
+            {"device_id": "29c47c8beabc", "account_uuid": "", "session_id": "sess-AAA"}
+        )
+    }
+    try:
+        client = _TC(srv.app)
+        for i in range(3):
+            r = client.post(
+                "/v1/messages",
+                json={
+                    "model": "claude-3-5-sonnet",
+                    "max_tokens": 64,
+                    "stream": False,
+                    "metadata": meta,
+                    "messages": [{"role": "user", "content": f"turn {i}"}],
+                },
+            )
+            assert r.status_code == 200, r.text
+    finally:
+        srv._make_provider = default_factory
+        srv.session_affinity_manager.clear()
+
+    continued = [c for c in seen if c != "DELETED"]
+    deletes = [c for c in seen if c == "DELETED"]
+    assert continued[0] is None, (
+        f"首轮不该带上游会话 id（还没观测到过）: {continued}"
+    )
+    assert continued[1:] == ["UPSTREAM-CONV", "UPSTREAM-CONV"], (
+        "`metadata.user_id.session_id` 没有被当作会话身份：上游从没收到过续聊 id，"
+        f"每轮都在重建上下文。实测 = {continued}"
+    )
+    assert not deletes, (
+        f"会话身份缺失导致每轮都把活跃会话当成匿名临时会话排进删除队列: {len(deletes)} 次"
+    )
+    print("test_metadata_session_id_keys_the_conversation: PASSED")
+
+
 def run_all():
     tests = [
         test_plain_text_stream_is_valid,
@@ -676,6 +752,7 @@ def run_all():
         test_thinking_display_omitted_still_recovers_tool_from_reasoning,
         test_non_streaming_thinking_display_omitted_sends_no_thinking_block,
         test_thinking_omitted_does_not_change_the_token_count,
+        test_metadata_session_id_keys_the_conversation,
     ]
     for fn in tests:
         fn()
