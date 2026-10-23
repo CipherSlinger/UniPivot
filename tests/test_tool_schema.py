@@ -42,6 +42,7 @@ from providers.anthropic_compat import (  # noqa: E402
     extract_anthropic_content,
     format_tools_system_prompt,
 )
+from providers.tool_streamer import resolve_allowed_tools  # noqa: E402
 
 
 def _nested_tool() -> dict:
@@ -148,6 +149,52 @@ def test_tool_choice_directives():
     print("test_tool_choice_directives: PASSED")
 
 
+def test_responses_flat_tool_choice_is_enforced():
+    """Responses 的**扁平**形状既是工具声明的形状，也是 tool_choice 的形状。
+
+    [TOOL-LOOP] 两处实现都只认 OpenAI 的嵌套形状
+    `{"type":"function","function":{"name":...}}` 与 Anthropic 的
+    `{"type":"tool","name":...}`，于是 Responses 原生写法
+    `{"type":"function","name":"read_file"}`（顶层 name，无 function 包装）
+    在解析白名单里**失败开放**成「全部声明工具」，在提示词里也**不追加任何指令**：
+
+        Responses flat {type:function, name}  allow={'read_file','write_file'}  directive=''
+
+    客户端点名了一个工具，网关既没告诉模型去调它，也没有在解析端挡住别的调用。
+    对 Codex 这类按 Responses 契约发请求的客户端，这个约束等于不存在。
+
+    custom（freeform）的扁平形状同理：`{"type":"custom","name":"apply_patch"}`。
+    """
+    tools = [
+        {"type": "function", "name": "read_file", "parameters": {"type": "object"}},
+        {"type": "function", "name": "write_file", "parameters": {"type": "object"}},
+        {"type": "custom", "name": "apply_patch"},
+    ]
+
+    # 解析端：点名即收窄到该工具
+    flat_fn = {"type": "function", "name": "read_file"}
+    assert resolve_allowed_tools(tools, flat_fn) == {"read_file"}, (
+        f"Responses 扁平 tool_choice 未收窄白名单: {resolve_allowed_tools(tools, flat_fn)}"
+    )
+    flat_custom = {"type": "custom", "name": "apply_patch"}
+    assert resolve_allowed_tools(tools, flat_custom) == {"apply_patch"}, (
+        f"Responses 扁平 custom 形状未收窄白名单: {resolve_allowed_tools(tools, flat_custom)}"
+    )
+
+    # 提示词端：点名必须出现
+    assert "MUST call the tool `read_file`" in format_tools_system_prompt(tools, tool_choice=flat_fn)
+    assert "MUST call the tool `apply_patch`" in format_tools_system_prompt(tools, tool_choice=flat_custom)
+
+    # 回归边界：**没有** name 的 `{"type":"function"}` 仍是无法识别 -> 失败开放，
+    # 不得被误当成「点名了某个空名字」而清空白名单。
+    assert resolve_allowed_tools(tools, {"type": "function"}) == {
+        "read_file", "write_file", "apply_patch"
+    }
+    assert format_tools_system_prompt(tools, tool_choice={"type": "function"}) == \
+        format_tools_system_prompt(tools)
+    print("test_responses_flat_tool_choice_is_enforced: PASSED")
+
+
 # ------------------------------------------------- 5. description 截断
 
 def test_long_description_is_truncated():
@@ -248,6 +295,7 @@ def run_all():
         test_required_vs_optional_is_expressed,
         test_anthropic_input_schema_shape,
         test_tool_choice_directives,
+        test_responses_flat_tool_choice_is_enforced,
         test_long_description_is_truncated,
         test_duplicate_instruction_block_is_gone,
         test_oversized_tool_set_degrades_gracefully,

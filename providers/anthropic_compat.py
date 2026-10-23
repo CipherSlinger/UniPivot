@@ -267,6 +267,10 @@ def _tool_choice_directive(tool_choice: Any) -> str:
             name = tool_choice.get("name")
         elif isinstance(tool_choice.get("function"), dict):
             name = tool_choice["function"].get("name")
+        else:
+            # Responses 扁平形状（`{"type":"function","name":...}` / custom 的
+            # `{"type":"custom","name":...}`）；与 `resolve_allowed_tools` 同一判定。
+            name = tool_choice.get("name")
         if isinstance(name, str) and name.strip():
             return f"You MUST call the tool `{name.strip()}` in this turn, with arguments matching its schema."
     return ""

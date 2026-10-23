@@ -106,6 +106,14 @@ def resolve_allowed_tools(tools: Any, tool_choice: Any = None) -> Optional[set]:
         elif isinstance(tool_choice.get("function"), dict):
             # OpenAI: {"type": "function", "function": {"name": ...}}
             chosen = tool_choice["function"].get("name")
+        else:
+            # [TOOL-LOOP] Responses 的**扁平**形状：`{"type": "function", "name": ...}`
+            # 与 custom 工具的 `{"type": "custom", "name": ...}`——名字在顶层，没有
+            # function 包装。这正是 Responses 原生写法（也是它声明工具的形状），
+            # 漏掉它等于对 Codex 这类客户端**完全没有** tool_choice 约束：实测
+            # 收窄前是 `{'read_file','write_file'}`，客户端点名了 `read_file` 却
+            # 仍能收到 `write_file` 的调用，而客户端按契约不会执行它，回合报废。
+            chosen = tool_choice.get("name")
         if isinstance(chosen, str) and chosen.strip():
             # 点名的工具若根本没声明（客户端自相矛盾），按无法识别处理：
             # 收紧白名单只会把一个可用的回合变成空回合，失败开放更安全。
