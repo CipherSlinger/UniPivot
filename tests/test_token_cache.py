@@ -184,7 +184,46 @@ def test_diagnostics_exposes_new_sections():
     tc = data["token_counter_cache"]
     for key in ("enabled", "entries", "max_entries", "hits", "misses", "evictions", "hit_rate"):
         assert key in tc, key
+    pc = data["prompt_cache"]
+    assert pc["status"] in ("active", "not_wired"), pc["status"]
+    assert "wired" in pc, sorted(pc)
     print("test_diagnostics_exposes_new_sections: PASSED")
+
+
+def test_prompt_cache_diagnostics_never_claim_an_unwired_cache():
+    """`prompt_cache` 区块不得宣称一个代码里并不存在的缓存。
+
+    [DIAG-HONESTY] 实测：向网关连发 12 个带 `cache_control` 的请求后，这个区块的
+    每一个计数器仍然全是 0（前后完全相等），而 `status` 一直写着 `"active"`。
+    原因不是缓存没命中，而是 `PromptCacheManager` 在**生产路径上没有任何调用点**
+    ——`get`/`set`/`match_prefix` 只被它自己的单测调用，`server.py` 只读了
+    `get_stats()`。同时 `ttft_reduction_pct: 45.0` 是一个写死的常数收益。
+
+    一个宣称自己启用了缓存、还把收益写成常数的诊断面板，比没有这个面板更糟：
+    运维据此判断长上下文的开销已被缓存吸收，而实际每次请求都在完整重建上下文。
+    这与 OPT-031/035 的 dossier/dispatch 分歧是同一类缺陷——系统宣称的事情，
+    代码并没有做。
+
+    断言：未接入时必须 `status == "not_wired"`、`wired is False`、且**不伪造**
+    收益数字（`ttft_reduction_pct is None`，而不是 0——0 会被读成「测过，没收益」）。
+    """
+    from providers.prompt_cache import prompt_cache_manager
+
+    prompt_cache_manager.clear()
+    client = TestClient(srv.app)
+    pc = client.get("/v1/diagnostics").json()["prompt_cache"]
+
+    assert pc["total_requests"] == 0, pc
+    assert pc["status"] == "not_wired", (
+        f"没有接入任何缓存读写，诊断却报告 status={pc['status']!r}——"
+        f"运维会据此认为缓存已经生效"
+    )
+    assert pc["wired"] is False, pc
+    assert pc["ttft_reduction_pct"] is None, (
+        f"未接入时仍然报告 ttft 收益 {pc['ttft_reduction_pct']!r}——"
+        f"这个数字是写死的常数，不是量出来的"
+    )
+    print("test_prompt_cache_diagnostics_never_claim_an_unwired_cache: PASSED")
 
 
 def run_all():
@@ -195,6 +234,7 @@ def run_all():
     test_compute_count_key_determinism_and_discrimination()
     test_count_tokens_endpoint_memoization_and_no_upstream()
     test_diagnostics_exposes_new_sections()
+    test_prompt_cache_diagnostics_never_claim_an_unwired_cache()
     print("\n✅ All deterministic token count cache tests (OPT-009) passed!")
 
 

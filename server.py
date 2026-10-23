@@ -92,9 +92,9 @@ from providers import (
     sse_message_delta,
     sse_message_start,
     sse_message_stop,
+    # [DIAG-HONESTY] 只导入真正用到的：`get_prompt_cache_manager` 与
+    # `has_cache_control` 此前被导入却从未调用，是「看起来接好了」的假象之一。
     prompt_cache_manager,
-    get_prompt_cache_manager,
-    has_cache_control,
     ResponsesRequest,
     ResponsesEventStream,
     convert_responses_to_gateway_messages,
@@ -1597,16 +1597,35 @@ async def get_diagnostics():
         "active_connections": active_conns,
     }
 
-    # 6. Prompt Cache 真实动态命中率与 Token 节省统计
+    # 6. Prompt Cache 统计
+    #
+    # [DIAG-HONESTY] 这里必须如实报告，而不是宣称一个并不存在的缓存。
+    # 实测：向网关连发 12 个带 `cache_control` 的请求后，本区块的每一个计数器
+    # 仍然全是 0（`changed: False`），而 `status` 一直写着 `"active"`——因为
+    # `PromptCacheManager` 在生产路径上**没有任何调用点**（`get`/`set`/
+    # `match_prefix` 只在它自己的单测里被调用，server.py 只读了 `get_stats()`）。
+    # 更糟的是 `ttft_reduction_pct: 45.0` 是一个**写死的**收益数字：它不是量出来的，
+    # 而是「只要命中过一次就报 45%」。
+    #
+    # 一个宣称自己启用了缓存、并把收益写成常数的诊断面板，比没有这个面板更糟：
+    # 运维据此判断「长上下文的开销已经被缓存吸收了」，而实际每一次请求都在
+    # 完整重建上下文。这与本仓库反复修复的「系统宣称的事情代码并没有做」
+    # （OPT-031/035 的 dossier/dispatch 分歧）是同一类缺陷。
+    #
+    # 现在如实报告：没有接入就是 `"not_wired"`，且不伪造任何收益数字。
     cache_stats = prompt_cache_manager.get_stats()
+    _cache_wired = cache_stats["total_requests"] > 0
     prompt_cache = {
-        "status": "active",
+        "status": "active" if _cache_wired else "not_wired",
         **cache_stats,
+        "wired": _cache_wired,
         "hit_rate": cache_stats["hit_ratio"],
         "hit_rate_pct": round(cache_stats["hit_ratio"] * 100, 2),
         "hits": cache_stats["cache_hits"],
         "tokens_saved": cache_stats["saved_tokens"],
-        "ttft_reduction_pct": 45.0 if cache_stats["cache_hits"] > 0 else 0.0,
+        # 只有真正观测到命中才谈得上省了多少首字延迟；未接入时为 None 而不是 0，
+        # 因为 0 会被读成「测了一下，没有收益」。
+        "ttft_reduction_pct": None,
     }
 
     # 7. 自适应负载均衡器实时度量与被禁用节点列表
