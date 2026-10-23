@@ -2400,6 +2400,8 @@ class FailoverRouter:
                     "解除后也可用 DELETE /v1/admin/credential-outage 立即清除该状态。",
                     status=503,
                     err_type="credential_outage",
+                    # [H6] 真实窗口：快速失败态还剩多久就报多久（TTL 到期即放行探路）。
+                    retry_after=self.cooldown_tracker.credential_watch.remaining_seconds(),
                 )
 
             # [OPT-033] 运维禁用硬阻断：`DISABLED_PROVIDERS` 是运维关于「这个节点不属于
@@ -2430,6 +2432,8 @@ class FailoverRouter:
                         f"（环境变量 DISABLED_PROVIDERS）或改用其他厂商模型。",
                         status=503,
                         err_type="disabled",
+                        # [H6] 禁用是**运维声明**，没有任何窗口会自己到期——等多久都没用，
+                        # 故不报退避时长（由网关层回退到默认值，而不是编一个倒计时）。
                     )
                 next_cand = candidates[0]
                 self.cooldown_tracker.note_disabled_gate_redirect(
@@ -2468,6 +2472,8 @@ class FailoverRouter:
                         f"请使用 POST /v1/admin/quarantine 解除租约，或改用其他厂商模型。",
                         status=503,
                         err_type="quarantined",
+                        # [H6] 租约的剩余时长是已知的，照实报。
+                        retry_after=remaining,
                     )
                 next_cand = candidates[0]
                 logger.warning(
@@ -2526,6 +2532,13 @@ class FailoverRouter:
                         f"重登无效，请静待平台解除，切勿重试。",
                         status=503,
                         err_type="ring_exhausted",
+                        # [H6] 整环最早可用的时刻 = 当前避让节点里**最短**的剩余时长
+                        # （其余节点更晚才恢复，按最短报才不会让客户端在白等最长的
+                        # 那一个）。没有快照时退回默认值。
+                        retry_after=min(
+                            (v["remaining_seconds"] for v in avoiding.values()),
+                            default=None,
+                        ),
                     )
                 next_cand = candidates[0]
                 self.cooldown_tracker.note_long_avoidance_redirect(curr_provider_key, next_cand.provider_key)

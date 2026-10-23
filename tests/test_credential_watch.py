@@ -50,6 +50,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 import providers.failover as fov  # noqa: E402
 import server as srv  # noqa: E402
 from providers.anthropic_compat import map_anthropic_error_type  # noqa: E402
+from providers.base import ProviderError  # noqa: E402
 from providers.credential_watch import CredentialOutageWatch  # noqa: E402
 
 ALL_FIVE = ["deepseek", "doubao", "glm", "kimi", "qwen"]
@@ -72,6 +73,14 @@ class _CountingProvider:
 class _EchoProvider:
     async def chat(self, *a, **kw):
         yield "你好", {}
+
+
+class _AlwaysFailingProvider:
+    """普通上游 5xx（抖动），不是确定性拒绝——用来验证退避头不会被误加。"""
+
+    async def chat(self, *a, **kw):
+        raise ProviderError("upstream exploded", status=502, err_type="upstream_error")
+        yield  # pragma: no cover
 
 
 def _fresh() -> CredentialOutageWatch:
@@ -342,6 +351,73 @@ def test_anthropic_error_type_mapping():
     print("test_anthropic_error_type_mapping: PASSED")
 
 
+def test_zero_upstream_refusal_carries_a_backoff_signal():
+    """零上游拒绝必须带上 `Retry-After`：这是网关**唯一**确定答案的时刻。
+
+    [H6] 实测（真实 Claude Code CLI 对 8036 端口的死环网关）：不带该头时客户端
+    在 200 秒内重试了 **11 次**，每次都拿到一个「零上游、结论确定」的 503，并把
+    它转述给用户为「这是一个服务端问题，通常是暂时的，请稍后再试」——而网关其实
+    知道那五家节点各自的避让窗口还有 0.4~24 小时，重试一秒都不会有用。
+    带上 `Retry-After: 3600` 后，同样的跑法只有 **1 次** 请求。
+
+    这类拒绝是**确定性**的（凭证失效 / 运维禁用 / 封禁租约 / 整环长效避让），
+    与一次 502 的上游抖动不同：抖动值得立刻重试，而这里重试只会制造无效请求。
+    客户端的重试策略由这个头驱动，网关不发声就只能靠客户端瞎猜。
+
+    覆盖面：三个协议 + 四类拒绝成因都要带。
+    """
+    watch = srv.credential_watch
+    watch.clear_all_for_tests()
+    original = srv._make_provider
+    srv._make_provider = lambda key: _CountingProvider()
+    client = TestClient(srv.app)
+    try:
+        _arm(watch, ["qwen", "glm", "doubao"], time.time())
+
+        # 凭证整环失效（流式与非流式都要带）
+        for path, body in (
+            ("/v1/chat/completions",
+             {"model": "qwen-max-latest", "messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/messages",
+             {"model": "claude-3-5-sonnet", "max_tokens": 16,
+              "messages": [{"role": "user", "content": "hi"}]}),
+            ("/v1/responses",
+             {"model": "gpt-4o", "input": "hi"}),
+            ("/v1/chat/completions",
+             {"model": "qwen-max-latest", "stream": True,
+              "messages": [{"role": "user", "content": "hi"}]}),
+        ):
+            r = client.post(path, json=body)
+            assert r.status_code == 503, (path, r.status_code, r.text[:200])
+            ra = r.headers.get("retry-after")
+            assert ra is not None, f"{path}: 零上游拒绝未携带 Retry-After"
+            assert int(ra) > 0, f"{path}: Retry-After 必须是正整数秒，实际 {ra!r}"
+            # 报出的必须是**真实窗口**，不是一个与状态无关的常量：此刻快速失败态
+            # 刚被 arm（TTL 120s），剩余时长必然落在 (0, 120] 之内。若某个实现把默认
+            # 值 600 直接写死，这条断言会立刻变红——「有个头」不等于「说了真话」。
+            assert int(ra) <= 120, (
+                f"{path}: Retry-After={ra} 超出了快速失败态的真实剩余窗口（≤120s），"
+                "说明报的是一个与状态无关的常量"
+            )
+
+        # 一次普通的上游 5xx **不应**被伪装成确定性拒绝：
+        # 抖动值得立刻重试，错误的退避头会让一个健康节点被客户端整体放逐一小时。
+        srv._make_provider = lambda key: _AlwaysFailingProvider()
+        watch.clear_all_for_tests()
+        r = client.post("/v1/chat/completions",
+                        json={"model": "qwen-max-latest",
+                              "messages": [{"role": "user", "content": "hi"}]})
+        assert r.status_code >= 500, (r.status_code, r.text[:200])
+        assert "retry-after" not in r.headers, (
+            "上游抖动被误标为确定性拒绝："
+            f"{r.headers.get('retry-after')!r}"
+        )
+    finally:
+        srv._make_provider = original
+        watch.clear_all_for_tests()
+    print("test_zero_upstream_refusal_carries_a_backoff_signal: PASSED")
+
+
 def test_diagnostics_and_admin_endpoints():
     watch = srv.credential_watch
     watch.clear_all_for_tests()
@@ -388,6 +464,7 @@ def run_all():
     test_dispatched_request_produces_zero_upstream_calls()
     test_error_semantics_both_protocols()
     test_anthropic_error_type_mapping()
+    test_zero_upstream_refusal_carries_a_backoff_signal()
     test_diagnostics_and_admin_endpoints()
     print("\n✅ All credential-watch tests (OPT-025) passed!")
 

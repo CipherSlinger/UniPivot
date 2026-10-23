@@ -1119,6 +1119,61 @@ def format_validation_error_message(exc: RequestValidationError) -> str:
     return "; ".join(messages) if messages else "请求数据格式校验失败"
 
 
+# [H6] 零上游确定性拒绝 —— 网关**知道**退避窗口有多长的四种情形。
+#
+# 这四个 err_type 的共同点：派发边界已经判定「此刻发出去一定是白打」，因此零上游
+# 调用直接返回。结论是**确定性**的，不是一次上游抖动，客户端立刻重试一秒都不会有用。
+#
+# 实测（真实 Claude Code CLI，200 秒窗口）：
+#   - 不带 Retry-After：客户端重试 **11 次**，每次拿到同样的零上游 503；
+#   - 带 `Retry-After: 3600`：**1 次**。
+# 并且不带该头时，客户端把这条消息转述给用户为「这是一个服务端问题，通常是暂时的，
+# 请稍后再试」——而网关自己知道那五家还剩 0.4~24 小时。用户会照着重试。
+#
+# 与「上游抖动」的边界必须守住：一次 502/504 值得立刻重试，给抖动加退避头会让客户端
+# 把一个健康节点整体放逐一小时，那是比不说话更糟的误导。所以只认这四个语义明确的
+# 零上游拒绝，其余一律不带。
+_DETERMINISTIC_REFUSAL_ERR_TYPES = {
+    "credential_outage",   # [OPT-025] 整环凭证失效
+    "disabled",            # [OPT-033] 运维禁用且环内无可用节点
+    "quarantined",         # [OPT-021] 运维封禁租约
+    "ring_exhausted",      # [OPT-031] 整环长效避让
+}
+
+# 退避秒数：取「最快可能自愈的那一档」，不复述最长的那一档。
+# 凭证失效由人重登解除（通常几分钟内），封禁租约是天级——按最长的报会让一次刚好的
+# 重登后还要多等一天。宁可让客户端早一点回来撞一次（那一次仍然是零上游、无成本），
+# 也不要让它在问题已经修好之后还拒绝过来。
+_REFUSAL_RETRY_AFTER_SECONDS = int(os.getenv("GATEWAY_REFUSAL_RETRY_AFTER", "600"))
+_REFUSAL_RETRY_AFTER_MAX_SECONDS = int(os.getenv("GATEWAY_REFUSAL_RETRY_AFTER_MAX", "3600"))
+
+
+def _is_deterministic_refusal(status: int, err_type: Optional[str]) -> bool:
+    """本次拒绝是否属于「网关已确定、重试无用」的零上游拒绝。"""
+    if status < 500:
+        return False
+    return (err_type or "") in _DETERMINISTIC_REFUSAL_ERR_TYPES
+
+
+def _refusal_headers(exc: ProviderError) -> dict:
+    """为确定性拒绝构造退避头；非确定性失败返回空字典（零回归）。
+
+    时长优先取**抛出点自己知道的那个窗口**（`ProviderError.retry_after`）：租约剩余
+    多少小时、快速失败态还剩多少秒、整环最早何时可用，这些在 raise 的那一刻都是已知
+    的，用常量代替等于让客户端对着一份编出来的倒计时等待。只有抛出点明确表示「没有
+    窗口可等」（`retry_after is None`：运维禁用，等多久都不会自己好）时才回退默认值。
+    """
+    status, err_type = exc.status, exc.err_type
+    if not _is_deterministic_refusal(status, err_type):
+        return {}
+    if exc.retry_after is not None:
+        seconds = exc.retry_after
+    else:
+        seconds = _REFUSAL_RETRY_AFTER_SECONDS
+    seconds = int(max(1, min(seconds, _REFUSAL_RETRY_AFTER_MAX_SECONDS)))
+    return {"Retry-After": str(seconds)}
+
+
 @app.middleware("http")
 async def unified_exception_middleware(request: Request, call_next):
     """全局统一异常处理中间件：捕获所有未预期的异常并按请求协议输出对应的标准 JSON。"""
@@ -1172,14 +1227,17 @@ async def http_exception_handler(request: Request, exc: StarletteHTTPException):
 @app.exception_handler(ProviderError)
 async def provider_error_handler(request: Request, exc: ProviderError):
     """统一捕获 ProviderError 并按当前客户端协议格式化。"""
+    headers = _refusal_headers(exc)
     if is_anthropic_request(request):
         return JSONResponse(
             status_code=exc.status,
             content=anthropic_error_response(exc.message, status=exc.status, err_type=exc.err_type),
+            headers=headers,
         )
     return JSONResponse(
         status_code=exc.status,
         content=error_response(exc.message, status=exc.status, err_type=exc.err_type),
+        headers=headers,
     )
 
 
@@ -2233,6 +2291,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 return JSONResponse(
                     error_response(e.message, e.status, e.err_type),
                     status_code=e.status,
+                    headers=_refusal_headers(e),
                 )
             except Exception as e:
                 if flight_decision and flight_decision.is_leader:
@@ -2726,7 +2785,11 @@ async def chat_completions(req: ChatCompletionRequest):
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
             group_finalized = True
-        return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
+        return JSONResponse(
+            error_response(e.message, e.status, e.err_type),
+            status_code=e.status,
+            headers=_refusal_headers(e),
+        )
     except Exception as e:
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
@@ -3006,6 +3069,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             return JSONResponse(
                 anthropic_error_response(e.message, e.status, e.err_type),
                 status_code=e.status,
+                headers=_refusal_headers(e),
             )
         except Exception as e:
             if flight_decision and flight_decision.is_leader:
@@ -3427,6 +3491,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         return JSONResponse(
             anthropic_error_response(e.message, e.status, e.err_type),
             status_code=e.status,
+            headers=_refusal_headers(e),
         )
     except Exception as e:
         error_msg = str(e)
@@ -3789,7 +3854,11 @@ async def responses_endpoint(req: ResponsesRequest):
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
             group_finalized = True
-        return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
+        return JSONResponse(
+            error_response(e.message, e.status, e.err_type),
+            status_code=e.status,
+            headers=_refusal_headers(e),
+        )
     except Exception as e:
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:
@@ -4129,7 +4198,11 @@ async def responses_endpoint(req: ResponsesRequest):
         if flight_decision and flight_decision.is_leader:
             await flight_decision.group.finish(error=e)
             group_finalized = True
-        return JSONResponse(error_response(e.message, e.status, e.err_type), status_code=e.status)
+        return JSONResponse(
+            error_response(e.message, e.status, e.err_type),
+            status_code=e.status,
+            headers=_refusal_headers(e),
+        )
     except Exception as e:
         error_msg = str(e)
         if flight_decision and flight_decision.is_leader:

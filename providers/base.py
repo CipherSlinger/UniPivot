@@ -32,11 +32,23 @@ async def ensure_async_client(
 class ProviderError(Exception):
     """上游（网页端）调用失败，携带给客户端看的错误信息。"""
 
-    def __init__(self, message: str, status: int = 502, err_type: str = "upstream_error"):
+    def __init__(
+        self,
+        message: str,
+        status: int = 502,
+        err_type: str = "upstream_error",
+        retry_after: Optional[float] = None,
+    ):
         super().__init__(message)
         self.status = status
         self.err_type = err_type
         self.message = message
+        # [H6] 「网关已经确定、重试无用」的拒绝，可以在这里带上**它自己知道的**
+        # 退避时长（秒）。此前这类拒绝只给状态码，真实 Agent CLI 会在几十秒内
+        # 重试十余次同样的零上游 503——即便每次都是零上游，客户端侧的等待体验
+        # 与「服务端暂时故障」的转述都属于误导。为 None 表示「本次失败是上游
+        # 抖动」，那种情况**必须**保持无退避头，让客户端立刻重试下一个候选。
+        self.retry_after = retry_after
 
 
 class StopSequenceHit(Exception):

@@ -191,6 +191,20 @@ class CredentialOutageWatch:
             self._prune(now)
             return sorted(self._auth_failures)
 
+    def remaining_seconds(self, now: Optional[float] = None) -> float:
+        """[H6] 当前快速失败态还剩多久（未处于失效态时为 0）。
+
+        用途只有一个：让拒绝响应里的 `Retry-After` 说出**网关自己知道的**时长，
+        而不是一个与真实窗口无关的常量。TTL 到期即放行探路，所以这个值就是客户端
+        无需白等的那段窗口。
+        """
+        now = time.time() if now is None else now
+        with self._lock:
+            since = self._outage_since
+        if since is None:
+            return 0.0
+        return max(0.0, self._ttl() - (now - since))
+
     def get_diagnostics(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
