@@ -352,19 +352,28 @@ def test_anthropic_error_type_mapping():
 
 
 def test_zero_upstream_refusal_carries_a_backoff_signal():
-    """零上游拒绝必须带上 `Retry-After`：这是网关**唯一**确定答案的时刻。
+    """零上游拒绝必须**同时**带上 `x-should-retry: false` 与 `Retry-After`。
 
-    [H6] 实测（真实 Claude Code CLI 对 8036 端口的死环网关）：不带该头时客户端
-    在 200 秒内重试了 **11 次**，每次都拿到一个「零上游、结论确定」的 503，并把
-    它转述给用户为「这是一个服务端问题，通常是暂时的，请稍后再试」——而网关其实
-    知道那五家节点各自的避让窗口还有 0.4~24 小时，重试一秒都不会有用。
-    带上 `Retry-After: 3600` 后，同样的跑法只有 **1 次** 请求。
+    [H6] 实测（真实 Claude Code CLI v2.1.293，对死环网关，40 秒窗口，每次重启服务端
+    后测量，唯一变量是响应头）：
+
+      模式 none  → 客户端重试 **7 次**，每次拿到同样的零上游 503
+      模式 ra    → 客户端重试 **7 次**（`Retry-After: 60` 一次都没减少）
+      模式 nsr   → 客户端重试 **1 次**，立刻把真实原因报给用户
+
+    为什么只有后者有效，读 CLI 源码可见（不是猜）：
+      `if(k.status===429){let O=parseInt(k.headers.get("retry-after")??"",10);…}`
+      —— Retry-After **只在 429 上**被解析，放在 503 上是一份没人读的声明；
+      `let h=n.headers.get("x-should-retry");if(h==="true")return!0;if(h==="false")return!1;`
+      —— 它在状态码分类**之前**被读取。
+
+    早先这条用例把 7→1 的功劳记在 `Retry-After` 头上，是测量设计的错：当时两个端口
+    用的不是同一个服务端，变量不止一个。受控复测推翻了那个结论。
 
     这类拒绝是**确定性**的（凭证失效 / 运维禁用 / 封禁租约 / 整环长效避让），
     与一次 502 的上游抖动不同：抖动值得立刻重试，而这里重试只会制造无效请求。
-    客户端的重试策略由这个头驱动，网关不发声就只能靠客户端瞎猜。
 
-    覆盖面：三个协议 + 四类拒绝成因都要带。
+    覆盖面：三个协议 + 四类拒绝成因都要带；普通上游 5xx 一个都不许带。
     """
     watch = srv.credential_watch
     watch.clear_all_for_tests()
@@ -389,6 +398,11 @@ def test_zero_upstream_refusal_carries_a_backoff_signal():
         ):
             r = client.post(path, json=body)
             assert r.status_code == 503, (path, r.status_code, r.text[:200])
+            # 真正抑制重试的那个头。
+            assert r.headers.get("x-should-retry") == "false", (
+                f"{path}: 零上游拒绝未携带 x-should-retry: false —— "
+                "这是 Claude Code 唯一尊重的重试抑制信号，缺了它客户端会重试 7 次"
+            )
             ra = r.headers.get("retry-after")
             assert ra is not None, f"{path}: 零上游拒绝未携带 Retry-After"
             assert int(ra) > 0, f"{path}: Retry-After 必须是正整数秒，实际 {ra!r}"
@@ -411,6 +425,10 @@ def test_zero_upstream_refusal_carries_a_backoff_signal():
         assert "retry-after" not in r.headers, (
             "上游抖动被误标为确定性拒绝："
             f"{r.headers.get('retry-after')!r}"
+        )
+        assert "x-should-retry" not in r.headers, (
+            "上游抖动被误标为确定性拒绝（x-should-retry）："
+            f"{r.headers.get('x-should-retry')!r} —— 这会让客户端放弃一个健康节点"
         )
     finally:
         srv._make_provider = original

@@ -1124,15 +1124,27 @@ def format_validation_error_message(exc: RequestValidationError) -> str:
 # 这四个 err_type 的共同点：派发边界已经判定「此刻发出去一定是白打」，因此零上游
 # 调用直接返回。结论是**确定性**的，不是一次上游抖动，客户端立刻重试一秒都不会有用。
 #
-# 实测（真实 Claude Code CLI，200 秒窗口）：
-#   - 不带 Retry-After：客户端重试 **11 次**，每次拿到同样的零上游 503；
-#   - 带 `Retry-After: 3600`：**1 次**。
-# 并且不带该头时，客户端把这条消息转述给用户为「这是一个服务端问题，通常是暂时的，
-# 请稍后再试」——而网关自己知道那五家还剩 0.4~24 小时。用户会照着重试。
+# 实测（真实 Claude Code CLI v2.1.293，同一台服务器、同一台真实 CLI，40 秒窗口，
+# 每次重启服务端后测量，唯一变量是响应头）：
+#   - 不带任何头：            客户端重试 **7 次**，每次拿到同样的零上游 503；
+#   - 只带 `Retry-After: 60`： 客户端重试 **7 次** —— 一次都没有少。
+#   - 只带 `x-should-retry: false`：客户端重试 **1 次**，立刻把真实原因报给用户。
 #
-# 与「上游抖动」的边界必须守住：一次 502/504 值得立刻重试，给抖动加退避头会让客户端
-# 把一个健康节点整体放逐一小时，那是比不说话更糟的误导。所以只认这四个语义明确的
-# 零上游拒绝，其余一律不带。
+# 为什么 `Retry-After` 在 503 上不起作用（读 CLI 源码确认，不是猜）：
+#   `if(k.status===429){let O=parseInt(k.headers.get("retry-after")??"",10); ...}`
+#   —— 它**只在 429 上**解析 Retry-After。放在 503 上是一份没人读的声明。
+# 而 `x-should-retry` 在状态码判断**之前**被读取：
+#   `let h=n.headers.get("x-should-retry"); if(h==="true")return!0; if(h==="false")return!1;`
+#
+# 两个头所以都发：真值信源只有 `x-should-retry`，但 `Retry-After` 是 HTTP 标准字段，
+# 其他 SDK / 中间层会读它，且它对人类排查有用。**不要**以为它是抑制重试的那个。
+#
+# 没有这两个头时，客户端把消息转述给用户为「这是一个服务端问题，通常是暂时的，请稍后
+# 再试」——而网关自己知道那五家还剩 0.4~24 小时。用户会照着重试。
+#
+# 与「上游抖动」的边界必须守住：一次 502/504 值得立刻重试，给抖动加 `x-should-retry:
+# false` 会让客户端把一个健康节点整体放逐一小时，那是比不说话更糟的误导。所以只认这
+# 四个语义明确的零上游拒绝，其余一律不带。
 _DETERMINISTIC_REFUSAL_ERR_TYPES = {
     "credential_outage",   # [OPT-025] 整环凭证失效
     "disabled",            # [OPT-033] 运维禁用且环内无可用节点
@@ -1158,10 +1170,16 @@ def _is_deterministic_refusal(status: int, err_type: Optional[str]) -> bool:
 def _refusal_headers(exc: ProviderError) -> dict:
     """为确定性拒绝构造退避头；非确定性失败返回空字典（零回归）。
 
-    时长优先取**抛出点自己知道的那个窗口**（`ProviderError.retry_after`）：租约剩余
-    多少小时、快速失败态还剩多少秒、整环最早何时可用，这些在 raise 的那一刻都是已知
-    的，用常量代替等于让客户端对着一份编出来的倒计时等待。只有抛出点明确表示「没有
-    窗口可等」（`retry_after is None`：运维禁用，等多久都不会自己好）时才回退默认值。
+    两个头各司其职，缺一不可：
+
+    `x-should-retry: false` —— **真正抑制重试的那个**。Claude Code 在按状态码分类之前
+    先读它（见上方实测），少了它，客户端对同一个零上游 503 重试 7 次。
+
+    `Retry-After` —— 给人看、给其他 SDK 看的标准化退避时长。时长优先取**抛出点自己
+    知道的那个窗口**（`ProviderError.retry_after`）：租约剩余多少小时、快速失败态还剩
+    多少秒、整环最早何时可用，这些在 raise 的那一刻都是已知的，用常量代替等于让客户端
+    对着一份编出来的倒计时等待。只有抛出点明确表示「没有窗口可等」（`retry_after is
+    None`：运维禁用，等多久都不会自己好）时才回退默认值。
     """
     status, err_type = exc.status, exc.err_type
     if not _is_deterministic_refusal(status, err_type):
@@ -1171,7 +1189,7 @@ def _refusal_headers(exc: ProviderError) -> dict:
     else:
         seconds = _REFUSAL_RETRY_AFTER_SECONDS
     seconds = int(max(1, min(seconds, _REFUSAL_RETRY_AFTER_MAX_SECONDS)))
-    return {"Retry-After": str(seconds)}
+    return {"Retry-After": str(seconds), "x-should-retry": "false"}
 
 
 @app.middleware("http")
