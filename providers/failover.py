@@ -2345,6 +2345,29 @@ class FailoverRouter:
         """
         return self.cooldown_tracker._env_float("GATEWAY_HANDSHAKE_BUDGET", 180.0)
 
+    def _count_untried_candidates(
+        self,
+        primary_provider: str,
+        primary_model: str,
+        excluded_providers: Optional[Set[str]] = None,
+    ) -> int:
+        """还没有被尝试过、且此刻仍可被派发的候选数量。
+
+        [BUDGET-2] 只用于把总预算**公平分摊**给尚未尝试的候选：`get_fallback_candidates`
+        已经排除了已尝试节点、运维禁用、封禁租约与长效避让，所以这里的计数与派发循环
+        真正会再走几轮是同一个集合。用作除数而不是用来判决——判决仍只看时钟。
+        """
+        try:
+            return len(
+                self.get_fallback_candidates(
+                    primary_provider,
+                    primary_model,
+                    excluded_providers=set(excluded_providers or ()),
+                )
+            )
+        except Exception:  # noqa: BLE001 - 预算分摊失败不应影响派发
+            return 1
+
     def _timeout_cooldown(self) -> float:
         """[M2] 超时失败后的冷却时长（秒，默认 60）。
 
@@ -2421,6 +2444,20 @@ class FailoverRouter:
                     f"GATEWAY_HANDSHAKE_BUDGET 调整总预算。\n已记录的失败:\n{detail}",
                     status=504,
                     err_type="upstream_timeout",
+                    # [H7] 与「环已走完」同一个道理：这是确定性结论，客户端重试
+                    # 只会再等过一整个预算并得到同一答案。报出已尝试节点里**最早**
+                    # 可能恢复的冷却窗口，而不是让网关层回退到一个编出来的常量。
+                    retry_after=min(
+                        [
+                            r
+                            for r in (
+                                self.cooldown_tracker.get_remaining_cooldown(p)
+                                for p in tried_providers
+                            )
+                            if r and r > 0
+                        ],
+                        default=self._timeout_cooldown(),
+                    ),
                 )
 
             tried_providers.add(curr_provider_key)
@@ -2667,10 +2704,28 @@ class FailoverRouter:
                     # [BUDGET] 本次尝试只能用「总预算的剩余部分」：整条请求的边界
                     # 必须先于单次尝试的边界。这里只做**收紧**，不判决（判决在循环
                     # 顶部，见 `_handshake_budget` 的说明）。
+                    #
+                    # [BUDGET-2] 收紧必须按**剩余候选数公平分配**，而不是把剩下的
+                    # 全给当前这一个。第一版就是直接把剩余预算当作本次上限：默认
+                    # 配置（单次 180s、总预算 180s）下 `min(180, 180)` = 180，
+                    # 第一个慢候选就吃光了整条预算，后四个候选一次都不再尝试。
+                    # 实测（`claude -p` 对着五节点全挂、单次 30s/总预算 15s 的环）：
+                    # 「已尝试 1 个节点」就耗尽 —— 这是**修复前不存在**的可用性回归，
+                    # 「第一个节点慢、第二个节点快」这种最常见故障形态反而不自愈了。
+                    # 公平份额 = 剩余预算 / 剩余未尝试候选数，且不高于单次上限；
+                    # 最后一个候选拿走全部剩余，故总时长上界仍严格成立。
                     if deadline is not None and handshake_timeout > 0:
+                        remaining_budget = deadline - asyncio.get_running_loop().time()
+                        # `tried_providers` 已包含当前候选，故它的候选数**不含**本次；
+                        # 本次的份额是「剩余预算 / (后续候选数 + 1)」，与后续候选等分。
+                        later = self._count_untried_candidates(
+                            primary_provider_key,
+                            primary_wire_model,
+                            excluded_providers=set(tried_providers),
+                        )
+                        share = remaining_budget / max(later + 1, 1)
                         handshake_timeout = min(
-                            handshake_timeout,
-                            max(deadline - asyncio.get_running_loop().time(), 0.05),
+                            handshake_timeout, max(share, 0.05)
                         )
                     if handshake_timeout > 0:
                         # `wait_for` 的超时会取消被等待的协程——这里正是我们想要的：
@@ -2681,8 +2736,11 @@ class FailoverRouter:
                             )
                         except asyncio.TimeoutError:
                             raise ProviderError(
+                                # 保留一位小数：公平分摊后份额可以小于 1s，用 `:.0f`
+                                # 会把 0.3s 写成「在 0s 内未返回首包」——报告的数字
+                                # 与真实等待不符，正是本项目反复记录的谎报类型。
                                 f"节点 [{provider_key}:{wire_model}] 在 "
-                                f"{handshake_timeout:.0f}s 内未返回首包（握手超时）",
+                                f"{handshake_timeout:.1f}s 内未返回首包（握手超时）",
                                 status=504,
                                 err_type="upstream_timeout",
                             ) from None
@@ -2903,9 +2961,48 @@ class FailoverRouter:
                         f"对等能力环 [{ring.value}] 内所有节点均已尝试且全部失效。\n"
                         f"故障详情与避让记录:\n" + "\n".join(f" - {e}" for e in composite_errors)
                     )
+                    # [BUDGET-2] 预算现在会被**公平分摊**给各候选，因此常见结局不再是
+                    # 「预算耗尽」而是「每个候选都只分到一小份、各自超时后环内全灭」。
+                    # 此时报错若只列失败，运维无法区分「预算太小」和「节点真的全挂」，
+                    # 也就不知道该调预算还是去查网络。把预算与份额一并写出（仅在预算
+                    # 确实参与了本次判决时，否则逐值保持旧文案）。
+                    if deadline is not None:
+                        report += (
+                            f"\n注：握手总预算 {handshake_budget:.0f}s 已按剩余候选公平"
+                            f"分摊（每个候选只有其中一份），因此单次超时时间远短于 "
+                            f"GATEWAY_FIRST_CHUNK_TIMEOUT。若节点实际健康但响应较慢，"
+                            f"请调大 GATEWAY_HANDSHAKE_BUDGET。"
+                        )
                     logger.error(f"[对等互备网格] 全部后备节点熔断: {report}")
                     status = getattr(primary_exc, "status", 502) if primary_exc else 502
                     err_type = getattr(primary_exc, "err_type", "upstream_error") if primary_exc else "upstream_error"
+                    # [H7] 环已走完 ⇒ 这是一个**确定性**结论，不是「上游抖了一下」。
+                    # 同一个环再走一遍不会得到不同答案，而客户端会立刻重来。
+                    # 实测（真实 Claude Code，五节点全挂、同样的 504 与文案，唯一变量
+                    # 是响应头）：仅 504 → 240s 内 8 次请求；加 `x-should-retry:false`
+                    # → 18s、2 次请求、EXIT=1。8 次 × 5 候选 = 40 次打在已知全挂的环上
+                    # 的上游调用，正是风控线一直在消灭的风暴形态。
+                    # 退避时长取抛出点真正知道的窗口：这些节点刚被判定超时，各自的
+                    # 超时冷却还剩多久是可问的，报最短的那个（最早可能恢复的时刻）。
+                    # 只有超时这一种终局在这里是确定性的：5xx/WAF/401 各自的语义由
+                    # 它们自己决定，不在此处一并改写。
+                    if err_type == "upstream_timeout":
+                        raise ProviderError(
+                            report,
+                            status=status,
+                            err_type=err_type,
+                            retry_after=min(
+                                [
+                                    r
+                                    for r in (
+                                        self.cooldown_tracker.get_remaining_cooldown(p)
+                                        for p in tried_providers
+                                    )
+                                    if r and r > 0
+                                ],
+                                default=self._timeout_cooldown(),
+                            ),
+                        )
                     raise ProviderError(report, status=status, err_type=err_type)
 
                 # 选取最优后备候选

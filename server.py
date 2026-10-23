@@ -1184,6 +1184,13 @@ _DETERMINISTIC_REFUSAL_ERR_TYPES = {
     "disabled",            # [OPT-033] 运维禁用且环内无可用节点
     "quarantined",         # [OPT-021] 运维封禁租约
     "ring_exhausted",      # [OPT-031] 整环长效避让
+    # [H7] 环内节点全部尝试且全部握手超时。这是**环已经走完**的结论，同一个环
+    # 再走一遍不会得到不同答案。实测（真实 Claude Code，五节点全挂，唯一变量是
+    # 响应头）：仅 504 → 240s 内 8 次请求；加 `x-should-retry:false` → 18s/2 次。
+    # 注意：**单节点**超时且环内仍有候选时不带此头（由抛出点决定 `retry_after`
+    # 为 None 的路径不会走到这里——见 failover 里 `err_type == "upstream_timeout"`
+    # 且「环已耗尽」的那个分支）。
+    "upstream_timeout",
 }
 
 # 退避秒数：取「最快可能自愈的那一档」，不复述最长的那一档。
