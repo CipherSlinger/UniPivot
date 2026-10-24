@@ -124,22 +124,36 @@ def _reset_all(tracker: fov.CooldownTracker | None = None) -> None:
 
 # ------------------------------------------------------------------ 1. 指纹
 
-def test_fingerprint_is_content_hash_and_tracks_captured_at():
-    """正常凭证 JSON -> `sha:` 内容哈希；改动任一笔参与字段（含 captured_at）即变。"""
+def test_fingerprint_is_a_content_hash_not_a_save_counter():
+    """指纹是**凭证内容**的哈希；重新保存同一份凭证不得改变它。
+
+    这条断言在 [REFRESH-VERIFY] 里被**修正过**，原版的断言恰好是缺陷本身：
+    它断言「只改 captured_at 指纹就要变」，理由是「重登必然刷新 captured_at」。
+    但 `Session.save()` 每次保存都刷新 captured_at，因此那个断言等价于
+    「任何一次保存都算续期」——包括无头刷新把 profile 里的旧令牌原样再存一遍。
+    实测后果：一次什么都没修好的静默刷新，把 60s 的 auth 冷却直接复位到 0，
+    解除了 OPT-026 为「拿着同一个失效凭证反复打」而设的避让。
+
+    正确的分界是「凭证内容变了」（真正重登：token 刷新 / Cookie 轮换 / 身份变化），
+    不是「文件又被写了一次」。详见 tests/test_credential_renewal_discrimination.py。
+    """
     _install_fake_credentials()
     _write_credential("qwen", "tok_A", 1_700_000_000.0)
     fp1 = cred.credential_fingerprint("qwen")
     assert fp1 and fp1.startswith("sha:"), fp1
 
-    # 只改 captured_at（模拟 `Session.save()` 的正常重登：token 可能不变，但捕获时间必变）
+    # 只改 captured_at（模拟 `Session.save()` 又保存了一次，内容没变）
     _write_credential("qwen", "tok_A", 1_700_000_900.0)
     fp2 = cred.credential_fingerprint("qwen")
-    assert fp2 != fp1, "重登必然刷新 captured_at，指纹必须随之改变"
+    assert fp2 == fp1, (
+        "内容没变、只是被重新保存，指纹却变了——"
+        "任何一次空刷新都会冒充「凭证已续期」，解除 auth 避让"
+    )
 
     # token 变化当然也改变指纹
     _write_credential("qwen", "tok_B", 1_700_000_900.0)
     assert cred.credential_fingerprint("qwen") != fp2
-    print("test_fingerprint_is_content_hash_and_tracks_captured_at: PASSED")
+    print("test_fingerprint_is_a_content_hash_not_a_save_counter: PASSED")
 
 
 def test_fingerprint_meta_fallback_for_unparseable_file():
@@ -529,7 +543,7 @@ def test_clearing_outage_also_releases_auth_avoidance():
 
 
 def run_all():
-    test_fingerprint_is_content_hash_and_tracks_captured_at()
+    test_fingerprint_is_a_content_hash_not_a_save_counter()
     test_fingerprint_meta_fallback_for_unparseable_file()
     test_no_record_is_not_renewed()
     test_unreadable_credential_is_not_renewed()

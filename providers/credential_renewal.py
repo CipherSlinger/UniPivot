@@ -21,8 +21,10 @@
    - 在记录认证失败的那一刻，对凭证来源（`session/<provider>.json`）取**内容指纹**
      （token + cookie + captured_at 的哈希；不可解析时退化为 mtime_ns:size）。
      该指纹随状态持久化，因此「先重登、再重启」也能被识别。
-   - 此后任一时刻比较当前指纹：不同即说明凭证确已更新（`Session.save()` 用
-     `os.replace` 原子落盘，且每次捕获都会刷新 `captured_at`，正常流程必然改变指纹）。
+   - 此后任一时刻比较当前指纹：不同即说明凭证确已更新。指纹只覆盖**凭证内容**
+     （token / cookie / user_id / device_id），**不含 `captured_at`**——后者每次
+     `Session.save()` 都会刷新，把它算进去会让「重新保存了一次」冒充「已续期」，
+     一次什么都没修好的静默刷新就能解除避让（见 `_FINGERPRINT_FIELDS` 的说明）。
 4. 复位必须限定「认证成因」(Cause-scoped release)：
    - 仅当该节点**最近一次**失败严重度为 `auth` 时才复位（`cooldown_severity` 随冷却
      一并持久化）。若之后又发生 WAF/频控，说明是另一类问题，绝不代它释放。
@@ -70,9 +72,20 @@ _PROVIDER_SESSION_FILES: Dict[str, Path] = {
     "glm": _SESSION_DIR / "glm.json",
 }
 
-# 指纹中参与哈希的凭证字段：captured_at 是每次捕获都会刷新的时间戳，
-# 因此任何一次真实重登都必然改变指纹；即使有人刻意保留 mtime 也一样能识别。
-_FINGERPRINT_FIELDS = ("token", "cookie", "captured_at", "user_id", "device_id")
+# 指纹中参与哈希的凭证字段 = **凭证内容**，不含 `captured_at`。
+#
+# [REFRESH-VERIFY] 为什么不含 `captured_at`：`Session.save()` 每次保存都会刷新它，
+# 而"续期"这个判断要回答的是"凭证被换掉了吗"。把保存时间算进去，会让**任何**一次
+# 保存都算续期——包括浏览器 profile 里还留着旧令牌、无头刷新把它原样再存一遍的
+# 情况（令牌一个字节都没变）。实测后果是链条式的：
+#   一次 60s 的 auth 冷却 ——> refreshed_providers() 报告已续期 ——> 冷却复位到 0
+# 也就是说，一次什么都没修好的静默刷新，解除了 OPT-026 为"拿着同一个失效凭证
+# 反复打"而设的避让，让节点立刻重新进入上游；同时 `note_auth_failure` 会把
+# "同一枚凭证 + 一次空刷新"当成"新凭证仍被拒"，进而推断账号级封禁 (OPT-027)。
+#
+# 字段选择与 `_save_session_from_context` 捕获到的东西一致：真正重登时至少有一项
+# 会变（令牌刷新，或安全 Cookie 轮换，或账号/设备身份变化）。
+_FINGERPRINT_FIELDS = ("token", "cookie", "user_id", "device_id")
 
 
 def credential_path(provider_key: str) -> Optional[Path]:
