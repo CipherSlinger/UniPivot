@@ -204,8 +204,15 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
         "declared": (bodies[-1]["declared_tools"] if bodies else []),
         "chosen": (bodies[-1]["chosen_tool"] if bodies else None),
         "has_tools_section": bool(bodies and bodies[-1]["has_tools_section"]),
-        "round2_saw_result": any(
-            "Tool Result for" in (b.get("prompt_tail") or "") for b in bodies
+        # [HARNESS] Assert on the payload the upstream REALLY receives, not on
+        # `prompt_tail`: in continuation mode the provider sends only the new
+        # turn, so a tool result that exists in the replayed history but never
+        # made it onto the wire would pass a `prompt_tail` check and fail the
+        # agent. The two are different prompts and only one of them is real.
+        # EVERY round after the first must carry one — `any()` would let a run
+        # that loses the result at round 3 still report PASS.
+        "round2_saw_result": len(bodies) > 1 and all(
+            b.get("payload_has_tool_result") for b in bodies[1:]
         ),
         # [SESSION-ID] The upstream conversation id the gateway hands the provider
         # is the only observable proof that session affinity works for THIS client.

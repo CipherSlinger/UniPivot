@@ -136,27 +136,22 @@ _PREFERRED = tuple(
 
 
 def _flatten(messages) -> str:
-    """Flatten gateway messages the same way the providers would, for probing."""
-    out: list[str] = []
-    for m in messages:
-        c = m.get("content")
-        if isinstance(c, str):
-            out.append(c)
-        elif isinstance(c, list):
-            for b in c:
-                if isinstance(b, dict):
-                    for key in ("text", "content", "thinking"):
-                        v = b.get(key)
-                        if isinstance(v, str):
-                            out.append(v)
-                    if isinstance(b.get("content"), list):
-                        for inner in b["content"]:
-                            if isinstance(inner, dict) and isinstance(inner.get("text"), str):
-                                out.append(inner["text"])
-    return "\n".join(out)
+    """Flatten gateway messages **exactly** as the providers do, for probing.
+
+    This used to be a local re-implementation that joined every text fragment
+    with no role labels. The providers do not do that: they call
+    `providers.base.flatten_messages`, which renders `System: …` / `Developer: …`
+    / `User: …` prefixes and appends the tool-call blocks. So every assertion
+    made on `prompt_full` (has_tools_section, the declared-tool regex, "did the
+    tool result reach upstream") was asserted against a prompt the upstream never
+    sees — an instrument that quietly disagrees with the thing it measures.
+    Delegating means the probe cannot drift from the product.
+    """
+    from providers.base import flatten_messages
+    return flatten_messages(messages)
 
 
-def _payload_len(messages, conversation_id) -> int:
+def _payload_text(messages, conversation_id) -> str:
     """Characters the provider would REALLY send upstream.
 
     In continuation mode (`conversation_id` set) the upstream session already
@@ -167,8 +162,52 @@ def _payload_len(messages, conversation_id) -> int:
     session that is never reused look fine).
     """
     from providers.base import continuation_content
-    body = continuation_content(messages) if conversation_id else _flatten(messages)
-    return len(body)
+    return continuation_content(messages) if conversation_id else _flatten(messages)
+
+
+def _newest_tool_result(messages):
+    """Text of the newest tool result in the replayed history, or "".
+
+    Two traps, both measured. (a) The gateway's own tool contract contains the
+    literal `[Tool Result for <id>]`, so a bare substring test fires on round one
+    and the loop never happens (CLAUDE.md section 60) — hence a real id is
+    required. (b) A tool result may arrive as `role:"tool"`, as an Anthropic
+    `tool_result`, or as a Responses `function_call_output` replayed into a user
+    turn; require the rendered *text* rather than the id, because a provider
+    renders `role:"tool"` as `Tool (name): …` with no id at all.
+    """
+    from providers.base import text_of
+
+    for m in reversed(messages):
+        if not isinstance(m, dict):
+            continue
+        role = str(m.get("role") or "").lower()
+        if role in ("system", "developer"):
+            continue          # the contract's example literal lives here
+        body = text_of(m.get("content")).strip()
+        if role == "tool":
+            return body
+        if re.search(r"\[Tool Result for [A-Za-z0-9_-]+", body):
+            return body
+    return ""
+
+
+def _payload_has_tool_result(messages, conversation_id) -> bool:
+    """Does the body this provider puts on the wire carry the newest tool result?
+
+    The question the agent actually depends on: **did the newest tool result the
+    client sent back reach the wire?** `prompt_full` / `prompt_tail` are built
+    from the replayed history, which is NOT what a continuation request sends, so
+    an assertion on them can be satisfied by text that never left the process
+    (measured: a round-3 payload containing only the new tool call still shows a
+    `[Tool Result for c1]` in the replayed history).
+    """
+    wanted = _newest_tool_result(messages)
+    if not wanted:
+        return False
+    # Compare on a prefix only: clients append token counters and
+    # <system-reminder> blocks after the real output, and those differ per turn.
+    return wanted[:80] in _payload_text(messages, conversation_id)
 
 
 def _declared_tools(prompt: str) -> list[str]:
@@ -256,7 +295,15 @@ class LoopProvider:
                 # [SESSION-ID] What the provider really puts on the wire: full
                 # history on a fresh conversation, only the new turn when the
                 # upstream session is reused. This is the cost the agent pays.
-                "payload_len": _payload_len(messages, kw.get("conversation_id")),
+                "payload_len": len(_payload_text(messages, kw.get("conversation_id"))),
+                # What the model REALLY receives this turn. In continuation mode the
+                # provider sends only the new turn, so a tool result that exists in
+                # the replayed history but not in the payload was never delivered —
+                # `prompt_full` alone cannot tell those apart.
+                "payload_tail": _payload_text(messages, kw.get("conversation_id"))[-300:],
+                "payload_has_tool_result": _payload_has_tool_result(
+                    messages, kw.get("conversation_id")
+                ),
                 "tools": kw.get("tools"),
                 "prompt_len": len(prompt),
                 "has_tools_section": "## Tools Available" in prompt,
