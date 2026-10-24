@@ -3093,6 +3093,35 @@ class FailoverRouter:
                             sem_held = False
                             sem.release()
 
+                    # [C3] 关闭本函数打开的那条上游流。
+                    #
+                    # `aclose()` 对**从未启动**的生成器是空操作，对已耗尽的生成器
+                    # 也是空操作，所以这里可以无条件调用：正常跑完的路径逐字节不变。
+                    # 危险只在收尾发生在一个**已被取消**的任务里（客户端断连）：
+                    # 原地 await 会被立刻二次取消，provider 的 `finally` 一行都执行
+                    # 不到。因此派成独立任务再 shield 等待——取消只打断等待，关闭
+                    # 任务本身仍会跑完（与 `disconnect_guard.safe_aclose_detached`
+                    # 同一条纪律，那边记录了这个坑的实测）。
+                    async def _close_raw_stream() -> None:
+                        aclose = getattr(raw_stream, "aclose", None)
+                        if aclose is None:
+                            return
+                        try:
+                            task = asyncio.ensure_future(aclose())
+                        except Exception as exc:  # noqa: BLE001 - 回收必须绝对安全
+                            logger.warning("[对流回收] 上游流关闭调度失败 (已忽略): %s", exc)
+                            return
+                        try:
+                            await asyncio.shield(task)
+                        except asyncio.CancelledError:
+                            # 当前任务被取消：关闭任务继续在后台跑完
+                            pass
+                        except BaseException as exc:  # noqa: BLE001
+                            logger.warning(
+                                "[对流回收] 上游流关闭失败 (已忽略): %s: %s",
+                                type(exc).__name__, exc,
+                            )
+
                     # [M2] 空闲超时拉取：用 `asyncio.wait` 观察，而不是
                     # `asyncio.wait_for` / `asyncio.timeout()`。
                     #
@@ -3218,8 +3247,31 @@ class FailoverRouter:
                             # 中途断开按原有规范上抛，不产生半包污染
                             raise
                         finally:
-                            # 整段流结束（正常、异常、或被 aclose）→ 归还并发槽位。
-                            # 必须同步释放：GeneratorExit 路径上不允许 await。
+                            # [C3] 上游生成器必须**在这里**被显式关闭，不能只归还
+                            # 槽位。`raw_stream` 是本函数打开的那条流，它的
+                            # `finally` 才是 provider 侧退出 `async with
+                            # client.stream(...)`、释放 HTTP/2 连接的地方。
+                            #
+                            # 此前这里只调 `_release_sem()`，于是：
+                            #   * 响应体从未启动 → `ManagedStream.close()` 推进一帧
+                            #     让本生成器跑进 `finally`，槽位归还了，可 provider
+                            #     生成器仍停在 `yield` 上**永远挂着**；
+                            #   * 客户端中途断连 → 同上。
+                            # 唯一「关闭」它的时机是 CPython 的引用计数回收——
+                            # 那不是一个可以被断言的时机。实测（把流引用一直握在
+                            # 手里、禁止 GC）：`opened=1 closed=0`；放手让 GC 跑完
+                            # 才变 1/1。真实进程里这条流会带着上游连接一直活到
+                            # 垃圾回收，正是「客户端已走、上游仍在生成」的空耗，
+                            # 也是连接池被慢慢吃光的来源。
+                            #
+                            # 必须先关上游、后放槽位：反过来的话，下一个拿到槽位的
+                            # 请求会与这条尚未关闭的流并存，节点并发上界当场被突破。
+                            # `_close_raw_stream` 自己就是「独立任务 + shield」，
+                            # 因此这里在取消路径上也等得到它。
+                            try:
+                                await _close_raw_stream()
+                            except BaseException:  # noqa: BLE001 - 回收不得掩盖原始错误
+                                pass
                             _release_sem()
 
                     sem_handed_off = True

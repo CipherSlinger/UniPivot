@@ -68,6 +68,45 @@ class _TrackedProvider:
         return None
 
 
+class _RefHoldingProvider:
+    """把「上游生成器对象」本身**一直持有**的 Provider（[C3] 回归用例专用）。
+
+    为什么要这么做：`wrapped_stream` 的 `finally` 原先只归还槽位、从不 `aclose()`
+    上游流，但离线用例仍然会全绿——因为 `raw_stream` 只被 `wrapped_stream` 的闭包
+    引用，包装流一旦被丢弃，CPython 的引用计数会在丢弃的瞬间跑 async generator 的
+    终结器，`finally` 照样执行一次。**是 GC 替代码完成了回收**，于是「没写关闭」
+    这个缺陷被完美掩盖（这也是它能在真实 `codex exec` 上表现为 100% 失败、却躲过
+    全部离线用例的原因）。
+
+    本类在 `chat()` 里把生成器对象记进 `self.generators`，引用计数因此永不归零，
+    终结器不会介入；`closed` 只可能在**有人显式 `aclose()`** 时自增。用例的断言
+    于是真正测的是代码有没有关闭，而不是 GC 有没有顺手帮忙。
+    """
+
+    def __init__(self, chunks=("a", "b", "c", "d")):
+        self.opened = 0
+        self.closed = 0
+        self.chunks = chunks
+        self.generators = []
+
+    def chat(self, *args, **kwargs):
+        self.opened += 1
+        gen = self._stream()
+        self.generators.append(gen)  # 持有引用：终结器不得替代码收尾
+        return gen
+
+    async def _stream(self):
+        try:
+            for chunk in self.chunks:
+                yield chunk, {"conversation_id": "conv_c3"}
+            yield "", {"conversation_id": "conv_c3"}
+        finally:
+            self.closed += 1
+
+    async def delete_conversation(self, *args, **kwargs):
+        return None
+
+
 def _scope(path: str) -> dict:
     return {
         "type": "http",
@@ -192,6 +231,59 @@ def test_upstream_failure_mid_stream_still_errors_in_band():
     print("test_upstream_failure_mid_stream_still_errors_in_band: PASSED")
 
 
+def test_mid_stream_disconnect_closes_the_upstream_generator():
+    """[C3] 客户端**流到一半**消失：provider 生成器必须被真正关闭。
+
+    这是上面三条用例都覆盖不到的那一格，也是**构造上会被引用计数掩盖**的一格：
+    `wrapped_stream` 的 `finally` 原先只调 `_release_sem()`，从不 `aclose()`
+    `raw_stream`。于是槽位回来了、LB 配额也归零了，唯独 provider 生成器停在
+    `yield` 上还活着——它要等到 CPython 回收这个对象时才跑 `finally`。离线用例
+    里对象往往在函数返回后就失去引用，GC 顺手把它收掉，于是**断言全绿**；真实
+    进程里那条流会带着上游连接一直挂到垃圾回收，正是「客户端已走、上游仍在生成」。
+
+    所以本用例必须把槽位、LB、上游关闭三件事分开断言，并且**不给 GC 发牌**：
+    驱动期间把 `_make_provider` 返回的 provider 一直握在手里（它持有生成器），
+    断言在同一个事件循环里、任何 `gc.collect()` 之前就成立。
+    """
+    async def _run():
+        leaks = []
+        cases = [
+            ("/v1/chat/completions", OPENAI_BODY),
+            ("/v1/messages", ANTHROPIC_BODY),
+            ("/v1/responses", RESPONSES_BODY),
+        ]
+        # 一直引用到断言结束：让「引用计数顺手收掉」不能成为通过的理由
+        held = []
+        for path, body in cases:
+            _reset_counters()
+            # `_RefHoldingProvider` 把生成器对象本身也攥住，GC 无法替代码收尾
+            provider = _RefHoldingProvider()
+            held.append(provider)
+            before_sem = _sem_value("qwen")
+            # send_frames=2：客户端先收到状态行 + 一帧正文，然后消失
+            await _drive(provider, path, body, send_frames=2)
+            lb = srv.load_balancer.get_metrics("qwen").active_concurrency
+            sem = _sem_value("qwen")
+            if provider.opened == 0:
+                leaks.append(f"{path}: 上游根本没被打开，测不到回收路径")
+                continue
+            if provider.closed != provider.opened:
+                leaks.append(
+                    f"{path}: 流中途断连后上游生成器仍未关闭 "
+                    f"{provider.opened} 开 / {provider.closed} 关"
+                    f"（只归还了槽位，连接被留给 GC）"
+                )
+            if sem != before_sem:
+                leaks.append(f"{path}: 节点信号量泄漏 {before_sem} -> {sem}")
+            if lb != 0:
+                leaks.append(f"{path}: LB 配额泄漏 {lb}")
+        return leaks
+
+    leaks = asyncio.run(_run())
+    assert not leaks, "\n".join(leaks)
+    print("test_mid_stream_disconnect_closes_the_upstream_generator: PASSED")
+
+
 def test_managed_stream_closes_never_started_source():
     """回收原语：`ManagedStream.close()` 必须收尾一条**从未被迭代**的源流。
 
@@ -229,6 +321,7 @@ def run_all():
     test_bodies_never_started_still_release_everything()
     test_complete_stream_releases_exactly_once()
     test_upstream_failure_mid_stream_still_errors_in_band()
+    test_mid_stream_disconnect_closes_the_upstream_generator()
     test_managed_stream_closes_never_started_source()
     print("\n✅ All stream start-reclaim tests passed!")
 
