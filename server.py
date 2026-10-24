@@ -1361,12 +1361,62 @@ async def health():
         p_info["remaining_cooldown"] = round(rem_cd, 1)
         p_info["remaining_cooldown_seconds"] = round(rem_cd, 1)
 
+    # [HEALTH-TRUTH] `dispatchable` 必须与派发边界**同一口径**，且无凭证的节点永远
+    # 不可派发。此前 /health 只有一个恒真的 `"status": "ok"`：全新克隆（session/ 为空）
+    # 时五个节点全部 offline、无一持有凭证，顶层状态照样说健康。它是运维、监控探针和
+    # agent 接入脚本判断「网关好了没有」的唯一入口，报 ok 就等于告诉所有人可以开始发
+    # 请求——随后每个请求都以 401 结束，而整份响应里没有一处指向真正的原因（缺凭证）。
+    #
+    # 这是 OPT-032/033/035（预演/档案说可派发，派发边界却拒绝）的同一类缺陷，换到了
+    # 就绪面上，因此判据直接取 `evaluate_dispatch_gate`——不在这里另写一套。
+    # 「配置了」是派发闸门自身不表达的一位（它只回答已知节点的封禁状态），所以合成：
+    #     dispatchable = 有凭证 and 闸门说可派发
+    # 短软冷却仍是 demote-only，闸门对它答 True，就绪面因此照旧报 ok——与「环内全冷却
+    # 时允许最后一搏」的可用性语义逐值一致。
+    configured_map = {
+        pk: _configured(resolver) for pk, resolver in (
+            ("qwen", resolve_qwen), ("deepseek", resolve_deepseek),
+            ("doubao", resolve_doubao), ("kimi", resolve_kimi), ("glm", resolve_glm),
+        )
+    }
+    dispatchable_map = {}
+    for p_name, p_info in providers_status.items():
+        try:
+            gate_ok = bool(
+                failover_router.evaluate_dispatch_gate(p_name)["dispatchable"]
+            )
+        except Exception:  # noqa: BLE001 - 就绪面不得因单个节点判定失败而整体不可用
+            gate_ok = False
+        is_ok = bool(configured_map.get(p_name, False)) and gate_ok
+        p_info["dispatchable"] = is_ok
+        dispatchable_map[p_name] = is_ok
+
+    if any(dispatchable_map.values()):
+        overall_status = "ok"
+        status_reason = ""
+    else:
+        missing = [pk for pk, ok in configured_map.items() if not ok]
+        overall_status = "degraded"
+        if len(missing) == len(configured_map):
+            status_reason = (
+                "没有任何节点持有凭证：网关可以启动但无法服务。"
+                "请运行 `.venv/bin/python login.py all` 扫码登录"
+            )
+        else:
+            status_reason = (
+                "所有已配置的节点当前都不可派发（被封禁租约/运维禁用/长效避让）。"
+                f"未配置凭证的节点: {', '.join(missing) or '无'}；"
+                "明细见本响应 providers[*].dispatchable 与 GET /v1/admin/dispatch-audit"
+            )
+
     healing_status = healing_engine.get_healing_status()
     risk_recent = risk_ledger.recent_interceptions(hours=24.0)
     _dg_diag = disconnect_guard.get_diagnostics()
     _sf_diag = singleflight_manager.get_diagnostics()
     return {
-        "status": "ok",
+        "status": overall_status,
+        "status_reason": status_reason,
+        "dispatchable_providers": sorted([pk for pk, ok in dispatchable_map.items() if ok]),
         "disabled_providers": sorted(list(disabled_set)),
         "inflight_requests": _inflight_requests,
         "risk_ledger": {

@@ -184,7 +184,16 @@ def test_server_health_and_heal_endpoints():
     r = client.get("/health")
     assert r.status_code == 200
     data = r.json()
-    assert data["status"] == "ok"
+    # [HEALTH-TRUTH] 这条断言原本写的是 `data["status"] == "ok"`，它锁住的正是缺陷
+    # 本身：本机与 CI 的 `session/` 都是空的，五个节点全部无凭证，网关可以启动但发
+    # 不出任何请求，而 /health 照样报 ok。它是运维与 agent 接入脚本判断「网关好了
+    # 没有」的唯一入口，报 ok 等于告诉所有人可以开始发请求。
+    # 契约改为：状态反映**能否真的服务**，且降级时给出成因。
+    # 正反两面见 tests/test_health_truthfulness.py（无凭证 -> degraded + 成因；
+    # 有凭证 -> ok，防止修成永远降级）。
+    assert data["status"] in ("ok", "degraded")
+    if data["status"] == "degraded":
+        assert data.get("status_reason"), "降级状态必须给出成因，否则运维不知道该做什么"
     assert "providers" in data
     assert "qwen" in data["providers"]
     assert "healing" in data

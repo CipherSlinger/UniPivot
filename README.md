@@ -126,10 +126,32 @@ claude -p "Write a complete implementation of a red-black tree in Python" --mode
 ```
 
 ### 2. Connecting Codex CLI (Responses API)
+
+Codex **does not read `OPENAI_BASE_URL`**. Measured against the real `codex` 0.145.0 binary: with only that variable set, its `ModelProviderInfo` reports `base_url: None` and the CLI dials `wss://api.openai.com/v1/responses` — your prompts go to OpenAI, not to this gateway. The binary does not even contain the string `OPENAI_BASE_URL`. A custom provider must be declared in `$CODEX_HOME/config.toml`:
+
+```toml
+# ~/.codex/config.toml  (or point CODEX_HOME at this directory)
+model_provider = "unipivot"
+model = "gpt-5.5"
+approval_policy = "never"
+sandbox_mode = "danger-full-access"
+
+[model_providers.unipivot]
+name = "unipivot"
+base_url = "http://127.0.0.1:8000/v1"
+wire_api = "responses"
+requires_openai_auth = false
+```
+
+Then simply:
 ```bash
-OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
-OPENAI_API_KEY=test-key \
-codex -m gpt-4o "Optimize the concurrent network connection pool logic in the current directory"
+codex exec "Optimize the concurrent network connection pool logic in the current directory"
+```
+
+Verify it is really talking to the gateway before trusting a run — the gateway log will show a `POST /v1/responses`, and `curl -s http://127.0.0.1:8000/v1/diagnostics | head` will show the request. To check end to end including a real two-round tool loop:
+
+```bash
+.venv/bin/python scripts/e2e/run_agent_loop.py --client codex
 ```
 
 ### 3. Calling from the OpenAI Python SDK
