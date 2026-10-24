@@ -76,6 +76,12 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
+    # [PROTOCOL] 服务端会话续接：客户端只发增量，前文交给服务端保存。网关**不**
+    # 持久化 response 对象，因此这个 id 必然解析不了——此前它靠 `extra="allow"`
+    # 收进 `model_extra` 却无人读，请求照常 200，模型只收到一句裸问题（实测）。
+    # 声明在这里是为了让它成为一个**被看见**的字段，拒绝逻辑在 `server.py` 的
+    # `/v1/responses` 入口（零上游，见 H4）。
+    previous_response_id: Optional[str] = None
     # [SESSION-ID] Codex CLI 的会话身份放在这个扁平字典里（`thread_id` / `session_id`），
     # 从不发 `conversation_id`。此前该字段根本没被解析（`extra="allow"` 把它搁在
     # `model_extra` 里），于是 `/v1/responses` 对 Codex 的粘滞/续聊/匿名回收全部空转。

@@ -3868,6 +3868,30 @@ async def count_tokens(req: AnthropicCountTokensRequest):
 @app.post("/v1/responses")
 @app.post("/responses")
 async def responses_endpoint(req: ResponsesRequest):
+    # [PROTOCOL] 服务端会话续接必须拒绝，不能静默忽略。
+    #
+    # 这个字段此前根本没被声明（靠 `extra="allow"` 收着），**没有任何代码读它**。
+    # 实测：`{"previous_response_id":"resp_abc123","input":"what did I ask before?"}`
+    # -> HTTP 200，上游提示词只有那一句裸问题。客户端的契约是「前文由服务端给」，
+    # 于是模型对着一个没有前因的问题自信作答——一次没有报错的错答案。
+    #
+    # 网关不持久化 response 对象，所以**任何** previous_response_id 都必然解析
+    # 不了；「静默新建会话」正是上面测到的行为。拒绝用的是 OpenAI 线上契约的
+    # 那个 code（`previous_response_not_found`），因为真实 SDK 与网关的恢复逻辑
+    # 就是依据它改用完整历史重发一次——静默忽略让他们永远走不到那条恢复路径。
+    # 零上游（H4）：拒绝发生在任何 provider 被构造之前。
+    if req.previous_response_id:
+        return JSONResponse(
+            error_response(
+                "`previous_response_id` 不受支持：本网关不持久化 response 对象，"
+                "无法解析该 id。请改为在 `input` 中回传完整历史（或省略该字段）。",
+                404,
+                "invalid_request_error",
+                code="previous_response_not_found",
+            ),
+            status_code=404,
+        )
+
     parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
     # [SESSION-ID] 会话身份的唯一判据：真实 Codex 从不发 `conversation_id`，它的线程
     # 标识在 `client_metadata.thread_id`（父子 agent 共享 session_id、线程不同）。
