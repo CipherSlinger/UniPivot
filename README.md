@@ -30,7 +30,7 @@ No need to apply for official commercial API keys, prepay, or bind a credit card
                        │         UniPivot gateway server.py (127.0.0.1:8000)         │
                        │ ├─ Translation layer (Chat Completions/Messages/Responses)  │
                        │ ├─ Fully connected peer grid (Reasoning/Flagship/Speed)     │
-                       │ ├─ Risk-control avoidance & cooling (429/WAF, 30s~120s)     │
+                       │ ├─ Risk-control avoidance (cooling / escalation / lease)    │
                        │ ├─ Self-healing hotfix brain (Monitor/Healer/AgentRunner)   │
                        │ └─ HTTP/2 connection pool (Max 100 Conns / 40 Keep-Alive)   │
                        └────────┬────────────┬─────────────┬────────────┬────────────┘
@@ -54,7 +54,9 @@ No need to apply for official commercial API keys, prepay, or bind a credit card
 ### 3. Fully Connected Peer Failover Grid
 - **Three-tier capability ring scheduling**: divided into the **Reasoning Ring (REASONING)**, **Flagship Ring (FLAGSHIP)**, and **Speed Ring (SPEED)**. All nodes within a ring are peers that back each other up.
 - **Transparent switchover before the first chunk**: upstream anomalies are caught before the first token arrives and shifted losslessly to a healthy backup node in the ring, eliminating half-packet dirty data.
-- **Adaptive risk control and intelligent cooling**: on encountering 429 or WAF (Alibaba RGV587 / ByteDance human verification), exponential avoidance is triggered automatically (30s~120s dynamic cooling), and smooth pacing plus random jitter are added to the call chain.
+- **Severity-aware avoidance, not a single cooldown number**: the tier determines the patience, because the tiers recover in opposite ways. A 429 is transient and self-healing, so it gets a short exponential backoff (`base × 1.2ⁿ`, capped at `GATEWAY_WAF_COOLDOWN_MAX` = 900s) and "retry when it clears" *is* the correct recovery. A repeated human-verification challenge (Alibaba RGV587 / ByteDance) is the one class **only a human can lift**, so every automated retry is another automated attempt against a flagged account — it escalates by powers of two (`GATEWAY_WAF_LONG_COOLDOWN_BASE` 3600s → capped at 24h), and the release path watches the credential file: completing `login.py` yourself changes it, which the gateway reads as "a human intervened". An operator quarantine lease extends the window with `max()`, so a mistyped lease can never release a banned node early.
+- **A ban is never re-poked to "check"**: a long avoidance is a hard block at the dispatch boundary, not a demotion — such a node is excluded from the candidate set, and a ring with no healthy member fails closed with **zero upstream calls** and a message naming each node's cause and remaining time. Confirming a declaration costs no upstream touch at all (`GET /v1/admin/dispatch-audit` is a read-only dry-run that asks the same gate the dispatcher asks).
+- Smooth pacing plus random jitter on the call chain, with evidence-driven and probation-aware multipliers layered on top.
 
 ### 4. Automated Self-Healing and Hotfix Brain
 - A built-in background health-audit probe periodically inspects the status of the five model services.
@@ -70,7 +72,7 @@ No need to apply for official commercial API keys, prepay, or bind a credit card
 ### 1. Environment Preparation
 ```bash
 # Clone the repository and enter the directory
-git clone <repo_url> && cd qwen
+git clone <repo_url> && cd UniPivot
 
 # Create a Python virtual environment and install the core dependencies
 python3 -m venv .venv
@@ -100,8 +102,8 @@ Run the interactive login command; the system will open a browser window for you
 ### 3. Start the Gateway Service
 ```bash
 ./run.sh
-# Or start it explicitly via uvicorn
-.venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
+# Or start it explicitly (note: `python -m uvicorn`, not `.venv/bin/uvicorn`)
+.venv/bin/python -m uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
 After the service starts:
@@ -114,7 +116,7 @@ After the service starts:
 ## 💻 Developer Ecosystem Integration Examples
 
 ### 1. Connecting the Official Claude Code CLI
-Configuring just three environment variables is enough to drive the underlying models directly with Anthropic's official command-line tool:
+Four environment variables are enough to drive the underlying models directly with Anthropic's official command-line tool:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
 ANTHROPIC_API_KEY=test-key \
@@ -182,31 +184,46 @@ When a client requests a generic alias, the system routes automatically accordin
 ## 🛠️ Project Organization
 
 ```
-├── server.py               # Gateway entry point (FastAPI routing, lifecycle management)
-├── login.py                # Automated credential capture (Playwright Chrome driver)
-├── session_store.py        # Atomic POSIX credential storage and permission isolation (0o700/0o600)
-├── providers/              # Model adaptation and translation core package
-│   ├── base.py             # Message flattening, token estimation, SSE frame assembly
-│   ├── failover.py         # Peer failover routing grid, dynamic cooldown avoidance, three-tier capability rings
-│   ├── http_client.py      # HTTP/2 connection pool and singleton reuse
-│   ├── anthropic_compat.py # Anthropic Messages protocol state machine and ToolCall parsing
-│   ├── responses_compat.py # OpenAI Responses API protocol translation
-│   ├── qwen/               # Qwen v2 protocol adapter
-│   ├── deepseek/           # DeepSeek protocol adapter and WebAssembly PoW engine
-│   ├── doubao/             # Doubao PC client protocol adapter
-│   ├── kimi/               # Kimi conversation pre-creation and token rotation adapter
-│   └── glm/                # GLM dynamic signature and logic stream adapter
-├── healing/                # Self-healing and hotfix system
-│   ├── monitor.py          # Provider health probe inspection and fault state machine
-│   ├── healer.py           # Model brain election, prompt assembly and task dispatch
-│   └── agent_runner.py     # Agent CLI discovery, bootstrap installation and sandboxed execution
-├── scripts/                # Reverse-engineering analysis and integration scripts
-│   ├── reverse/            # Frontend Webpack dependencies, upstream signing and other reverse-engineering analysis
-│   └── debug/              # Single-endpoint HTTP probing and replay debugging
-├── static/                 # Codex Light Web UI front-end assets
-├── tests/                  # Offline automated test suite (covers the five providers and three protocols)
-└── docs/                   # Architecture design and research documents
-    ├── architecture.md     # Complete system architecture design and engineering specification
+├── server.py                    # Gateway entry point (FastAPI routing, lifecycle management)
+├── login.py                     # Automated credential capture (Playwright Chrome driver)
+├── session_store.py             # Atomic POSIX credential storage and permission isolation (0o700/0o600)
+├── providers/                   # Model adaptation and translation core package
+│   ├── base.py                  # Message flattening, token estimation, SSE frame assembly
+│   ├── failover.py              # Peer failover routing grid, dispatch gate, three-tier capability rings
+│   ├── risk_ledger.py           # Durable cooldowns + auditable interception ledger (JSONL)
+│   ├── risk_dossier.py          # All-time interception record and "can this be bypassed?" verdict
+│   ├── risk_correlation.py      # Cross-provider correlation: systemic vs. single-account interception
+│   ├── quarantine.py            # Operator ban leases (long-duration, extend-only)
+│   ├── credential_watch.py      # Whole-ring credential outage detection and zero-upstream fast-fail
+│   ├── credential_renewal.py    # Credential-content fingerprinting and cause-scoped avoidance release
+│   ├── device_identity.py       # Stable per-node device identity (constant across requests and restarts)
+│   ├── singleflight.py          # In-flight request dedup with streaming fanout and follower backpressure
+│   ├── session_affinity.py      # Conversation pinning and cross-model state handoff
+│   ├── conversation_gc.py       # Durable retry queue for temporary-conversation deletion
+│   ├── tool_streamer.py         # Anti-fabrication tool-call parsing (three-layer defence)
+│   ├── stop_sequences.py        # Client-declared stop-sequence truncation (streaming-safe, split-aware)
+│   ├── stream_completion.py     # Tri-state completion marker verdict (seen / not-seen / unknown)
+│   ├── stream_keepalive.py      # SSE heartbeat during upstream silence
+│   ├── prompt_optimizer.py      # History folding that shortens without rewriting
+│   ├── http_client.py           # HTTP/2 connection pool and singleton reuse
+│   ├── anthropic_compat.py      # Anthropic Messages protocol state machine and ToolCall parsing
+│   ├── responses_compat.py      # OpenAI Responses API protocol translation
+│   ├── qwen/                    # Qwen v2 protocol adapter
+│   ├── deepseek/                # DeepSeek protocol adapter and WebAssembly PoW engine
+│   ├── doubao/                  # Doubao PC client protocol adapter
+│   ├── kimi/                    # Kimi conversation pre-creation and token rotation adapter
+│   └── glm/                     # GLM dynamic signature and logic stream adapter
+├── healing/                     # Self-healing and hotfix system
+│   ├── monitor.py               # Provider health probe inspection and fault state machine
+│   ├── healer.py                # Model brain election, prompt assembly and task dispatch
+│   └── agent_runner.py          # Agent CLI discovery, bootstrap installation and sandboxed execution
+├── scripts/                     # Reverse-engineering analysis and integration scripts
+│   ├── reverse/                 # Frontend Webpack dependencies, upstream signing and other reverse-engineering analysis
+│   └── debug/                   # Single-endpoint HTTP probing and replay debugging
+├── static/                      # Codex Light Web UI front-end assets
+├── tests/                       # Offline automated test suite (covers the five providers and three protocols)
+└── docs/                        # Architecture design and research documents
+    ├── architecture.md          # Complete system architecture design and engineering specification
     └── provider_capabilities.md # In-depth vendor capability research report
 ```
 
@@ -214,15 +231,19 @@ When a client requests a generic alias, the system routes automatically accordin
 
 ## 🧪 Automated Test Verification
 
-This repository ships a fully offline unit-test suite; the protocol streaming state machines, the PoW solver, and the self-healing logic can all be verified without connecting to the real internet:
+This repository ships a fully offline unit-test suite in `tests/` — every file a standalone script, each runnable on its own (no test runner, no network). The protocol streaming state machines, the PoW solver, the risk-avoidance ledger, the tool loop and the self-healing logic can all be verified without connecting to the real internet:
 
 ```bash
-.venv/bin/python tests/test_providers.py && \
-.venv/bin/python tests/test_server.py && \
-.venv/bin/python tests/test_session.py && \
-.venv/bin/python tests/test_healing.py && \
-.venv/bin/python tests/test_responses.py
+# Run the entire suite
+for f in tests/test_*.py; do .venv/bin/python "$f" || { echo "FAILED $f"; break; }; done
+
+# Or run a single module's suite
+.venv/bin/python tests/test_responses_protocol.py
+.venv/bin/python tests/test_agent_loop.py
+.venv/bin/python tests/test_stream_lifecycle.py
 ```
+
+Every suite sets `TESTING=1`, so the durable stores (risk ledger, cooldowns, quarantine leases, conversation GC queue, device identities) resolve to a `tempfile.mkdtemp()` directory — **no test writes to `session/` and no test issues a real upstream request**.
 
 ---
 
