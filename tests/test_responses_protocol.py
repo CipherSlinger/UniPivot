@@ -566,6 +566,108 @@ def test_error_response_never_invents_a_code():
     assert err["type"] == "upstream_error"
 
 
+def test_zero_upstream_refusal_keeps_a_json_error_on_the_status_line():
+    """[H4 / Codex] 零上游确定性拒绝必须仍是「状态行 + JSON 错误体」，不是 2xx 流。
+
+    这条用例存在的意义是**挡住一个诱人但会撒谎的改法**：把确定性拒绝伪装成
+    200 + 一条 `response.failed` 流，或者把状态码换成 400/429 去骗客户端停止重试。
+
+    实测（真实 codex-cli 0.145.0，全部为零上游拒绝，服务端计数）：
+
+        服务端形状                          请求数  用户看到
+        ---------------------------------------------------------------
+        503 + JSON 错误体（当前）              30   真实原因（25s 后）
+        503 + SSE `response.failed` 流          30   `event: response.created`
+        409 + SSE 流                             6   状态码 + body 片段
+        400 + JSON 错误体                        1   **裸 JSON body**
+        429 + JSON 错误体                        1   `exceeded retry limit, last status: 429`
+        200 + SSE `response.failed`             6   真实原因
+        200 + SSE `code:invalid_prompt`          1   真实原因（但 code 是编的）
+        `Retry-After` / `x-should-retry`       30   完全无效
+
+    三条结论决定了当前形状就是诚实的最优解：
+
+    (a) **状态码完全决定重试次数，body 只在 2xx 时被解析。** 同一份带
+        `insufficient_quota` / `invalid_prompt` 的 `response.failed` 流，挂在
+        200 上 → 1~6 次请求；挂在 503 上 → 30 次，且用户看到的是 `event:
+        response.created`（流被当错误体打印）。所以「用 SSE 形状改善 5xx」不成立。
+    (b) **能 1 次停下的状态码都不诚实**：400 说「你的请求格式错了」（实际是网关
+        没有可用凭证，用户的请求完全合法），429 说「你请求太快」（实际重试再快
+        也没用）。而且 400 把错误体当裸 JSON 打印给用户，可读性比现在更差。
+    (c) **能 1 次停下的 code 都是谎**：只有 `insufficient_quota` /
+        `usage_not_included` / `context_length_exceeded` / `invalid_prompt` /
+        `cyber_policy` 会终止重试，它们分别表示「额度用完 / 套餐不含 / 上下文超限 /
+        提示词违规」，与「凭证失效」是完全不同的原因。
+    (d) **重试预算是客户端配置，不是协议**：`request_max_retries = 0` /
+        `stream_max_retries = 0` 写在 `[model_providers.<id>]` 下实测 30 → 1 次，
+        写在顶层被忽略。这是**用户在客户端一侧**该做的决定，网关不该也不该能替它做。
+
+    因此这里钉住当前选择：503 + `application/json`，状态行可被任何 SDK 读到
+    （这正是 H4 存在的理由——严格 SDK 先看状态码），并且**不**携带任何伪造的
+    终止型 code。同时钉住我们唯一能做的诚实优化仍然在：客户端可用配置压掉重试。
+    """
+    original = srv.failover_router.execute_chat
+
+    async def _refuse(**kwargs):
+        raise ProviderError(
+            "全部/多数上游节点的认证凭证已失效，请执行 `.venv/bin/python login.py all`",
+            status=503,
+            err_type="credential_outage",
+            retry_after=119,
+        )
+
+    srv.failover_router.execute_chat = _refuse
+    try:
+        client = TestClient(srv.app)
+        for stream in (True, False):
+            r = client.post(
+                "/v1/responses",
+                json={"model": "gpt-4o", "input": "hi", "stream": stream},
+            )
+            where = f"stream={stream}"
+            assert r.status_code == 503, (
+                f"零上游拒绝在 {where} 上被报成了 HTTP {r.status_code}："
+                "实测 Codex 对 5xx 重试 30 次、对 4xx 只发 1 次，但能停在 1 次的 "
+                "400/429 都在撒谎（400 = 你的请求格式错了，429 = 你请求太快），"
+                "且 400/429 连原因都不给用户看（裸 JSON / 'exceeded retry limit'）。"
+                "H4 要求拒绝体现在状态行上，503 是唯一既真实又能被严格 SDK 读到的答案。"
+            )
+            assert r.headers.get("content-type", "").startswith("application/json"), (
+                f"零上游拒绝在 {where} 上不是 JSON 错误体，而是 "
+                f"{r.headers.get('content-type')!r}：实测把同一份 response.failed "
+                "挂在 503 上，Codex 仍发 30 次请求，并把 `event: response.created` "
+                "当错误信息打印给用户——SSE 形状在非 2xx 上既不能减少重试也不能传达原因。"
+            )
+            payload = r.json()
+            err = payload.get("error") or {}
+            assert err.get("type") == "credential_outage", (
+                f"{where} 的 error.type 不是网关真实的失败类别，实际 {err.get('type')!r}"
+            )
+            # 不伪造任何「会终止重试」的 code：那 5 个值各自的语义都与凭证失效无关。
+            assert "code" not in err or err.get("code") not in {
+                "insufficient_quota",
+                "usage_not_included",
+                "context_length_exceeded",
+                "invalid_prompt",
+                "cyber_policy",
+            }, (
+                f"{where} 伪造了终止型 error.code={err.get('code')!r}：这几个值会让 "
+                "Codex 只发 1 次请求，但它们表示额度用完/套餐不含/上下文超限/提示词违规，"
+                "与「网关没有可用凭证」是不同原因。省下的 29 次请求是用一句谎话换的。"
+            )
+            # 可读原因必须原样到达（没有任何分支可以把它吞掉）
+            assert "login.py" in err.get("message", ""), (
+                f"{where} 没有把可执行的修复指令传给用户，实际 {err.get('message')!r}"
+            )
+            # H6 的退避头仍然是诚实的（真实窗口 119s，不是常量）
+            assert r.headers.get("retry-after") == "119", (
+                f"{where} 的 Retry-After 不是抛出点知道的真实窗口，实际 "
+                f"{r.headers.get('retry-after')!r}"
+            )
+    finally:
+        srv.failover_router.execute_chat = original
+
+
 def run_all():
     tests = [
         test_text_stream_event_contract,
@@ -579,6 +681,7 @@ def run_all():
         test_mid_stream_failure_is_a_terminal_event_codex_reads,
         test_failed_event_code_is_the_gateway_err_type_not_a_mapped_enum,
         test_error_response_never_invents_a_code,
+        test_zero_upstream_refusal_keeps_a_json_error_on_the_status_line,
     ]
     for fn in tests:
         fn()
