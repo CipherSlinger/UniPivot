@@ -351,6 +351,90 @@ def test_a_node_already_cooled_for_this_is_reconvicted_on_the_first_attempt():
     )
 
 
+def test_a_non_risk_escalation_never_relabels_a_live_risk_cause():
+    """[BUDGET-6] 我们自己的降级决定，绝不能改写一个**仍在生效**的风控成因。
+
+    这是 [BUDGET-3]/[BUDGET-4] 一直没测到的那一格：预算裁短/超时记账都**不是风控
+    事件**，但它们和风控事件共用 `_cooldowns` 与 `_cooldown_severity` 两个格子，而
+    后者是**无条件覆盖**的，前者却取 `max()`。于是「更长的窗口」被保留了，「更长的
+    窗口的成因」被抹掉了。
+
+    实测（probe4，真实 HTTP 路径）：qwen 带着一次真实的人机验证拦截
+    `(45.0s, cause='waf')`，环内其余四个节点处于 30s 频控短冷却——那是 OPT-021 刻意
+    保留的「最后一搏」区间，所以主选节点照常被派发。它的握手被我们自己的总预算裁短，
+    连续计数已饱和在阈值上（BUDGET-5 的金丝雀语义），一次请求之后：
+
+        qwen: (60.0s, cause='timeout')     ← 窗口变长，成因被改写
+        release_auth_avoidance_locked(["qwen"], "probe", _RELEASABLE_BY_RENEWAL) -> []
+
+    后果不是「一条日志难看」，而是三个下游同时被误导：
+    1. **人工重登出口失效**：waf 是唯一只有人能解除的一类（OPT-023/029），复位路径
+       按成因判定，成因变成 timeout 之后运维照档案做完滑块验证也解除不了；
+    2. **档案给错建议**：`AVOIDANCE_MATRIX['timeout']` 说的是「重登无效，检查上游服务
+       与本地出网」，而这个节点其实是被人机验证挡住的；
+    3. **长效避让判读**：timeout 的 60s 远低于 1200s 阈值，一个真正的 waf 长效避让
+       会被降级成「短冷却，值得最后一搏」，节点继续被自动重试——正是 OPT-029 要消灭
+       的自我维持循环。
+
+    同一形状在 `record_failure` 里**早已存在**（probe5：先种 900s 的 waf，再记一次
+    429，窗口仍是 900s 而成因变成 ratelimit，重登复位同样返回 `[]`）。所以本用例断言
+    的是**一条对两个写入方都成立的性质**，不是给 `note_budget_capped` 打的补丁：
+    非风控记账不得改写仍在生效的风控成因；而风控记账之间可以互相改写（后一次拦截
+    就是更新的证据，opt029 的成因限定依赖这一点）。
+    """
+    tracker = _fresh_state()
+    _env(GATEWAY_BUDGET_CAPPED_LIMIT="3", GATEWAY_TIMEOUT_COOLDOWN="60")
+
+    from providers.failover import _RELEASABLE_BY_RENEWAL
+
+    async def main():
+        # --- 情形一：BUDGET-5 的预算裁短升级（非风控） -------------------
+        await tracker.record_failure("qwen", 403, "RGV587 人机验证 captcha", custom_cooldown=45.0)
+        assert tracker.cooldown_cause("qwen") == "waf"
+        assert tracker.get_remaining_cooldown("qwen") > 40.0
+
+        # 连续计数饱和 = BUDGET-5 的金丝雀态（一次被裁短即再次定罪）
+        tracker._budget_capped_streak["qwen"] = 3
+        await tracker.note_budget_capped("qwen")
+
+        assert tracker.get_remaining_cooldown("qwen") >= 55.0, (
+            "窗口本身应当延长（取 max 是正确的）——本用例只针对成因"
+        )
+        assert tracker.cooldown_cause("qwen") == "waf", (
+            f"一次预算裁短把仍在生效的人机验证成因改写成了 "
+            f"{tracker.cooldown_cause('qwen')!r}。这不是风控事件，不得改写风控成因："
+            f"改写后人工重登（唯一出口）将无法解除该避让，档案也会建议运维去检查"
+            f"网络而不是完成滑块验证"
+        )
+        assert tracker.release_auth_avoidance_locked(
+            ["qwen"], "probe", _RELEASABLE_BY_RENEWAL
+        ) == ["qwen"], (
+            "人机验证的避让必须仍可被人工重登解除（这是 waf 的唯一出口）"
+        )
+
+        # --- 情形二：record_failure 的超时记账（非风控） -------------------
+        tracker.reset()
+        await tracker.record_failure("deepseek", 403, "RGV587 人机验证 captcha", custom_cooldown=900.0)
+        assert tracker.cooldown_cause("deepseek") == "waf"
+        await tracker.record_failure("deepseek", 429, "rate limit 频控")
+        assert tracker.get_remaining_cooldown("deepseek") > 800.0, "窗口仍应是 900s 那一段"
+        assert tracker.cooldown_cause("deepseek") == "ratelimit", (
+            "风控成因之间**可以**互相改写——这是 OPT-029 明确写下的判定（「若之后又发生"
+            "其它类拦截，说明是另一类问题，绝不代它释放」），本用例不推翻它，只把它作为"
+            "对照，证明规则不是『成因永不改变』。注意这里窗口仍是 900s 那段、成因却已"
+            "易主，属于同一类「窗口归属与成因不一致」的遗留问题，已记入队列待判"
+        )
+        await tracker.record_failure("deepseek", 504, "上游超时", is_timeout=True)
+        assert tracker.get_remaining_cooldown("deepseek") > 800.0, "窗口仍应是 900s 那一段"
+        assert tracker.cooldown_cause("deepseek") == "ratelimit", (
+            f"一次超时记账把仍在生效的频控成因改写成了 "
+            f"{tracker.cooldown_cause('deepseek')!r}——超时是上游故障，不是风控事件"
+        )
+
+    asyncio.run(main())
+    print("test_a_non_risk_escalation_never_relabels_a_live_risk_cause: PASSED")
+
+
 def test_the_saturated_streak_survives_a_restart():
     """重启不得成为一步绕过：饱和的连续计数必须与冷却一起持久化。
 
@@ -432,9 +516,10 @@ def run_all():
     test_threshold_zero_restores_the_never_escalate_behaviour()
     test_recovery_clears_the_accumulated_evidence()
     test_a_node_already_cooled_for_this_is_reconvicted_on_the_first_attempt()
+    test_a_non_risk_escalation_never_relabels_a_live_risk_cause()
     test_the_saturated_streak_survives_a_restart()
     test_the_mechanism_is_observable_on_diagnostics()
-    print("\n✅ All budget-capped evidence tests passed! (7 cases)")
+    print("\n✅ All budget-capped evidence tests passed! (8 cases)")
 
 
 if __name__ == "__main__":

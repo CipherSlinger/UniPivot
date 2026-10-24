@@ -87,6 +87,14 @@ _PROVIDER_SESSION_FILES: Dict[str, Path] = {
 # 会变（令牌刷新，或安全 Cookie 轮换，或账号/设备身份变化）。
 _FINGERPRINT_FIELDS = ("token", "cookie", "user_id", "device_id")
 
+# [DAY-ZERO] 「本机从未配置过凭证」的哨兵指纹。真实指纹总是 `sha:…` 或 `meta:…`，
+# 所以这个值不可能与一个真实凭证撞车——比较「哨兵 -> 真实指纹」即「配置缺口已被补上」。
+#
+# 它**只**出现在带 `kind="unconfigured"` 标记的记录里，而 `note_auth_failure` /
+# `note_interception` 覆盖记录时只写 `{fingerprint, at}`、不带 `kind`，因此这两条
+# 证据链在结构上无法互相看见（详见 `note_unconfigured` 的说明）。
+_UNCONFIGURED_SENTINEL = "absent:never-configured"
+
 
 def credential_path(provider_key: str) -> Optional[Path]:
     """返回指定节点的凭证文件路径（未知节点返回 None）。
@@ -152,6 +160,9 @@ class CredentialRenewalTracker:
             # [OPT-027] 发生在「已更新过的凭证」上的认证失败次数——即
             # 「新凭证仍被拒」证据的出现次数（账号级封禁的判决依据）。
             "rejections_after_renewal": 0,
+            # [DAY-ZERO] 「从未配置」基线的写入次数——与续期计数**分开**，因为它是
+            # 配置事实而非风控证据。
+            "unconfigured_baselines": 0,
         }
         self._load()
 
@@ -233,7 +244,14 @@ class CredentialRenewalTracker:
         now = time.time() if now is None else now
         with self._lock:
             previous = self._records.get(pk)
-            if previous is not None and previous.get("fingerprint") != fp:
+            # [DAY-ZERO] `kind="unconfigured"` 的哨兵基线**不是**一枚凭证，它只表达
+            # 「本机当时没有凭证」。把它当成「上一枚凭证」会让「从未配置 -> 首次登录
+            # 后立刻被 401」被判成「新凭证仍被拒」，从而推断账号级封禁并给一个从未
+            # 被上游拦截过的账号施加自动租约——本方法唯一被依赖的返回值（OPT-027 的
+            # 判别式）绝不能被配置缺口污染。两条证据链在结构上分开：
+            # 哨兵记录由 `note_unconfigured` 写、由 `unconfigured_providers` 读。
+            had_credential = previous is not None and previous.get("kind") != "unconfigured"
+            if had_credential and previous.get("fingerprint") != fp:
                 renewed_since_last = True
             self._records[pk] = {"fingerprint": fp, "at": now}
             self._stats["renewals_recorded"] += 1
@@ -297,7 +315,14 @@ class CredentialRenewalTracker:
         if self.is_disabled():
             return []
         with self._lock:
-            snapshot = {pk: dict(rec) for pk, rec in self._records.items()}
+            snapshot = {
+                pk: dict(rec)
+                for pk, rec in self._records.items()
+                # [DAY-ZERO] 「从未配置」的哨兵基线不是一枚凭证，它的变化由
+                # `unconfigured_providers()` 报告。两条证据链必须分开读：这条回答
+                # 「凭证被换掉了吗」（会喂给封禁推断），那条回答「配置补上了吗」。
+                if rec.get("kind") != "unconfigured"
+            }
         renewed: List[str] = []
         for pk, rec in snapshot.items():
             current = credential_fingerprint(pk)
@@ -314,6 +339,83 @@ class CredentialRenewalTracker:
         with self._lock:
             return (provider_key or "").strip().lower() in self._records
 
+    # ------------------------------------------------------------ [DAY-ZERO] 未配置基线
+
+    def note_unconfigured(self, provider_key: str, now: Optional[float] = None) -> bool:
+        """为一个**本机从未配置过凭证**的节点留下「不存在」基线。
+
+        为什么需要它：`renewed_providers()` 的判定是「记录里的指纹 != 当前指纹」，
+        而 `note_auth_failure` 在凭证文件不存在时**不写任何记录**（`credential_fingerprint`
+        返回 None）。于是全新克隆的节点在避让期间根本没有比较对象，运维照着网关自己的
+        报错跑完 `login.py`，`renewed_providers()` 仍然返回空——网关让运维做的事，做完
+        之后没有任何效果。这正是 OPT-026 记录过的自锁，换了个触发条件。
+
+        **这条证据链与 OPT-027 严格隔离，这是本方法存在的唯一风险点**：
+        `note_auth_failure` 的返回值是「本次失败是否发生在一枚**已更新**的凭证上」，
+        它是账号级封禁推断（自动租约）的唯一判别依据。若把「从未配置 -> 刚配置」记成
+        一次「续期」，那么全新克隆的第一次真实登录就会被判成「换了新凭证仍被拒」，
+        进而给一个**从未被上游拦截过**的账号施加封禁租约。因此这里写入的基线带
+        `kind="unconfigured"` 标记，`note_auth_failure`/`note_interception` 覆盖记录时
+        会丢掉这个标记（它们只写凭证事实），而 `note_unconfigured` **永远不返回、
+        也永远不写入**封禁推断所需的任何计数。
+
+        因此本方法只服务于一个消费者：`unconfigured_providers()`——即「该节点曾经
+        处于未配置状态，而现在有凭证了」这一**纯配置事实**。
+
+        开关：与其他续期判定同受 `is_disabled()` 约束（关闭时返回 False，调用方
+        退化为「无基线、需运维显式指定」的保守行为）。
+        """
+        if self.is_disabled():
+            return False
+        pk = (provider_key or "").strip().lower()
+        if not pk:
+            return False
+        # 已有真实凭证：说明它不是「未配置」状态，交给 `note_auth_failure` 的那条链。
+        if credential_fingerprint(pk) is not None:
+            return False
+        now = time.time() if now is None else now
+        with self._lock:
+            self._records[pk] = {"fingerprint": _UNCONFIGURED_SENTINEL, "at": now, "kind": "unconfigured"}
+            self._stats["unconfigured_baselines"] += 1
+            self._save_locked()
+        return True
+
+    def unconfigured_providers(self) -> List[str]:
+        """曾经未配置、**现在**已配置的节点（只读判定，纯配置事实）。
+
+        与 `renewed_providers()` 分开实现而不是共用一个函数，是因为两者回答的问题
+        不同、失败方向也不同：续期判定是**风控**证据（错了会给健康账号上封禁租约），
+        而这里只是「配置缺口是否已被补上」。共用一处必然要在一处里判 `kind`，
+        而那正是两条证据链开始互相污染的地方。
+        """
+        if self.is_disabled():
+            return []
+        with self._lock:
+            snapshot = {
+                pk: dict(rec)
+                for pk, rec in self._records.items()
+                if rec.get("kind") == "unconfigured"
+            }
+        configured: List[str] = []
+        for pk, rec in snapshot.items():
+            if rec.get("fingerprint") != _UNCONFIGURED_SENTINEL:
+                continue
+            if credential_fingerprint(pk) is None:
+                continue
+            configured.append(pk)
+        return sorted(configured)
+
+    def clear_unconfigured(self, provider_key: str) -> None:
+        """清掉某节点的「未配置」基线（复位已经发生，比较对象不再需要）。"""
+        if self.is_disabled():
+            return
+        pk = (provider_key or "").strip().lower()
+        with self._lock:
+            rec = self._records.get(pk)
+            if rec and rec.get("kind") == "unconfigured":
+                self._records.pop(pk, None)
+                self._save_locked()
+
     def get_diagnostics(self, now: Optional[float] = None) -> Dict[str, Any]:
         now = time.time() if now is None else now
         with self._lock:
@@ -327,6 +429,8 @@ class CredentialRenewalTracker:
             "tracked_providers": sorted(records),
             "records": records,
             "renewed_providers": self.renewed_providers(now),
+            # [DAY-ZERO] 曾经未配置、现已补上凭证的节点（配置事实，与续期证据分开）。
+            "unconfigured_providers": self.unconfigured_providers(),
             "stats": stats,
             "hint": (
                 "检测到凭证文件已更新，这些节点的认证级避让将（或已）被复位："
@@ -349,6 +453,7 @@ class CredentialRenewalTracker:
                 "renewals_detected": 0,
                 "records_cleared": 0,
                 "rejections_after_renewal": 0,
+                "unconfigured_baselines": 0,
             }
 
 

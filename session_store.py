@@ -122,3 +122,37 @@ def resolve_glm() -> Optional[Session]:
     return _resolve_session(["GLM_AUTH_TOKEN", "GLM_REFRESH_TOKEN", "CHATGLM_AUTH_TOKEN"], "GLM_COOKIE", GLM_SESSION_FILE)
 
 
+# [DAY-ZERO] 「本机是否配置了该节点的凭证」——全项目**唯一**判据。
+#
+# 判据只有一条：解析器能否拿到一个带 token 的会话（env 优先，其次 session/<provider>.json）。
+# 这与 `server.py:_make_provider` 抛「未检测到 … 令牌」的条件、以及健康探针
+# (`healing/monitor.py` 的 `if not sess or not sess.token`) **逐字一致**——三处必须问
+# 同一个问题，否则「算不算已配置」会出现第二份定义，而第二份定义必然漂移。
+#
+# 为什么它必须存在：没有凭证是**纯本地的配置缺口**，不是上游的 401。过去网关把两者
+# 混为一谈，于是一个全新克隆的第一次请求就给自己记下了认证级风控避让（详见
+# `providers/failover.py:record_failure` 的 [DAY-ZERO] 段与 CLAUDE.md 同名条目）。
+_PROVIDER_RESOLVERS = {
+    "qwen": resolve_qwen,
+    "deepseek": resolve_deepseek,
+    "doubao": resolve_doubao,
+    "kimi": resolve_kimi,
+    "glm": resolve_glm,
+}
+
+
+def is_configured(provider_key: str) -> bool:
+    """本机是否配置了该节点的凭证（只读，绝不写盘、绝不联网）。
+
+    未知节点返回 True（不属于本判据的处理范围，交由原有语义决定）。
+    解析异常同样返回 True：**判定失败必须退回旧行为**，绝不能因为一次读取异常就把
+    一个已配置的节点误判成「未配置」——那会让一次真实的上游 401 逃过认证级避让。
+    """
+    resolver = _PROVIDER_RESOLVERS.get((provider_key or "").strip().lower())
+    if resolver is None:
+        return True
+    try:
+        session = resolver()
+    except Exception:  # noqa: BLE001 - 判定失败一律按「已配置」处理（保守）
+        return True
+    return bool(session and session.token)

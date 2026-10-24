@@ -381,11 +381,15 @@ def test_diagnostics_and_admin_endpoint_exposure():
             "disabled",
             "timeout",
             "truncated",
+            "unconfigured",
         }, (
             "研判矩阵新增成因时必须同步更新此断言"
             "（OPT-035 新增 disabled；[M2] 新增 timeout、[S2] 新增 truncated —— "
             "这两类都是**上游故障**而不是风控拦截，建议必须指向上游健康/本地出口"
-            "质量，而不是「去重新登陆」或「去完成人机验证」）"
+            "质量，而不是「去重新登陆」或「去完成人机验证」；"
+            "[DAY-ZERO] 新增 unconfigured —— 这是**本机配置缺口**，既不是平台风控、"
+            "也不是上游故障：它的解除方式与 auth 一样是 `login.py`（所以重登有效），"
+            "而 disabled 的解除方式是改配置（重登无效），两者不得混为一谈）"
         )
 
         # 单节点视图

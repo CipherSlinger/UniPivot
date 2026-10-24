@@ -173,6 +173,23 @@ AVOIDANCE_MATRIX: Dict[str, Dict[str, Any]] = {
                     "(deepseek/doubao/glm) 协议里没有完成标记，它们的截断无法被"
                     "判定——那是协议的限制，不是漏判。",
     },
+    # [DAY-ZERO] 未配置凭证：本机的配置缺口，连上游都没碰过。
+    # 与 `disabled` 同属「不是平台风控」，但方向相反：disabled 是运维**主动**排除，
+    # 这里是运维**还没**配置。两者的正确动作因此完全不同（改配置 vs 执行登录）。
+    "unconfigured": {
+        "label": "本机未配置凭证 (尚未 `login.py`)",
+        "technically_bypassable": False,
+        "recoverable_by_relogin": True,
+        "auto_recovers": True,
+        "typical_span": "一次登录动作",
+        "strategy": "这不是上游风控，也不是上游故障：本机**根本没有该节点的凭证**，"
+                    "网关从未向该厂商发出过任何请求。正确动作是执行 "
+                    "`.venv/bin/python login.py <provider>`（或配置对应的 `*_AUTH_TOKEN` "
+                    "环境变量）完成第一次登录。网关为该节点保留的是一段**固定短冷却**、"
+                    "**不随次数升级**，且凭证一出现就自动解除（不需要重启）——"
+                    "因为这一档若借用认证级的升级路径，就会落入「只有人工重登能修好、"
+                    "而重登产生的状态又锁死着自己」的自锁。",
+    },
     # [OPT-035] 运维声明出局：不是平台的风控，而是运维把节点排除出本次部署。
     # 措辞刻意与「封禁」和「认证失效」都不同，因为它们**都**建议重登，而这里重登
     # 完全无效——这正是本项目反复修复的「误导运维」缺陷类型（OPT-026/027/029/031）。
@@ -200,12 +217,20 @@ _SEVERITY_TO_VERDICT = {
     "timeout": "timeout",
     # [S2] 截断同理：上游故障，重新登录无效。
     "truncated": "truncated",
+    # [DAY-ZERO] 未配置凭证：本地配置缺口，不是平台风控。
+    # 不加这一行会落到 `_SEVERITY_TO_VERDICT.get(...) or "ratelimit"` 的缺省上，
+    # 于是档案会告诉运维「频率限制，无需人工介入，等待窗口衰减即可」——而真实动作
+    # 是第一次登录。这是本项目反复修复的「误导运维」缺陷类型
+    # （OPT-026/027/029/031/035），换了个成因。
+    "unconfigured": "unconfigured",
 }
 
 # [M2] 台账**无法表达**的成因：超时从不入账（它不是风控拦截），因此研判不能
 # 只在台账里找它，否则「此刻正因超时避让」会被报成台账里的旧成因（通常是 waf），
 # 把运维引去登录一个从未拦截过他的平台。只有这类成因才允许覆盖台账多数成因。
-_LIVE_ONLY_CAUSES = ("timeout", "truncated")
+# [DAY-ZERO] 未配置同理，而且更彻底：这类节点**从未被上游看见过**，台账里必然
+# 一条记录都没有，于是档案的缺省答案会是「无拦截记录」，同样不对。
+_LIVE_ONLY_CAUSES = ("timeout", "truncated", "unconfigured")
 
 
 class RiskDossier:
@@ -578,6 +603,16 @@ class RiskDossier:
                     f"执行 `.venv/bin/python login.py {provider_key}` 重新登录取令牌；"
                     f"凭证更新后网关会自动解除避让并转入串行探路重新验证",
                 ]
+            if cause == "unconfigured":
+                # [DAY-ZERO] 固定短冷却、凭证出现即自动解除：这里必须说清楚，
+                # 否则运维会把它当成「风控冷却」去等待一个不存在的窗口。
+                return [
+                    f"该节点的凭证**尚未配置**（剩余约 {rem:.0f} 秒的短冷却，"
+                    f"不随次数升级）：网关从未向该厂商发出过任何请求，这不属于风控",
+                    f"执行 `.venv/bin/python login.py {provider_key}` 完成首次登录"
+                    f"（或配置对应的 `*_AUTH_TOKEN`）；凭证出现后网关会**自动解除**该避让，"
+                    f"无需重启",
+                ]
             if cause == "timeout":
                 return [
                     f"该节点因**上游超时**进入避让，剩余约 {rem:.0f} 秒；网关已按上游故障"
@@ -606,6 +641,12 @@ class RiskDossier:
             return [
                 f"执行 `.venv/bin/python login.py {provider_key}` 由人工完成人机滑块验证",
                 "严禁以脚本方式自动破解验证码：属对抗行为且会显著加重账号风控评分",
+            ]
+        if verdict["verdict"] == "unconfigured":
+            return [
+                f"本机尚未配置该节点的凭证：执行 `.venv/bin/python login.py {provider_key}` "
+                f"完成首次登录（或配置对应的 `*_AUTH_TOKEN`）",
+                "网关从未向该厂商发出过请求，因此没有风控记录可言——这不是拦截，也无需等待冷却",
             ]
         if verdict["verdict"] == "timeout":
             return [

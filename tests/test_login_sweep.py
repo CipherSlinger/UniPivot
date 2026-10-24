@@ -157,11 +157,23 @@ def test_all_still_logs_in_a_cooling_node():
     from providers.quarantine import get_quarantine_store
 
     _reset_avoidance()
-    tracker = CooldownTracker()
-    asyncio.run(tracker.record_failure("glm", 429, "too many requests"))
+    # 前置条件必须真的成立：本机 session/ 为空时，glm 是「未配置」节点，
+    # `touch_avoidance_reason` 会如实报 `unconfigured`（[DAY-ZERO]），于是这里
+    # 量到的就不是「风控冷却中的节点」——那正是 [M1] 记录过的「断言的不是代码
+    # 真正保护的那个窗口」。给 glm 一枚假令牌，让本次冷却的成因确实是 ratelimit。
+    old_token = os.environ.get("GLM_AUTH_TOKEN")
+    os.environ["GLM_AUTH_TOKEN"] = "test-glm-token-for-login-sweep"
+    try:
+        tracker = CooldownTracker()
+        asyncio.run(tracker.record_failure("glm", 429, "too many requests"))
 
-    reason = tracker.touch_avoidance_reason("glm")
-    assert reason == "cooldown", f"前置条件不成立：glm 应为 cooldown，实际 {reason!r}"
+        reason = tracker.touch_avoidance_reason("glm")
+        assert reason == "cooldown", f"前置条件不成立：glm 应为 cooldown，实际 {reason!r}"
+    finally:
+        if old_token is None:
+            os.environ.pop("GLM_AUTH_TOKEN", None)
+        else:
+            os.environ["GLM_AUTH_TOKEN"] = old_token
 
     touched: list[str] = []
     _run_main(["all"], touched)

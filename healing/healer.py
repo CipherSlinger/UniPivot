@@ -56,6 +56,8 @@ def pick_healer_model(monitor: HealthMonitor, failing_provider: str) -> Optional
         "disabled": "已被运维禁用 (DISABLED_PROVIDERS)",
         "quarantined": "处于运维/自动封禁租约期",
         "cooldown": "处于风控避让冷却期",
+        # [DAY-ZERO] 配置缺口，不是风控。
+        "unconfigured": "本机尚未配置凭证",
     }
 
     def _avoiding(cand: str) -> bool:

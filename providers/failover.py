@@ -79,6 +79,20 @@ _PROBATION_EVIDENCE_FLOOR = 300.0
 # 可观测事实——凭证文件变了。频控**永不**在内：它本就会自行衰减，重登毫无意义。
 _RELEASABLE_BY_RENEWAL = (SEVERITY_AUTH, SEVERITY_WAF)
 
+# [DAY-ZERO] 「本机没有配置凭证」是配置缺口，与上面两者的**共同点**是：它们的解除
+# 依据都是「凭证出现了/变了」这一条可观测事实。区别在于它**没有**可比的旧凭证
+# （文件从来不存在），所以它的判定走 `.unconfigured_providers()` 这条独立证据链
+# （详见 `CredentialRenewalTracker.note_unconfigured`）。
+SEVERITY_UNCONFIGURED = "unconfigured"
+_RELEASABLE_BY_CONFIGURED = (SEVERITY_UNCONFIGURED,)
+# 凭证事实（变更或首次出现）可以解除的全部成因。
+_RELEASABLE_BY_CREDENTIAL_EVENT = _RELEASABLE_BY_RENEWAL + _RELEASABLE_BY_CONFIGURED
+
+# [BUDGET-6] **风控成因**：由上游的拦截给出、且处置方式取决于成因的那些。
+# `timeout` / `truncated` 是**上游故障**（本网关自己的观测），不是风控拦截——
+# 它们既不该写台账，也不该改写一个仍在生效的风控成因。
+_RISK_CAUSES = (SEVERITY_AUTH, SEVERITY_RATE_LIMIT, SEVERITY_WAF)
+
 
 # ---------------------------------------------------------------- [OPT-014] 风控证据驱动的自适应步调
 
@@ -361,6 +375,37 @@ def is_risk_interception(exc_or_text: Any) -> Tuple[bool, str]:
         return True, "Generic WAF / Captcha Challenge"
 
     return False, ""
+
+
+# ---------------------------------------------------------------- [DAY-ZERO] 未配置凭证
+
+def _provider_is_configured(provider_key: str) -> bool:
+    """本机是否配置了该节点的凭证——委托给 `session_store` 的**唯一**判据。
+
+    在本模块留一层薄封装，是为了让判定失败的方向明确落在「保守」一侧：任何异常都
+    按「已配置」处理（`session_store.is_configured` 已如此实现），于是真实的 401
+    绝不会因为一次读取异常而逃过认证级避让。若反过来把「读不到」当成「未配置」，
+    一次磁盘故障就能让整环停止升级认证避让——风控线的失败方向必须朝向「继续避让」。
+    """
+    try:
+        from session_store import is_configured
+
+        return bool(is_configured(provider_key))
+    except Exception:  # noqa: BLE001 - 判定不可用时不改变既有语义
+        return True
+
+
+def _unconfigured_cooldown() -> float:
+    """未配置凭证的固定短冷却（秒，默认 60，`GATEWAY_UNCONFIGURED_COOLDOWN`）。
+
+    固定而不随次数增长，是有意的：这一档的作用是「别把它当候选反复派发」，不是惩罚。
+    未配置不是错误行为，只是一个还没完成的前置步骤；真正让它恢复的信号是凭证出现，
+    而不是时间流逝或惩罚累积。
+    """
+    try:
+        return max(1.0, float(os.getenv("GATEWAY_UNCONFIGURED_COOLDOWN", "60")))
+    except (TypeError, ValueError):
+        return 60.0
 
 
 class CooldownTracker:
@@ -661,7 +706,7 @@ class CooldownTracker:
         """[OPT-034] 后台自维护触点（探针/令牌刷新/会话回收/自愈选举）的**唯一**判据。
 
         返回 `""` 表示可以触碰上游；否则返回成因，取值 `disabled` / `quarantined` /
-        `cooldown`（heaviest-wins，顺序即优先级）。
+        `cooldown` / `unconfigured`（heaviest-wins，顺序即优先级）。
 
         为什么需要这一条：派发边界（OPT-033）与健康探针（OPT-012）都遵守「运维禁用」，
         但**另外三条自维护通道只问了冷却、没问禁用**——一个被 `DISABLED_PROVIDERS`
@@ -696,6 +741,13 @@ class CooldownTracker:
         except Exception:  # noqa: BLE001 - 租约查询失败回退到冷却判读，绝不误放行
             pass
         if self.get_remaining_cooldown(provider_key) > 0.0:
+            # [DAY-ZERO] 成因如实：一次「本机没有凭证」不是风控冷却。若笼统报
+            # `cooldown`，探针日志就会写「避免加剧上游封禁」，而该账号从未被触碰过——
+            # 与 OPT-026/027/029/031 反复修复的误导类型同形，只是成因换成了配置缺口。
+            # 禁用/租约仍优先于它（那两者是更重的声明）。
+            if not _provider_is_configured(provider_key):
+                self.note_touch_block("unconfigured")
+                return "unconfigured"
             self.note_touch_block("cooldown")
             return "cooldown"
         return ""
@@ -1190,17 +1242,68 @@ class CooldownTracker:
             # 完成一个平台从未出现过的人机验证（与 [M2] 对超时的误判同形）。
             is_truncation = bool(is_truncation)
 
+            # [DAY-ZERO] 「本机没有配置这个节点的凭证」是**配置缺口**，不是上游的 401。
+            #
+            # `_make_provider` 在本地拿不到凭证时抛出 status=401 的 ProviderError，
+            # 而派发循环的 except 只读 `exc.status`——于是这条从未离开本机的结论被当成
+            # 上游 HTTP 401 记进了认证级避让（实测三轮之后五个节点全部 1800s，而**上游
+            # 调用次数为 0**）。一次 401 与一次「我们没配置」在成因上正相反：
+            # 前者的处置是重登，后者是去配置；而认证级是升级最重、解除路径最窄的一档。
+            #
+            # 判定必须问**唯一判据** `session_store.is_configured()`，而不是嗅探错误文案：
+            # 文案会变，而「本机此刻有没有凭证」是一个可查询的事实。同一个判据也用在
+            # `_make_provider` 的抛出条件与健康探针上，三处问同一个问题。
+            is_unconfigured = not (is_timeout or is_truncation) and not _provider_is_configured(provider_key)
+            if is_unconfigured:
+                # 未配置就是未配置：它不是风控拦截，也不是上游故障，而是我们自己的
+                # 配置缺口。下面所有风控副作用（台账、全环检测、封禁推断、观察期）
+                # 都必须跳过——`is_upstream_fault` 是它们的统一闸门，与超时/截断同路。
+                is_timeout = False
+                is_truncation = False
+                is_risk = False
+                is_waf_or_rate = False
+                is_auth_error = False
+
             # 「是上游故障，不是账号被标记」只定义一次：风控台账、全环凭证检测、
             # 恢复观察期三处都用它。否则每新增一种上游故障都要在四处各加一个
             # `and not ...`，正是本仓库反复在修的「同一事实散落多处」。
-            is_upstream_fault = is_timeout or is_truncation
+            is_upstream_fault = is_timeout or is_truncation or is_unconfigured
 
             # 严重度分级：auth（令牌/账号级）> ratelimit（频控）> waf（人机验证）
             severity = classify_interception_severity(
                 is_risk=is_risk, risk_reason=risk_reason, status=status, error_msg=error_msg
             )
             escalated = False
-            if is_timeout:
+            if is_unconfigured:
+                # [DAY-ZERO] 配置缺口自成一档，**永远不升级**。
+                #
+                # 为什么不能借用 auth 档：认证级的解除路径是「凭证指纹变化 -> 自动复位」
+                # （OPT-026），而凭证文件从来不存在时压根没有指纹记录可比，那条解除
+                # 路径对它**结构上不可见**——于是 30 分钟避让一旦升级上来就没人能解除，
+                # 运维照着网关自己的提示跑完 `login.py` 也依然不可用。这正是 OPT-026
+                # 记录过的自锁，换了个触发条件。
+                #
+                # 取一段固定的短冷却（不随次数增长）：它的作用只是「别把它当候选反复
+                # 派发」，而不是惩罚——未配置不是错误行为，只是还没配置。真正让它恢复
+                # 的信号是「凭证出现了」，由 `release_renewed_credentials*` 处理。
+                cooldown_duration = _unconfigured_cooldown()
+                severity = "unconfigured"
+                # 留下「此刻不存在凭证」的基线：`note_auth_failure` 在文件不存在时
+                # 不写任何记录，于是续期判定永远没有比较对象——运维补上凭证之后
+                # `renewed_providers()` 仍返回空，节点继续被避让，网关让运维做的事
+                # 做完后没有效果。这条基线走**独立**证据链（`kind="unconfigured"`），
+                # 绝不喂给 OPT-027 的封禁推断判别式（详见 `note_unconfigured`）。
+                try:
+                    self.renewal.note_unconfigured(provider_key)
+                except Exception:  # noqa: BLE001 - 基线失败绝不影响冷却主流程
+                    pass
+                logger.warning(
+                    f"[未配置避让] 节点 [{provider_key}] 本机没有凭证：冷却 "
+                    f"{cooldown_duration:.1f}s（第 {cur_fails} 次）。这是**本地配置缺口**，"
+                    f"不是上游风控——不写台账、不触发整环失效检测、不进入恢复观察期；"
+                    f"补上凭证后会自动复位"
+                )
+            elif is_timeout:
                 # 上游故障，不是风控：常规 5xx 那套 15s×n 的递增在这里方向相反
                 # ——连续超时说明上游**持续**不吐字，越敲越亏；而 45 秒以内的冷却
                 # 又落进「短冷却值得最后一搏」的区间，节点会一直被派发下去。
@@ -1282,8 +1385,9 @@ class CooldownTracker:
             end_time = time.time() + cooldown_duration
             # 如果已有更长的冷却期，保留较长者
             self._cooldowns[provider_key] = max(self._cooldowns.get(provider_key, 0.0), end_time)
-            # [OPT-026] 记录本次冷却的成因，供凭证续期后判定「是否可复位」
-            self._cooldown_severity[provider_key] = severity
+            # [OPT-026] 记录本次冷却的成因，供凭证续期后判定「是否可复位」。
+            # [BUDGET-6] 经统一判据写入：超时/截断是上游故障，不得抹掉仍在生效的风控成因。
+            self._set_cooldown_cause(provider_key, severity, end_time)
 
             # [OPT-025] 认证失效还需上报全环检测器：若多个**不同**节点在同一窗口内
             # 相继 401，说明整环凭证已失效，故障转移不可能成功——必须快速失败而非
@@ -1436,7 +1540,10 @@ class CooldownTracker:
             self._cooldowns[provider_key] = max(
                 self._cooldowns.get(provider_key, 0.0), end_time
             )
-            self._cooldown_severity[provider_key] = "timeout"
+            # [BUDGET-6] 经统一判据写入：本方法**不是**风控事件，若节点此刻正处于一段
+            # 仍在生效的风控避让（人机验证 / 认证失效），它的成因必须保留——否则人工重登
+            # 这个唯一出口会失效，档案也会把 captcha 节点误报成「网络问题」。
+            self._set_cooldown_cause(provider_key, "timeout", end_time)
             self._persist_state()
             logger.warning(
                 "[握手预算] 节点 [%s] 连续 %d 次未能在分到的预算份额内返回首包，"
@@ -1657,6 +1764,43 @@ class CooldownTracker:
 
     # -------------------------------------------------------- [OPT-026] 认证级避让复位
 
+    def _set_cooldown_cause(self, provider_key: str, cause: str, cooldown_end: float) -> None:
+        """[BUDGET-6] 记录这次的**冷却成因**——但不得让非风控记账抹掉仍在生效的风控成因。
+
+        `_cooldowns` 与 `_cooldown_severity` 是同一个窗口的两半：前者取 `max()`（保留
+        更长的窗口），后者过去是**无条件覆盖**。于是「更长的窗口」留下来了，「那个窗口
+        为什么存在」却被抹掉，而 `release_auth_avoidance_locked` 与档案建议都按成因判定。
+
+        实测的两种到达方式（都不是风控事件）：
+        - [BUDGET-6] BUDGET-5 的预算裁短升级（`note_budget_capped`）：qwen 带着一次真实的
+          人机验证 `(45s, waf)`，被我们自己的预算裁短一次后变成 `(60s, timeout)`，
+          `release_auth_avoidance_locked(..., _RELEASABLE_BY_RENEWAL)` 返回 `[]`——
+          运维照档案做完滑块验证也解除不了，而 waf 是**唯一只有人能解除**的一类。
+        - 同形的既有缺陷：先种 900s 的 waf，再记一次 429 → 窗口仍是 900s，成因变成
+          `ratelimit`，重登复位同样失效。
+
+        规则（一条，两个写入方共用，避免「同一事实两份定义」）：
+        - 风控成因之间**可以**互相改写——后一次拦截就是更新的证据，OPT-029 的成因限定
+          依赖这一点；
+        - **非风控**成因只有在它确实延长了窗口（即旧窗口已被取代）时才改写；否则旧窗口
+          仍然生效，成因必须跟着旧窗口走。
+        """
+        prev_end = self._cooldowns.get(provider_key, 0.0)
+        # 读「有效成因」而不是原始记录：复位路径（`release_auth_avoidance_locked`）就是
+        # 用它判定的，两处必须问同一个问题。记录缺失时它会退化到台账的最近一次拦截，
+        # 方向是**保留**风控成因（宁可多留一次人工出口，不可平白丢掉）。
+        prev_cause = self._effective_cooldown_severity(provider_key) if prev_end > time.time() else ""
+        if (
+            cause not in _RISK_CAUSES
+            and prev_cause in _RISK_CAUSES
+            and prev_end > time.time()
+            and prev_end >= cooldown_end
+        ):
+            # 旧的**风控**窗口仍然生效且没有被这次记账取代：保留它的成因。
+            # 只在内存里保留，落盘由调用方统一的 `_persist_state()` 完成。
+            return
+        self._cooldown_severity[provider_key] = cause
+
     def _effective_cooldown_severity(self, provider_key: str) -> str:
         """[OPT-026] 返回该节点冷却的成因严重度。
 
@@ -1726,7 +1870,8 @@ class CooldownTracker:
             except Exception:  # noqa: BLE001 - 查询失败按「有租约」处理（保守）
                 continue
             # 2. 只有 `causes` 指定的成因才可被复位
-            if self._effective_cooldown_severity(provider_key) not in allowed:
+            cause_before_release = self._effective_cooldown_severity(provider_key)
+            if cause_before_release not in allowed:
                 continue
             # 3. 确有待复位状态
             has_cooldown = self._cooldowns.get(provider_key, 0.0) > now
@@ -1745,6 +1890,21 @@ class CooldownTracker:
                 self.credential_watch.note_success(provider_key)
             except Exception:  # noqa: BLE001
                 pass
+            # [DAY-ZERO] 「首次配置」的复位**不进入**恢复观察期：观察期是为封禁解除
+            # 瞬间的需求释放准备的，而一个刚被扫码登录的节点没有任何被压制的历史积压。
+            # 给它上串行化 + 放大步调，只是在惩罚一个刚刚完成首次登录的健康节点。
+            if cause_before_release == SEVERITY_UNCONFIGURED:
+                try:
+                    self.renewal.clear_unconfigured(provider_key)
+                except Exception:  # noqa: BLE001
+                    pass
+                released.append(provider_key)
+                logger.warning(
+                    "[未配置复位] 节点 [%s] 的凭证已出现（原因: %s）：配置缺口已补齐，"
+                    "避让解除，节点恢复为可派发候选",
+                    provider_key, reason,
+                )
+                continue
             # 释放即进入恢复观察期：解封瞬间的并发洪峰同样适用于「凭证刚续期」
             self._enter_probation(provider_key, now)
             released.append(provider_key)
@@ -1778,6 +1938,27 @@ class CooldownTracker:
         except Exception:  # noqa: BLE001 - 判定失败绝不阻断任何流程
             return []
 
+    def unconfigured_providers(self) -> List[str]:
+        """[DAY-ZERO] 曾经未配置、现已补上凭证的节点（只读判定）。"""
+        try:
+            return self.renewal.unconfigured_providers()
+        except Exception:  # noqa: BLE001 - 判定失败绝不阻断任何流程
+            return []
+
+    def _credential_event_providers(self) -> List[str]:
+        """「凭证事实变了」的全部节点：续期（换掉了）**或**首次出现（配置补上了）。
+
+        两者合成一个入口，是它们共享同一个触发动作（运维执行了 `login.py`）；
+        但**成因仍然分开判定**——`release_auth_avoidance_locked` 按 `causes` 逐个
+        比对，所以一条「首次配置」的触发绝不会顺手复位一个 `auth`/`waf` 冷却，
+        反之亦然。合并的只是「谁被检查」，不是「谁被复位」。
+        """
+        merged: List[str] = []
+        for pk in list(self.renewed_providers()) + list(self.unconfigured_providers()):
+            if pk not in merged:
+                merged.append(pk)
+        return merged
+
     def release_renewed_credentials_now(self, providers=None, reason: str = "credential-renewal") -> List[str]:
         """[OPT-026] 同步复位入口：用于启动期（无并发）或已在锁内的调用方。
 
@@ -1787,18 +1968,22 @@ class CooldownTracker:
         [OPT-029] 触发条件是「凭证**确已更新**」，该事实对 `auth` 与 `waf` 同时成立
         （人工完成滑块验证后令牌同样会刷新），因此两者都可被复位；`ratelimit` 永不。
         """
-        targets = list(providers) if providers is not None else self.renewed_providers()
+        targets = list(providers) if providers is not None else self._credential_event_providers()
         if not targets:
             return []
-        return self.release_auth_avoidance_locked(targets, reason, _RELEASABLE_BY_RENEWAL)
+        return self.release_auth_avoidance_locked(
+            targets, reason, _RELEASABLE_BY_CREDENTIAL_EVENT
+        )
 
     async def release_renewed_credentials(self, providers=None, reason: str = "credential-renewal") -> List[str]:
         """[OPT-026] 运行期入口：自动判定（或指定）并复位凭证成因的避让。"""
-        targets = list(providers) if providers is not None else self.renewed_providers()
+        targets = list(providers) if providers is not None else self._credential_event_providers()
         if not targets:
             return []
         async with self._lock:
-            return self.release_auth_avoidance_locked(targets, reason, _RELEASABLE_BY_RENEWAL)
+            return self.release_auth_avoidance_locked(
+                targets, reason, _RELEASABLE_BY_CREDENTIAL_EVENT
+            )
 
     def compute_pacing_interval(self, provider_key: str, jitter: float = 0.0) -> float:
         """计算节点下一次调用前应保持的最小间隔（秒，不含抖动时传入 jitter=0）。
@@ -3356,6 +3541,22 @@ class FailoverRouter:
                         f"对等能力环 [{ring.value}] 内所有节点均已尝试且全部失效。\n"
                         f"故障详情与避让记录:\n" + "\n".join(f" - {e}" for e in composite_errors)
                     )
+                    # [DAY-ZERO] 措辞必须如实：如果这一环的节点**根本没有配置凭证**，
+                    # 那它们不是「失效」——「失效」意味着曾经可用、现在坏了，会让运维
+                    # 去排查上游与网络，而真实动作是第一次登录。全新克隆的第一次请求
+                    # 走的就是这条路径，这是产品的第一天，措辞错了就会把用户带偏。
+                    _unconfigured = [
+                        pk for pk in tried_providers if not _provider_is_configured(pk)
+                    ]
+                    if _unconfigured:
+                        report += (
+                            f"\n注意：其中 {len(_unconfigured)} 个节点（"
+                            + "、".join(sorted(_unconfigured))
+                            + "）在本机**尚未配置凭证**——它们从未被调用过，"
+                            "这不是上游故障，也未被上游风控拦截。请先执行 "
+                            "`.venv/bin/python login.py all` 完成登录（或为相应节点配置"
+                            "环境变量），配置完成后这些节点会自动恢复为可派发候选。"
+                        )
                     # [BUDGET-2] 预算现在会被**公平分摊**给各候选，因此常见结局不再是
                     # 「预算耗尽」而是「每个候选都只分到一小份、各自超时后环内全灭」。
                     # 此时报错若只列失败，运维无法区分「预算太小」和「节点真的全挂」，

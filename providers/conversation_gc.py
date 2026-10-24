@@ -155,6 +155,8 @@ class ConversationGC:
             "disabled": "已被运维禁用 (DISABLED_PROVIDERS)",
             "quarantined": "处于运维/自动封禁租约期",
             "cooldown": "处于风控避让冷却中",
+            # [DAY-ZERO] 配置缺口，不是风控：该账号从未被触碰，说成封禁会误导运维。
+            "unconfigured": "本机尚未配置凭证",
         }
         detail = f" (剩余 {remaining:.0f}s)" if cause == "cooldown" else ""
         logger.warning(

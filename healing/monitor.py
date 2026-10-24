@@ -445,9 +445,16 @@ class HealthMonitor:
                 st.status = "cooling"
                 st.last_check = time.time()
                 st.cooldown_remaining = round(cooldown_remaining, 1)
-                st.last_error = (
-                    f"风控避让冷却中 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针以规避上游封禁"
-                )
+                # [DAY-ZERO] 成因是「本机没有凭证」时不得说成风控：该账号从未被
+                # 触碰过，把它报成「避免加剧上游封禁」会让运维去排查一个不存在的封禁。
+                if avoidance == "unconfigured":
+                    st.last_error = (
+                        f"本机尚未配置凭证 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针"
+                    )
+                else:
+                    st.last_error = (
+                        f"风控避让冷却中 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针以规避上游封禁"
+                    )
                 self._probe_skip_stats["total"] += 1
                 per = self._probe_skip_stats["per_provider"]
                 per[name] = per.get(name, 0) + 1
