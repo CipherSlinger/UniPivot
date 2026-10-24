@@ -265,6 +265,11 @@ class DeepSeekProvider:
                 obj = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            # [STREAM-AUDIT] `data: []` / `null` / `42` 是**合法 JSON**，
+            # 但在它上面调 `.get()` 会抛 AttributeError，把一帧怪数据变成
+            # 整轮请求的 502。其余四个适配器都有这个守卫，DeepSeek 之前漏了。
+            if not isinstance(obj, dict):
+                continue
 
             v = obj.get("v")
 
