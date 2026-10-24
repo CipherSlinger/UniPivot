@@ -256,8 +256,12 @@ When a client requests a generic alias, the system routes automatically accordin
 This repository ships a fully offline unit-test suite in `tests/` — every file a standalone script, each runnable on its own (no test runner, no network). The protocol streaming state machines, the PoW solver, the risk-avoidance ledger, the tool loop and the self-healing logic can all be verified without connecting to the real internet:
 
 ```bash
-# Run the entire suite
-for f in tests/test_*.py; do .venv/bin/python "$f" || { echo "FAILED $f"; break; }; done
+# Run the entire suite (no `break`: one failure must not hide the rest)
+fail=0
+for f in tests/test_*.py; do
+  .venv/bin/python "$f" >/tmp/$(basename "$f").log 2>&1 || { echo "FAIL $f"; fail=$((fail+1)); }
+done
+echo "failures: $fail / $(ls tests/test_*.py | wc -l)"   # must print 0
 
 # Or run a single module's suite
 .venv/bin/python tests/test_responses_protocol.py
