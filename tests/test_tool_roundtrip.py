@@ -110,6 +110,48 @@ def test_tool_arguments_json_string_is_not_double_encoded():
     print("test_tool_arguments_json_string_is_not_double_encoded: PASSED")
 
 
+def test_unparseable_arguments_are_preserved_not_emptied():
+    """解析不了的 `arguments` 必须**保留原文**，而不是降级成 `{}`。
+
+    `{}` 是对模型的一个断言：「这次调用没有传任何参数」。真实情况却是「我们
+    解析不了客户端给的参数」，两者对模型意味着完全不同的历史——前者会让它以为
+    自己当初什么都没传，于是重发一次，或者无法解释随后那条
+    `[Tool Result for c1]` 是怎么产生的。
+
+    一并钉住两条回放路径的一致性：`flatten_messages`（OpenAI/Anthropic 的
+    chat 历史）与 `responses_compat._tool_call_block`（Responses 的
+    `function_call` 项）。同一份损坏历史在两条路径上必须给出同一个提示词，
+    否则「同一次调用两套规则」的老毛病会在这里重演。
+    """
+    from providers.responses_compat import _tool_call_block
+
+    broken = '{"path": "/tmp/a.py", oops'
+    prompt = flatten_messages([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c1", "type": "function",
+                         "function": {"name": "Read", "arguments": broken}}]},
+        {"role": "tool", "tool_call_id": "c1", "content": "print(1)"},
+    ])
+    assert '"_raw"' in prompt, f"损坏的参数被静默清成了 {{}}: {prompt}"
+    assert "/tmp/a.py" in prompt, f"原始参数字面量丢失: {prompt}"
+
+    block = _tool_call_block({"id": "c1", "name": "Read", "arguments": broken})
+    assert '"_raw"' in block and "/tmp/a.py" in block, (
+        f"Responses 路径与 chat 路径处理不一致: {block}"
+    )
+
+    # 空字符串仍是「没有参数」，不得被当成损坏内容包一层 `_raw`。
+    empty = flatten_messages([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None,
+         "tool_calls": [{"id": "c2", "type": "function",
+                         "function": {"name": "Read", "arguments": ""}}]},
+    ])
+    assert '"_raw"' not in empty, f"空参数被误判成损坏参数: {empty}"
+    print("test_unparseable_arguments_are_preserved_not_emptied: PASSED")
+
+
 def test_tool_message_carries_its_name():
     """`role:"tool"` 只带 tool_call_id，必须反查出工具名，否则上游看到一段无名输出。"""
     prompt = flatten_messages(_agent_turn())
@@ -192,6 +234,7 @@ def run_all():
     tests = [
         test_flatten_includes_assistant_tool_calls,
         test_tool_arguments_json_string_is_not_double_encoded,
+        test_unparseable_arguments_are_preserved_not_emptied,
         test_tool_message_carries_its_name,
         test_agent_loop_is_complete_in_upstream_prompt,
         test_continuation_sends_tool_result_not_stale_question,

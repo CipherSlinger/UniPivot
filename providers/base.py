@@ -167,10 +167,19 @@ def _serialize_tool_calls(tool_calls) -> str:
             # 被二次编码的字符串，模型看到的是转义后的文本而不是参数对象。
             try:
                 args = json.loads(args) if args.strip() else {}
-            except Exception:  # noqa: BLE001 - 参数不合法时降级为空对象，绝不丢调用本身
-                args = {}
+            except Exception:  # noqa: BLE001
+                # 参数不合法时**保留原文**，而不是降级成 `{}`。
+                #
+                # `{}` 是对模型的一个断言：「这次调用没有传任何参数」。而真实情况
+                # 是「我们解析不了客户端给的参数」——两者完全不同，前者会让模型
+                # 以为自己当初什么都没传（于是重发一次、或者误解随后那条
+                # `[Tool Result for c1]` 是怎么来的）。保留原文至少让它看到那段
+                # 文本。`responses_compat._tool_call_block` 早就是这样做的，这里是
+                # 同一条规则的第二个实现——两处不一致会让同一份历史在 OpenAI 路径
+                # 和 Responses 路径上产生不同的提示词。
+                args = {"_raw": args}
         elif not isinstance(args, dict):
-            args = {}
+            args = {"_raw": args} if args is not None else {}
         # [AGENT-LOOP] 调用 id 必须随调用一起回放，否则紧随其后的
         # `role:"tool"` 结果在提示词里无法与任何一次调用对应——模型只看到一段
         # 无名输出，多轮 agent 循环在第二次往返时就会迷失。无 id 时**不写该键**，
