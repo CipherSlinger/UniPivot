@@ -207,6 +207,17 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
         "round2_saw_result": any(
             "Tool Result for" in (b.get("prompt_tail") or "") for b in bodies
         ),
+        # [SESSION-ID] The upstream conversation id the gateway hands the provider
+        # is the only observable proof that session affinity works for THIS client.
+        # Neither real binary ever sends `conversation_id` (Claude Code puts its
+        # identity in `metadata.user_id`, Codex in `client_metadata.thread_id`), so
+        # before the fix every turn started a brand-new upstream conversation and
+        # re-sent the full history. A multi-round run that never reuses one is that
+        # defect, measured on the wire instead of inferred from the gateway's state.
+        "upstream_convs": [b.get("conversation_id") for b in bodies],
+        "session_reused": any(
+            b.get("conversation_id") for b in bodies[1:]
+        ) if len(bodies) > 1 else False,
         "stdout": stdout[-2000:],
     }
 
@@ -387,6 +398,14 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
                 f"{name}: only {len(res['markers'])}/{args.rounds} rounds really ran "
                 f"while {len(names) - 1} sibling session(s) of the same binary sent requests"
             )
+        # Shared log, shared evidence: every session is expected to establish and
+        # reuse its own upstream conversation, so the shared log must contain at
+        # least one continuation. Reported as a shared fact, never as per-session.
+        if args.rounds > 1 and not res.get("session_reused"):
+            failures.append(
+                "no request in the shared log reused an upstream conversation "
+                f"across {args.rounds} rounds (all bodies: {res.get('upstream_convs')})"
+            )
         if not res["has_tools_section"]:
             failures.append(f"{name}: its upstream prompt carried no tool contract")
 
@@ -496,6 +515,12 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
             failures.append(f"{name}: its upstream prompt carried no tool contract")
         if not res["round2_saw_result"]:
             failures.append(f"{name}: none of its requests carried a tool result")
+        if args.rounds > 1 and not res.get("session_reused"):
+            failures.append(
+                f"{name}: never reused an upstream conversation across "
+                f"{args.rounds} rounds while sharing the gateway "
+                f"(upstream_convs={res.get('upstream_convs')})"
+            )
 
     # A run where the two binaries never overlapped measures nothing about sharing,
     # and every other check in this function would still pass. Make that loud.
@@ -518,7 +543,8 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
             print(f"  {r['client']}: SKIPPED")
             continue
         ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
-              and r["round2_saw_result"] and len(r["markers"]) >= r["rounds_expected"])
+              and r["round2_saw_result"] and len(r["markers"]) >= r["rounds_expected"]
+              and (r["rounds_expected"] <= 1 or r.get("session_reused")))
         print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
               f"(bodies={r['bodies']}, tool_markers={len(r['markers'])}/{r['rounds_expected']}, "
               f"tool={r['chosen'][0] if r['chosen'] else None})")
@@ -627,6 +653,13 @@ def main() -> int:
                 failures.append(f"{name}: the upstream prompt carried no tool contract")
             if not res["round2_saw_result"]:
                 failures.append(f"{name}: no captured request carried a tool result")
+            if args.rounds > 1 and not res["session_reused"]:
+                failures.append(
+                    f"{name}: never reused an upstream conversation across "
+                    f"{args.rounds} rounds (upstream_convs="
+                    f"{res['upstream_convs']}) — session identity is not reaching "
+                    f"the gateway, so every turn rebuilds upstream context"
+                )
         finally:
             proc.terminate()
             try:
@@ -643,8 +676,13 @@ def main() -> int:
             want_rounds = r.get("rounds_expected", 1)
             markers = len(r.get("markers") or [])
             markers_ok = markers >= want_rounds if want_rounds > 1 else True
+            # A multi-round run that never reuses an upstream conversation is a
+            # failing run even though every tool really executed: the loop closes
+            # while each turn rebuilds the upstream context from scratch. Printing
+            # PASS beside that `!!` line would be the "the report lies" defect.
+            reuse_ok = markers_ok and (want_rounds <= 1 or r.get("session_reused"))
             ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
-                  and r["round2_saw_result"] and markers_ok)
+                  and r["round2_saw_result"] and markers_ok and reuse_ok)
             # At one round no per-round marker exists by construction, so printing
             # `tool_markers=0/1` reads as a failure on a run that is entirely green.
             markers_txt = f"{markers}/{want_rounds}" if want_rounds > 1 else "n/a"
@@ -652,7 +690,8 @@ def main() -> int:
                 f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
                 f"(exit={r['exit']}, bodies={r['bodies']}, tool_ran={r['marker']}, "
                 f"tool={r['chosen'][0] if r['chosen'] else None}, "
-                f"tool_markers={markers_txt})"
+                f"tool_markers={markers_txt}, "
+                f"conversation_reused={r.get('session_reused')})"
             )
     for f in failures:
         print(f"  !! {f}")

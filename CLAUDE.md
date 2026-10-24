@@ -774,3 +774,25 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
 
 65. **Web Frontend (`static/index.html`)**:
     - High-aesthetic Codex Light interface with grouped model selector and collapsible ` thinking` drawer.
+
+66. **Codex's Session Identity Lives in `client_metadata` (`providers/anthropic_compat.py:resolve_responses_session_id`, `server.py:responses_endpoint`)**:
+    - **[SESSION-ID] The same defect `resolve_client_session_id` fixed for Claude Code (commit `1f8abcf`), one protocol over.** Claude Code's identity was found in `metadata.user_id`; Codex's is in `client_metadata`, and `/v1/responses` read only `req.conversation_id`. Codex 0.145.0 **never** sends that field — it appears **0 times** across the three captured bodies of a real parent→child sub-agent run — and `ResponsesRequest` did not even declare `client_metadata` (`extra="allow"` parked it in `model_extra`, unread). So the entire stickiness / continuation / anonymous-GC chain was inert for every real Codex session: every turn started a **new** upstream conversation and re-sent the full history, and every turn queued the previous live conversation for deletion as if it were an anonymous temporary one. No error at any layer — the agent simply pays more each turn.
+    - **The key is `thread_id`, not `session_id`, and that distinction is load-bearing.** Captured from the real binary:
+      | body | `client_metadata.thread_id` | `client_metadata.session_id` | `thread_source` |
+      |---|---|---|---|
+      | parent turn 1 | `…c178…` | `…c178…` | `user` |
+      | parent turn 2 | `…c178…` | `…c178…` | `user` |
+      | child (spawned sub-agent) | `…c23b…` | `…c178…` (**same**) | `subagent` |
+      A sub-agent shares the parent's `session_id` and differs only in `thread_id`. Keying on `session_id` would pin the child to the parent's upstream conversation and let two independent dialogue lines overwrite each other's context — and parent/child concurrency is the *normal* shape of real Codex, not an edge case. `thread_id` is the identifier of "one dialogue line", which is exactly what the affinity key means.
+    - **Measured end-to-end with the real binary** (3-round `codex exec`, scripted upstream, `payload_len` = what the provider actually puts on the wire — full history on a fresh conversation, `continuation_content()` when the upstream session is reused):
+
+      | | pre-fix | post-fix |
+      |---|---|---|
+      | upstream `conversation_id` per turn | `[None, None, None, None]` | `[None, "c1", "c1", "c1"]` |
+      | payload chars | 36302 + 36711 + 37120 + 37529 = **147,662** | 36302 + 159 + 159 + 159 = **36,779** |
+
+      A 4x reduction in what the account is charged, growing with every further turn. The offline suite is red on the same defect at turn 2 with `'x-session-affinity': 'fresh', 'x-session-turns': '1'`.
+    - **One reading, in one place.** `resolve_responses_session_id()` is now the only judge inside the handler; the nine downstream `req.conversation_id` reads (affinity resolution, `record_turn`, the anonymous-GC guard and the client-facing echo, on both the streaming and non-streaming paths) all read the derived value. Two independent derivations of "is this the same conversation" is precisely the defect shape this file records over and over.
+    - **Fail-open on every shape.** An explicit `conversation_id` wins (unambiguous, and what non-Codex clients send); then `thread_id`; then `session_id`; a non-dict `client_metadata`, a missing key or a blank string all return `None`. A `None` key means "this request names no session" — create a new upstream conversation and flatten the full history — which is always correct, merely expensive. Replaying a malformed value as an upstream conversation id would send a *stranger's* context to the model.
+    - **The E2E harness now measures it, and its verdict includes it.** `scripts/e2e/scripted_upstream.py` records `conversation_id` and `payload_len` per captured body; `run_agent_loop.py` reports `upstream_convs` / `session_reused` and **fails a multi-round run that never reused a conversation**, in all three modes (single, two-vendor parallel, N sessions of one binary). This was added because the harness previously printed `PASS` for the pre-fix binary run — the loop closed, the tools really executed, and the run was silently 4x more expensive than it needed to be. A harness that cannot see the defect cannot report it, which is §60's lesson one instrument over.
+    - Pinned by `tests/test_affinity.py::test_responses_honours_codex_client_metadata_thread_identity` (4 directions: parent turn 1 `fresh`, parent turn 2 `bound` with the upstream conversation carried and **no** deletion, child thread `fresh` with no parent conversation inherited, parent unaffected afterwards), verified red on the pre-fix code with the exact message `同一 thread_id 的第二轮没有粘住——真实 Codex 从不发 conversation_id`.

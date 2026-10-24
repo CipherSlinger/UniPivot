@@ -76,6 +76,10 @@ class ResponsesRequest(BaseModel):
     max_output_tokens: Optional[int] = None
     max_tokens: Optional[int] = None
     conversation_id: Optional[str] = None
+    # [SESSION-ID] Codex CLI 的会话身份放在这个扁平字典里（`thread_id` / `session_id`），
+    # 从不发 `conversation_id`。此前该字段根本没被解析（`extra="allow"` 把它搁在
+    # `model_extra` 里），于是 `/v1/responses` 对 Codex 的粘滞/续聊/匿名回收全部空转。
+    client_metadata: Optional[dict] = None
     reasoning_effort: Optional[str] = None
     # [AGENT-LOOP] Codex CLI 发的是 `{"reasoning": {"effort": "high", ...}}` 对象，
     # 而不是 `reasoning_effort` 字符串。此前只认后者，模型名又恰好落在

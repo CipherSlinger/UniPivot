@@ -156,6 +156,21 @@ def _flatten(messages) -> str:
     return "\n".join(out)
 
 
+def _payload_len(messages, conversation_id) -> int:
+    """Characters the provider would REALLY send upstream.
+
+    In continuation mode (`conversation_id` set) the upstream session already
+    holds the history, so only the new turn is sent — that is `continuation_content`,
+    which is what every provider in this repo does. Measuring `_flatten(messages)`
+    instead would report the full history for both modes and make a fix that
+    reuses the upstream session look worthless (or, read the other way, make a
+    session that is never reused look fine).
+    """
+    from providers.base import continuation_content
+    body = continuation_content(messages) if conversation_id else _flatten(messages)
+    return len(body)
+
+
 def _declared_tools(prompt: str) -> list[str]:
     return re.findall(r"^- `([A-Za-z0-9_.-]+)`:.*$", prompt, re.M)
 
@@ -232,6 +247,16 @@ class LoopProvider:
                 "provider": self.key,
                 "model": model,
                 "kw_keys": sorted(kw.keys()),
+                # [SESSION-ID] The upstream conversation id the gateway hands the
+                # provider is the ONLY observable proof that session affinity
+                # really reuses a conversation across turns. Without it a turn-2
+                # request that starts a brand-new upstream conversation looks
+                # byte-identical to one that continues it.
+                "conversation_id": kw.get("conversation_id"),
+                # [SESSION-ID] What the provider really puts on the wire: full
+                # history on a fresh conversation, only the new turn when the
+                # upstream session is reused. This is the cost the agent pays.
+                "payload_len": _payload_len(messages, kw.get("conversation_id")),
                 "tools": kw.get("tools"),
                 "prompt_len": len(prompt),
                 "has_tools_section": "## Tools Available" in prompt,

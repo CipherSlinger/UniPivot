@@ -136,6 +136,40 @@ def resolve_client_session_id(
     return None
 
 
+def resolve_responses_session_id(
+    conversation_id: Optional[str], client_metadata: Any
+) -> Optional[str]:
+    """`/v1/responses` 的**客户端线程标识**——粘滞/续聊/匿名回收都以它为键。
+
+    [SESSION-ID] 真实 Codex 0.145.0 从不发 `conversation_id`：三份真实请求体里该键
+    出现 **0 次**，身份全在 `client_metadata` 的**扁平**字典里（不是 Anthropic 那种
+    JSON 串）：
+        {"session_id": <会话>, "thread_id": <线程>, "x-codex-window-id": …}
+    子 agent 的请求还带 `x-openai-subagent: collab_spawn` 与
+    `x-openai-parent-thread-id`，且 **thread_id 与父线程不同、session_id 相同**。
+
+    因此判据必须是 `thread_id`，不是 `session_id`：会话键的语义是「一条独立对话线」，
+    而父子 agent 是两个线程、两条对话线。若按 session_id 取键，子 agent 会把父线程
+    的上游上下文当成自己的，两边互相污染——而父子并发正是真实 Codex 的常态。
+
+    此前 `/v1/responses` 只读 `req.conversation_id`（Codex 永不为它赋值），于是对
+    Codex 整条链路空转：每轮都是新会话（重发全量历史），每轮还把上一轮的上游会话
+    当作匿名临时会话排队删除。零报错，只是每轮都更慢更贵。
+
+    取值顺序：显式 `conversation_id` > `thread_id` > `session_id`。解析失败一律退回
+    `None`（失败开放：宁可新建一次会话，也不要把一个坏值当成上游会话 id 回放）。
+    """
+    if conversation_id:
+        return conversation_id
+    if not isinstance(client_metadata, dict):
+        return None
+    for key in ("thread_id", "session_id"):
+        value = client_metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None]) -> str:
     """从 Anthropic content（字符串或 content block 列表）中提取纯文本。"""
     if content is None:

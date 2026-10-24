@@ -325,6 +325,131 @@ def test_responses_endpoint_affinity_headers():
     print("test_responses_endpoint_affinity_headers: PASSED")
 
 
+class SessionRecorder:
+    """记录每次上游调用拿到的 `conversation_id`，用来判断「是不是同一个上游会话」。"""
+
+    def __init__(self, key: str = "qwen"):
+        self.key = key
+        self.seen: list = []
+        self.served: list = []
+
+    def __call__(self, pkey, client=None, **kw):
+        provider = self
+
+        class _P:
+            async def chat(_self, messages, model, conversation_id=None, **kw):
+                provider.seen.append(conversation_id)
+                provider.served.append((provider.key, conversation_id, list(messages)))
+                yield "ok", {"conversation_id": conversation_id or "upstream_new_conv"}
+
+            async def delete_conversation(_self, *a, **kw):
+                provider.served.append(("delete", a, None))
+
+        return _P()
+
+
+def test_responses_honours_codex_client_metadata_thread_identity():
+    """[SESSION-ID] `/v1/responses` 的会话身份必须来自 `client_metadata`，而不是只认
+    `conversation_id`。
+
+    真实 Codex 0.145.0 抓包（三份请求体，父子两代 agent）：`conversation_id` 出现
+    **0 次**，身份全在 `client_metadata` 里：
+        {"session_id": <会话>, "thread_id": <线程>, "x-codex-window-id": …}
+    子 agent 的请求还额外带 `x-openai-subagent: collab_spawn` 与
+    `x-openai-subagent` 父线程字段，且 **thread_id 与父不同**（`…c23b…` vs `…c178…`）。
+
+    此前 `/v1/responses` 只把 `req.conversation_id` 当会话键，于是对 Codex 而言：
+      - 每一轮都是全新会话（上游会话 id 从未续用 → 每轮重发全量历史）；
+      - 每轮结束后把上一轮的上游会话当作「匿名临时会话」排队删除。
+    两条都实测可见，且没有任何报错——agent 只是每轮都变慢、变贵。
+
+    同时必须锁住反向的一条：**子 agent 不能被粘到父线程上**。两者共享同一个
+    `session_id`，只有 `thread_id` 不同；若按 session_id 取会话，子 agent 会把父
+    线程的上游上下文当成自己的，父子对话互相污染。
+    """
+    session_affinity_manager.clear()
+    recorder = SessionRecorder()
+    orig_make_provider = srv._make_provider
+    srv._make_provider = recorder
+
+    parent_thread = "01a16c7e-c178-7781-bf56-79308e306f01"
+    child_thread = "01a16c7e-c23b-7aa3-aaf9-d7a19a2e146b"
+    session_id = parent_thread  # Codex: session_id == parent thread id
+
+    def _post(thread_id: str, text: str, headers=None):
+        return client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-4o",
+                "input": text,
+                # 真实 Codex 的字段名与形状（注意：没有 conversation_id）
+                "client_metadata": {
+                    "session_id": session_id,
+                    "thread_id": thread_id,
+                    "x-codex-window-id": f"{thread_id}:0",
+                    "x-openai-subagent": "collab_spawn" if thread_id == child_thread else None,
+                    "x-openai-parent-thread-id": parent_thread if thread_id == child_thread else None,
+                },
+            },
+            headers=headers or {},
+        )
+
+    try:
+        client = TestClient(srv.app)
+
+        r1 = _post(parent_thread, "first question")
+        assert r1.status_code == 200, r1.text
+        assert r1.headers.get("x-session-affinity") == "fresh", (
+            "第一轮应当是 fresh，实际: %r" % (r1.headers.get("x-session-affinity"),)
+        )
+        r2 = _post(parent_thread, "second question")
+        assert r2.status_code == 200, r2.text
+        assert r2.headers.get("x-session-affinity") == "bound", (
+            "同一 thread_id 的第二轮没有粘住——真实 Codex 从不发 conversation_id，"
+            "所以会话身份只可能来自 client_metadata。实际响应头: "
+            f"{dict(r2.headers)}"
+        )
+        # 上游确实收到了**续用**的会话 id（不是每轮新建）
+        first_conv, second_conv = recorder.seen[0], recorder.seen[1]
+        assert first_conv is None, f"第一轮不该带上游会话 id: {first_conv!r}"
+        assert second_conv, (
+            "第二轮没有把上一轮的上游会话 id 传回给 provider——上游会重建上下文，"
+            "每轮重发全量历史。实测 seen={recorder.seen!r}"
+        )
+        # 会话续用期间不该把上游会话当临时会话删掉
+        deletes = [s for s in recorder.served if s[0] == "delete"]
+        assert not deletes, f"续用的会话被当成匿名临时会话删除了: {deletes!r}"
+
+        # --- 子 agent：同一 session_id、不同 thread_id，必须自成一条会话线
+        r3 = _post(child_thread, "child task")
+        assert r3.status_code == 200, r3.text
+        assert r3.headers.get("x-session-affinity") == "fresh", (
+            "子 agent（不同 thread_id、同一 session_id）被粘到了父线程上——"
+            "两个线程的上游上下文会互相污染。实际: "
+            f"{r3.headers.get('x-session-affinity')!r}"
+        )
+        assert recorder.seen[2] is None, (
+            f"子 agent 的第一轮不该复用父线程的上游会话 id: {recorder.seen[2]!r}"
+        )
+
+        # --- 父线程不受子 agent 影响，仍然续用自己那条会话
+        r4 = _post(parent_thread, "third question")
+        assert r4.status_code == 200, r4.text
+        assert r4.headers.get("x-session-affinity") == "bound", (
+            "子 agent 的请求打断了父线程的粘滞——父子并发是真实 Codex 的常态。"
+            f"实际: {r4.headers.get('x-session-affinity')!r}"
+        )
+        assert recorder.seen[3] == second_conv, (
+            "父线程续用的上游会话 id 变了（被另一条会话线覆盖）: "
+            f"{recorder.seen[3]!r} != {second_conv!r}"
+        )
+    finally:
+        srv._make_provider = orig_make_provider
+        session_affinity_manager.clear()
+
+    print("test_responses_honours_codex_client_metadata_thread_identity: PASSED")
+
+
 def test_diagnostics_telemetry():
     """测试 /v1/diagnostics 中的 session_affinity 遥测字段"""
     client = TestClient(srv.app)
@@ -346,6 +471,7 @@ def run_all():
     test_chat_completions_affinity_headers()
     test_anthropic_messages_affinity_headers()
     test_responses_endpoint_affinity_headers()
+    test_responses_honours_codex_client_metadata_thread_identity()
     test_diagnostics_telemetry()
     print("\n✅ All session affinity & state handoff tests (OPT-007) passed!")
 

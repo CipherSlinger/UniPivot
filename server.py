@@ -81,6 +81,7 @@ from providers import (
     parallel_calls_disallowed,
     recover_tools_from_reasoning,
     resolve_client_session_id,
+    resolve_responses_session_id,
     resolve_allowed_tools,
     StopSequenceScanner,
     truncate_final,
@@ -3851,6 +3852,10 @@ async def count_tokens(req: AnthropicCountTokensRequest):
 @app.post("/responses")
 async def responses_endpoint(req: ResponsesRequest):
     parallel_disallowed = parallel_calls_disallowed(req.parallel_tool_calls, req.tool_choice)
+    # [SESSION-ID] 会话身份的唯一判据：真实 Codex 从不发 `conversation_id`，它的线程
+    # 标识在 `client_metadata.thread_id`（父子 agent 共享 session_id、线程不同）。
+    # 本函数内所有「这是不是同一条对话线」的判断都读这一个值，避免两处各自推导。
+    client_session_id = resolve_responses_session_id(req.conversation_id, req.client_metadata)
     # [PROTOCOL] OpenAI 生态通用字段：Responses 客户端同样会带 stop
     stop_seq = req.stop
     gateway_messages = convert_responses_to_gateway_messages(req)
@@ -3917,7 +3922,7 @@ async def responses_endpoint(req: ResponsesRequest):
 
     # 2.1 智能会话粘滞解析与跨模型状态迁移
     affinity_decision = session_affinity_manager.resolve_affinity(
-        session_id=req.conversation_id,
+        session_id=client_session_id,
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
@@ -4314,21 +4319,21 @@ async def responses_endpoint(req: ResponsesRequest):
                     out_tokens,
                     reasoning_tokens=reasoning_tokens,
                     failover=failover_event.to_dict() if failover_event else None,
-                    conversation_id=req.conversation_id or conv_id,
+                    conversation_id=client_session_id or conv_id,
                     # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete
                     incomplete_reason="stop" if stop_scan.hit else None,
                 )
                 yield sse_done()
 
-                if req.conversation_id or conv_id:
+                if client_session_id or conv_id:
                     session_affinity_manager.record_turn(
-                        req.conversation_id or conv_id,
+                        client_session_id or conv_id,
                         dispatched_provider,
                         dispatched_model,
                         conv_id,
                     )
 
-                if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
+                if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
                     conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
                 success = True
             except ProviderError as e:
@@ -4421,15 +4426,15 @@ async def responses_endpoint(req: ResponsesRequest):
         if not success and not group_finalized and flight_decision and flight_decision.is_leader:
             terminate_aborted_group(flight_decision.group)
 
-    if req.conversation_id or conv_id:
+    if client_session_id or conv_id:
         session_affinity_manager.record_turn(
-            req.conversation_id or conv_id,
+            client_session_id or conv_id,
             dispatched_provider,
             dispatched_model,
             conv_id,
         )
 
-    if not req.conversation_id and conv_id and hasattr(active_provider, "delete_conversation"):
+    if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
         conversation_gc.schedule(active_provider, dispatched_provider, conv_id)
 
     full_output = "".join(chunks)
@@ -4493,7 +4498,7 @@ async def responses_endpoint(req: ResponsesRequest):
         output_text=full_output,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        conversation_id=req.conversation_id or conv_id,
+        conversation_id=client_session_id or conv_id,
         tool_calls=tool_calls_list,
         msg_id=msg_id,
         failover=failover_event.to_dict() if failover_event else None,
