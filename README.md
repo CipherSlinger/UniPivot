@@ -1,7 +1,7 @@
-# 同枢 (UniPivot) · 本地多协议大模型网关
+# 同枢 (UniPivot) · A Local Multi-Protocol LLM Gateway
 
 <p align="center">
-  <b>多源模型统一转译 · 三大协议原生兼容 · 全连通自愈网格 · Codex Light 极简视觉体验</b>
+  <b>Unified translation across multi-source models · Native compatibility with three protocols · Fully connected self-healing grid · Codex Light minimal visual experience</b>
 </p>
 
 <p align="center">
@@ -13,163 +13,163 @@
 
 ---
 
-## 🌟 核心特性
+## 🌟 Core Features
 
-**同枢 (UniPivot)** 是一个运行在本地的高性能、高韧性多协议转译服务。它将标准化的 **OpenAI Chat Completions**、**Anthropic Messages** 以及 **OpenAI Responses** 协议，实时转译为多源主流大模型 Web 端的内部调用。
+**同枢 (UniPivot)** is a high-performance, high-resilience multi-protocol translation service that runs locally. It translates the standardized **OpenAI Chat Completions**, **Anthropic Messages**, and **OpenAI Responses** protocols in real time into the internal calls of mainstream multi-source LLM web backends.
 
-无需申请官方商业 API Key，无需预付费或绑定信用卡，通过本网关即可直接驱动 **Claude Code CLI**、**Codex CLI**、**NextChat**、**Chatbox**、**Cursor** 等全套开发者生态工具。
+No need to apply for official commercial API keys, prepay, or bind a credit card. Through this gateway you can directly drive **Claude Code CLI**, **Codex CLI**, **NextChat**, **Chatbox**, **Cursor**, and the rest of the developer ecosystem toolchain.
 
 ```
                        ┌─────────────────────────────────────────────────────────────┐
-                       │                       主流客户端与开发工具                      │
+                       │            Mainstream Clients & Developer Tools             │
                        │   Claude Code CLI  │  Codex CLI  │  Cursor  │  NextChat    │
                        └──────────────────────────────┬──────────────────────────────┘
-                                                      │ 标准请求 (OpenAI / Anthropic / Responses)
+                                                      │ Standard request (OpenAI / Anthropic / Responses)
                                                       ▼
                        ┌─────────────────────────────────────────────────────────────┐
-                       │               同枢网关 server.py (127.0.0.1:8000)            │
-                       │ ├─ 协议转译层 (Chat Completions / Messages / Responses)      │
-                       │ ├─ 全连通对等互备环 (思考环 / 旗舰环 / 极速环)                   │
-                       │ ├─ 动态风控避让与冷却 (429/WAF 智能退避 30s~120s)              │
-                       │ ├─ 自愈热修复大脑 (HealthMonitor / Healer / AgentRunner)     │
-                       │ └─ HTTP/2 复用长连接池 (Max 100 Conns / 40 Keep-Alive)       │
+                       │         UniPivot gateway server.py (127.0.0.1:8000)         │
+                       │ ├─ Translation layer (Chat Completions/Messages/Responses)  │
+                       │ ├─ Fully connected peer grid (Reasoning/Flagship/Speed)     │
+                       │ ├─ Risk-control avoidance & cooling (429/WAF, 30s~120s)     │
+                       │ ├─ Self-healing hotfix brain (Monitor/Healer/AgentRunner)   │
+                       │ └─ HTTP/2 connection pool (Max 100 Conns / 40 Keep-Alive)   │
                        └────────┬────────────┬─────────────┬────────────┬────────────┘
                                 │            │             │            │            │
                                 ▼            ▼             ▼            ▼            ▼
-                         通义千问 Qwen   DeepSeek      豆包 Doubao   月之暗面 Kimi  智谱清言 GLM
+                              Qwen       DeepSeek       Doubao        Kimi          GLM
 ```
 
-### 1. 多源大模型矩阵
-- **通义千问 (Qwen)**：全面对齐国内主站 v2 接口，支持 Qwen3.7-Max 深度思考与临时无痕会话。
-- **深度求索 (DeepSeek)**：原生支持 DeepSeek-R1 深度思考推理链，基于 WebAssembly 独立沙箱求解 PoW。
-- **字节豆包 (Doubao)**：模拟 PC 桌面客户端协议，免除前端签名限制，原生抽取 `<think>` 推理流。
-- **月之暗面 (Kimi)**：长效 refresh_token 自动轮转 access_token，支持独立会话预创建与深度检索模式。
-- **智谱清言 (GLM)**：动态 MD5 签名校验与 Assistant ID 映射，完整支持 GLM-4-Plus 与 GLM-Zero-Preview。
+### 1. Multi-Source Model Matrix
+- **通义千问 (Qwen)**: Fully aligned with the domestic main-site v2 interface, supporting Qwen3.7-Max deep thinking and temporary traceless sessions.
+- **深度求索 (DeepSeek)**: Native support for the DeepSeek-R1 deep-thinking reasoning chain, solving PoW in an independent WebAssembly sandbox.
+- **字节豆包 (Doubao)**: Emulates the PC desktop client protocol, removing front-end signature restrictions and natively extracting the ` thinking` reasoning stream.
+- **月之暗面 (Kimi)**: Long-lived refresh_token automatically rotates the access_token, with support for independent conversation pre-creation and deep-research mode.
+- **智谱清言 (GLM)**: Dynamic MD5 signature verification and Assistant ID mapping, with full support for GLM-4-Plus and GLM-Zero-Preview.
 
-### 2. 三大标准协议原生兼容
-- **OpenAI Chat Completions (`/v1/chat/completions`)**：流式 SSE 逐字渲染、`reasoning_content` 推理流、`tools` 结构化参数自动平衡解析、`include_usage` 统计。
-- **Anthropic Messages (`/v1/messages`, `/v1/messages/count_tokens`)**：无缝对接官方 `claude` CLI（Claude Code），严格实现 `message_start` -> `content_block_delta` -> `message_stop` 状态机。
-- **OpenAI Responses (`/v1/responses`)**：无缝对接新一代 `codex` CLI，支持完整的 Responses 事件时序与函数调用增量分发。
+### 2. Native Compatibility with Three Standard Protocols
+- **OpenAI Chat Completions (`/v1/chat/completions`)**: token-by-token streaming SSE rendering, the `reasoning_content` reasoning stream, automatic balanced parsing of structured `tools` arguments, and `include_usage` statistics.
+- **Anthropic Messages (`/v1/messages`, `/v1/messages/count_tokens`)**: seamless integration with the official `claude` CLI (Claude Code), strictly implementing the `message_start` -> `content_block_delta` -> `message_stop` state machine.
+- **OpenAI Responses (`/v1/responses`)**: seamless integration with the new-generation `codex` CLI, with full Responses event ordering and incremental function-call dispatch.
 
-### 3. 全连通对等互备网格 (Failover Grid)
-- **三级能力环调度**：划分为**思考环 (REASONING)**、**旗舰环 (FLAGSHIP)**、**极速环 (SPEED)**。同环内所有节点对等互备。
-- **首包前透明切换**：在首个 Token 到达前捕获上游异常，自动无损平移至环内备用健康节点，杜绝半包脏数据。
-- **自适应风控与智能冷却**：遭遇 429、WAF（阿里 RGV587 / 字节人机）时，自动触发指数避让（30s~120s 动态冷却），并在调用链中加入平滑步调与随机抖动（Jitter）。
+### 3. Fully Connected Peer Failover Grid
+- **Three-tier capability ring scheduling**: divided into the **Reasoning Ring (REASONING)**, **Flagship Ring (FLAGSHIP)**, and **Speed Ring (SPEED)**. All nodes within a ring are peers that back each other up.
+- **Transparent switchover before the first chunk**: upstream anomalies are caught before the first token arrives and shifted losslessly to a healthy backup node in the ring, eliminating half-packet dirty data.
+- **Adaptive risk control and intelligent cooling**: on encountering 429 or WAF (Alibaba RGV587 / ByteDance human verification), exponential avoidance is triggered automatically (30s~120s dynamic cooling), and smooth pacing plus random jitter are added to the call chain.
 
-### 4. 自动化自愈与热修复大脑 (Self-Healing Brain)
-- 内置后台健康审计探针，定期巡检五大模型服务状态。
-- 上游接口变动时，系统自动选举当前健康的最强模型，组装上下文诊断 Prompt，调起本地 `claude` 或 `codex` 智能体自动排查代码并运行单测，实现代码级自动热修复。
+### 4. Automated Self-Healing and Hotfix Brain
+- A built-in background health-audit probe periodically inspects the status of the five model services.
+- When an upstream interface changes, the system automatically elects the currently healthiest and strongest model, assembles a contextual diagnostic prompt, and launches a local `claude` or `codex` agent to investigate the code and run unit tests, achieving code-level automatic hotfixing.
 
-### 5. Codex Light 极简视觉工作台
-- 访问 `http://127.0.0.1:8000` 即可开启内置现代化 Web UI，拥有优雅的排版排版与折叠式 `<think>` 思考过程抽屉。
+### 5. Codex Light Minimal Visual Workbench
+- Visit `http://127.0.0.1:8000` to open the built-in modern Web UI, with elegant typography and a collapsible ` thinking` reasoning drawer.
 
 ---
 
-## 🚀 快速上手
+## 🚀 Quick Start
 
-### 1. 环境准备
+### 1. Environment Preparation
 ```bash
-# 克隆仓库并进入目录
+# Clone the repository and enter the directory
 git clone <repo_url> && cd qwen
 
-# 创建 Python 虚拟环境并安装核心依赖
+# Create a Python virtual environment and install the core dependencies
 python3 -m venv .venv
 .venv/bin/pip install -r requirements.txt
 
-# 若本机未安装系统 Chrome，安装 Playwright 浏览器内核
+# If system Chrome is not installed, install the Playwright browser engine
 .venv/bin/playwright install chromium
 ```
 
-### 2. 扫码免密登录（捕获会话凭证）
-执行交互式登录命令，系统将调起浏览器窗口供您扫码或账号登录：
+### 2. Passwordless QR Login (Capturing Session Credentials)
+Run the interactive login command; the system will open a browser window for you to scan the QR code or log in with an account:
 ```bash
-# 登录全部五大服务商
+# Log in to all five providers
 .venv/bin/python login.py all
 
-# 或按需登录单个服务商
-.venv/bin/python login.py qwen       # 通义千问
+# Or log in to a single provider as needed
+.venv/bin/python login.py qwen       # Qwen
 .venv/bin/python login.py deepseek   # DeepSeek
-.venv/bin/python login.py doubao     # 豆包
+.venv/bin/python login.py doubao     # Doubao
 .venv/bin/python login.py kimi       # Kimi
-.venv/bin/python login.py glm        # 智谱 GLM
+.venv/bin/python login.py glm        # GLM
 
-# 静默刷新令牌（复用已有配置，无需弹窗）
+# Silently refresh tokens (reuse the existing profiles, no popup)
 .venv/bin/python login.py all --refresh
 ```
 
-### 3. 启动网关服务
+### 3. Start the Gateway Service
 ```bash
 ./run.sh
-# 或通过 uvicorn 显式启动
+# Or start it explicitly via uvicorn
 .venv/bin/uvicorn server:app --host 127.0.0.1 --port 8000
 ```
 
-服务启动后：
-- 🌐 **Web 界面**：`http://127.0.0.1:8000`
-- 📚 **Swagger 接口文档**：`http://127.0.0.1:8000/docs`
-- 🩺 **健康与自愈状态**：`http://127.0.0.1:8000/health`
+After the service starts:
+- 🌐 **Web UI**: `http://127.0.0.1:8000`
+- 📚 **Swagger API docs**: `http://127.0.0.1:8000/docs`
+- 🩺 **Health and self-healing status**: `http://127.0.0.1:8000/health`
 
 ---
 
-## 💻 开发者生态集成示例
+## 💻 Developer Ecosystem Integration Examples
 
-### 1. 接入官方 Claude Code CLI
-只需配置三个环境变量，即可使用 Anthropic 官方命令行工具直接驱动底层模型：
+### 1. Connecting the Official Claude Code CLI
+Configuring just three environment variables is enough to drive the underlying models directly with Anthropic's official command-line tool:
 ```bash
 ANTHROPIC_BASE_URL=http://127.0.0.1:8000 \
 ANTHROPIC_API_KEY=test-key \
 ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-haiku-20241022 \
 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1 \
-claude -p "请用 Python 写一个红黑树的完整实现" --model claude-3-7-sonnet
+claude -p "Write a complete implementation of a red-black tree in Python" --model claude-3-7-sonnet
 ```
 
-### 2. 接入 Codex CLI (Responses API)
+### 2. Connecting Codex CLI (Responses API)
 ```bash
 OPENAI_BASE_URL=http://127.0.0.1:8000/v1 \
 OPENAI_API_KEY=test-key \
-codex -m gpt-4o "优化当前目录下的并发网络连接池逻辑"
+codex -m gpt-4o "Optimize the concurrent network connection pool logic in the current directory"
 ```
 
-### 3. OpenAI Python SDK 调用
+### 3. Calling from the OpenAI Python SDK
 ```python
 from openai import OpenAI
 
 client = OpenAI(base_url="http://127.0.0.1:8000/v1", api_key="not-needed")
 
 response = client.chat.completions.create(
-    model="deepseek-reasoner",  # 或 qwen3.7-max / doubao-think / kimi-explore
-    messages=[{"role": "user", "content": "9.11 和 9.8 哪个数字更大？请给出严密证明。"}],
+    model="deepseek-reasoner",  # or qwen3.7-max / doubao-think / kimi-explore
+    messages=[{"role": "user", "content": "Which number is larger, 9.11 or 9.8? Give a rigorous proof."}],
     stream=True,
 )
 
 for chunk in response:
-    # 提取深度思考过程
+    # Extract the deep-thinking process
     if hasattr(chunk.choices[0].delta, "reasoning_content") and chunk.choices[0].delta.reasoning_content:
         print(chunk.choices[0].delta.reasoning_content, end="", flush=True)
-    # 提取最终回答
+    # Extract the final answer
     if chunk.choices[0].delta.content:
         print(chunk.choices[0].delta.content, end="", flush=True)
 ```
 
 ---
 
-## 🗺️ 模型矩阵与路由映射表
+## 🗺️ Model Matrix and Routing Map
 
-### 1. 原生提供方模型与特性
+### 1. Native Provider Models and Features
 
-| 提供方 | 原生支持模型 / 别名 | 网页端对应模型与核心能力 |
+| Provider | Natively Supported Models / Aliases | Corresponding Web Model and Core Capabilities |
 |---|---|---|
-| **通义千问** | `qwen`, `qwen-max`, `qwen3.7-max`, `qwen3.6-flash` | `Qwen` (默认), `Qwen3.7-Max` (推理旗舰), `Qwen3.6-Flash` (超快低延迟) |
-| **DeepSeek** | `deepseek-chat`, `deepseek-reasoner`, `deepseek-r1` | `deepseek-chat` (通用旗舰), `deepseek-reasoner` (R1 深度思考推理) |
-| **豆包** | `doubao-pro`, `doubao-think`, `doubao-lite`, `doubao-expert` | `doubao-pro` (默认旗舰), `doubao-think` (思维链), `doubao-lite` (极速响应) |
-| **月之暗面** | `kimi`, `kimi-explore`, `kimi-math`, `kimi-k1` | `kimi` (标准), `kimi-explore` (深度搜索与推理), `kimi-math` (数学专精) |
-| **智谱清言** | `glm-4-plus`, `glm-4-flash`, `glm-zero-preview`, `glm-think` | `glm-4-plus` (旗舰), `glm-4-flash` (高吞吐), `glm-zero-preview` (零度推理) |
+| **Qwen** | `qwen`, `qwen-max`, `qwen3.7-max`, `qwen3.6-flash` | `Qwen` (default), `Qwen3.7-Max` (reasoning flagship), `Qwen3.6-Flash` (ultra-fast, low latency) |
+| **DeepSeek** | `deepseek-chat`, `deepseek-reasoner`, `deepseek-r1` | `deepseek-chat` (general-purpose flagship), `deepseek-reasoner` (R1 deep-thinking reasoning) |
+| **Doubao** | `doubao-pro`, `doubao-think`, `doubao-lite`, `doubao-expert` | `doubao-pro` (default flagship), `doubao-think` (chain of thought), `doubao-lite` (ultra-fast response) |
+| **Kimi** | `kimi`, `kimi-explore`, `kimi-math`, `kimi-k1` | `kimi` (standard), `kimi-explore` (deep search and reasoning), `kimi-math` (mathematics specialist) |
+| **GLM** | `glm-4-plus`, `glm-4-flash`, `glm-zero-preview`, `glm-think` | `glm-4-plus` (flagship), `glm-4-flash` (high throughput), `glm-zero-preview` (zero-temperature reasoning) |
 
-### 2. 跨生态别名动态映射
+### 2. Cross-Ecosystem Dynamic Alias Mapping
 
-当客户端请求通用别名时，系统依据环境变量（`CLAUDE_BACKEND`、`OPENAI_BACKEND`，默认 `qwen`）自动分流：
+When a client requests a generic alias, the system routes automatically according to the environment variables (`CLAUDE_BACKEND`, `OPENAI_BACKEND`, default `qwen`):
 
-| 客户端请求别名 | Qwen (默认) | DeepSeek 后端 | 豆包后端 | Kimi 后端 | GLM 后端 |
+| Client-Requested Alias | Qwen (default) | DeepSeek Backend | Doubao Backend | Kimi Backend | GLM Backend |
 |---|---|---|---|---|---|
 | `claude-3-7-sonnet` | `Qwen3.7-Max` | `deepseek-reasoner` | `doubao-think` | `kimi-explore` | `glm-zero-preview` |
 | `claude-3-5-haiku` | `Qwen3.6-Flash` | `deepseek-chat` | `doubao-lite` | `kimi` | `glm-4-flash` |
@@ -179,42 +179,42 @@ for chunk in response:
 
 ---
 
-## 🛠️ 项目工程组织
+## 🛠️ Project Organization
 
 ```
-├── server.py               # 网关主程序（FastAPI 路由分发、生命周期管理）
-├── login.py                # 凭证自动化捕获脚本（Playwright Chrome 驱动）
-├── session_store.py        # 原子化 POSIX 凭证读取与权限隔离（0o700/0o600）
-├── providers/              # 模型适配与转译核心包
-│   ├── base.py             # 消息展平、Token 估算、SSE 帧组装
-│   ├── failover.py         # 对等互备路由网格、动态冷却避让、三级能力环
-│   ├── http_client.py      # HTTP/2 连接池与单例复用
-│   ├── anthropic_compat.py # Anthropic Messages 协议状态机与 ToolCall 解析
-│   ├── responses_compat.py # OpenAI Responses API 协议转译
-│   ├── qwen/               # 通义千问 v2 协议适配
-│   ├── deepseek/           # DeepSeek 协议适配与 WebAssembly PoW 引擎
-│   ├── doubao/             # 豆包 PC 客户端协议适配
-│   ├── kimi/               # Kimi 会话预建与 Token 轮转适配
-│   └── glm/                # 智谱清言动态签名与逻辑流适配
-├── healing/                # 自愈与热修复系统
-│   ├── monitor.py          # Provider 健康探测巡检与故障状态机
-│   ├── healer.py           # 选举模型大脑、组装 Prompt 与调度任务
-│   └── agent_runner.py     # 智能体 CLI 发现、自举安装与沙箱执行
-├── scripts/                # 逆向分析与联调脚本
-│   ├── reverse/            # 前端 Webpack 依赖、上行签名等逆向分析
-│   └── debug/              # 单端点 HTTP 探测与回放调试
-├── static/                 # Codex Light Web UI 前端资源
-├── tests/                  # 离线自动化测试套件（覆盖五大 Provider 与三协议）
-└── docs/                   # 架构设计与调研文档
-    ├── architecture.md     # 完整系统架构设计与工程规范
-    └── provider_capabilities.md # 厂商能力深度调研报告
+├── server.py               # Gateway entry point (FastAPI routing, lifecycle management)
+├── login.py                # Automated credential capture (Playwright Chrome driver)
+├── session_store.py        # Atomic POSIX credential storage and permission isolation (0o700/0o600)
+├── providers/              # Model adaptation and translation core package
+│   ├── base.py             # Message flattening, token estimation, SSE frame assembly
+│   ├── failover.py         # Peer failover routing grid, dynamic cooldown avoidance, three-tier capability rings
+│   ├── http_client.py      # HTTP/2 connection pool and singleton reuse
+│   ├── anthropic_compat.py # Anthropic Messages protocol state machine and ToolCall parsing
+│   ├── responses_compat.py # OpenAI Responses API protocol translation
+│   ├── qwen/               # Qwen v2 protocol adapter
+│   ├── deepseek/           # DeepSeek protocol adapter and WebAssembly PoW engine
+│   ├── doubao/             # Doubao PC client protocol adapter
+│   ├── kimi/               # Kimi conversation pre-creation and token rotation adapter
+│   └── glm/                # GLM dynamic signature and logic stream adapter
+├── healing/                # Self-healing and hotfix system
+│   ├── monitor.py          # Provider health probe inspection and fault state machine
+│   ├── healer.py           # Model brain election, prompt assembly and task dispatch
+│   └── agent_runner.py     # Agent CLI discovery, bootstrap installation and sandboxed execution
+├── scripts/                # Reverse-engineering analysis and integration scripts
+│   ├── reverse/            # Frontend Webpack dependencies, upstream signing and other reverse-engineering analysis
+│   └── debug/              # Single-endpoint HTTP probing and replay debugging
+├── static/                 # Codex Light Web UI front-end assets
+├── tests/                  # Offline automated test suite (covers the five providers and three protocols)
+└── docs/                   # Architecture design and research documents
+    ├── architecture.md     # Complete system architecture design and engineering specification
+    └── provider_capabilities.md # In-depth vendor capability research report
 ```
 
 ---
 
-## 🧪 自动化测试验证
+## 🧪 Automated Test Verification
 
-本仓库配备了完全离线的单元测试套件，无需连接真实外网即可验证协议流式状态机、PoW 求解器与自愈逻辑：
+This repository ships a fully offline unit-test suite; the protocol streaming state machines, the PoW solver, and the self-healing logic can all be verified without connecting to the real internet:
 
 ```bash
 .venv/bin/python tests/test_providers.py && \
@@ -226,6 +226,6 @@ for chunk in response:
 
 ---
 
-## 📄 开源许可证
+## 📄 Open-Source License
 
-本项目基于 [MIT 许可证](LICENSE) 发布。仅供个人学习、技术逆向研究与自动化开发调试使用，请严格遵守各模型平台的使用条款。
+This project is released under the [MIT License](LICENSE). It is intended only for personal learning, technical reverse-engineering research, and automated development debugging; please strictly comply with the terms of service of each model platform.
