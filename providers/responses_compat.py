@@ -45,6 +45,7 @@ from .anthropic_compat import (
     _FREEFORM_TOOL_DECL_TYPES,
     flatten_declared_tools,
     format_response_format_prompt,
+    namespace_of_tools,
     format_tools_system_prompt,
 )
 from .base import (
@@ -93,14 +94,17 @@ class ResponsesRequest(BaseModel):
         真实 Codex 0.145.0 会声明 `{"type":"namespace","name":"multi_agent_v1",
         "tools":[{"type":"function","name":"spawn_agent",...}, ...]}`——一个装有五个
         可调用 function 子工具的**容器**，它自身不可调用（实测客户端对
-        `name="multi_agent_v1"` 回 `unsupported call`，对裸名 `spawn_agent` 正常路由）。
+        `name="multi_agent_v1"` 回 `unsupported call`）。
 
-        在这里展平（而不是在各调用点各展一次），是因为下游有**两条**链路都要看到
+        在这里展平（而不是在各调用点各展一次），是因为下游有**三条**链路都要看到
         展平结果，且它们必须一致：
           - 提示词渲染（模型想调什么）；
-          - `resolve_allowed_tools` 的解析白名单（什么能被回传）。
+          - `resolve_allowed_tools` 的解析白名单（什么能被回传）；
+          - 出口的 `namespace_of_tools`（调用项上的 `namespace` 字段）。
         只修提示词会让模型写出 `spawn_agent` 然后被白名单当作未声明工具丢弃，症状
         与修复前完全一样、只是更难追。展平只有一份定义：`flatten_namespace_tools`。
+        namespace 的名字由客户端声明（`multi_agent_v1` / `collaboration` 取决于其
+        功能开关），网关绝不硬编码。
         """
         return flatten_declared_tools(tools)
 
@@ -494,8 +498,16 @@ def function_call_item(
     arguments: str = "",
     *,
     status: str = "completed",
+    namespace: Optional[str] = None,
 ) -> dict:
-    return {
+    """构造 `function_call` 输出项。
+
+    `namespace` 只有在该工具确实是某个 namespace 容器里的子工具时才传（判据是
+    `anthropic_compat.namespace_of_tools`）。客户端查表键是 `namespace + name`
+    无分隔符拼接：子工具不带它 -> `unsupported call: spawn_agent`；普通工具带它 ->
+    `unsupported call: multi_agent_v1exec_command`。两个方向都由实测确定。
+    """
+    item = {
         "id": call_id,
         "type": "function_call",
         "call_id": call_id,
@@ -503,6 +515,9 @@ def function_call_item(
         "arguments": arguments,
         "status": status,
     }
+    if isinstance(namespace, str) and namespace:
+        item["namespace"] = namespace
+    return item
 
 
 # [TOOL-LOOP] Responsese 的 custom / freeform 工具族（Codex CLI 的 `apply_patch`
@@ -607,11 +622,16 @@ def format_responses_completion(
     reasoning_id: Optional[str] = None,
     reasoning_tokens: int = 0,
     freeform_tools: Optional[set] = None,
+    tool_namespaces: Optional[dict] = None,
 ) -> dict:
     """构造标准的 Responses API JSON 对象。
 
     `freeform_tools` 是客户端声明的 custom（freeform）工具名集合：命中它们的调用
     必须以 `custom_tool_call` 输出（参数是纯文本 `input`），而不是 `function_call`。
+
+    `tool_namespaces` 是 `namespace 子工具名 -> namespace`（`namespace_of_tools` 的
+    产物）：这些工具的调用项必须带回 `namespace` 字段，否则真实 Codex 回
+    `unsupported call: <裸名>`。普通工具不得带该字段（会拼成 `ns+name` 而拒收）。
     """
     created = created_at or int(time.time())
     m_id = msg_id or _id("msg", "_")
@@ -639,7 +659,14 @@ def format_responses_completion(
                 fn_args = json.dumps(fn_args, ensure_ascii=False)
             elif fn_args is None:
                 fn_args = "{}"
-            output_items.append(function_call_item(c_id, fn_name, str(fn_args)))
+            output_items.append(
+                function_call_item(
+                    c_id,
+                    fn_name,
+                    str(fn_args),
+                    namespace=(tool_namespaces or {}).get(fn_name),
+                )
+            )
 
     resp = {
         "id": resp_id,

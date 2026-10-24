@@ -297,16 +297,21 @@ def test_nameless_builtin_tools_do_not_render_as_empty_bullets():
 #      猜得到名字也不知道参数（与 `apply_patch` 被告知 `Args: {}` 同一缺陷类）；
 #   2. 它被告知可调用的名字是 `multi_agent_v1`，而真实客户端**拒绝**这个名字。
 #
-# 客户端路由实测（同一个 mock 上游，只改回传的 call item 形状）：
+# 客户端路由实测（同一个 mock 上游，只改回传的 call item 形状；判据是工具**有没
+# 有真的执行**——每一臂里 mock 模型都照样说 "Sub-agent spawned."，回复措辞无法区分）：
 #   - `name="multi_agent_v1"`                    -> `unsupported call: multi_agent_v1`
-#   - `name="spawn_agent"`（裸名）                -> `collab: SpawnAgent`（已路由）
-#   - `name="close_agent"` 等裸名                 -> 路由，只有假 agent id 报错
-#   - 裸名 + `"namespace":"multi_agent_v1"`       -> `unsupported call: multi_agent_v1spawn_agent`
-#     （客户端把 namespace 与 name **无分隔符拼接**后再查表）
+#   - 裸名 `spawn_agent`（不带 namespace）        -> `unsupported call: spawn_agent`
+#   - 裸名 + 真实 `"namespace"`                   -> `collab: SpawnAgent` -> `{"agent_id":…}`
+#   - 裸名 + `"bogus_ns"`                        -> `unsupported call: bogus_nsspawn_agent`
+#   - 普通工具 `exec_command` + 任意 namespace    -> `unsupported call: multi_agent_v1exec_command`
 #   - `multi_agent_v1.spawn_agent` / `::` / `__`  -> 全部 `unsupported call`
+#     （客户端把 namespace 与 name **无分隔符拼接**后再查表：这既要求子工具带上
+#       namespace，也要求普通工具绝不能带）
 #
-# 所以唯一正确的形状是：把子工具按**裸名**、带完整 schema 放进可调用列表，
-# namespace 自己不可调用（只作为分组说明）。
+# 所以**声明侧**的正确形状是：把子工具按**裸名**、带完整 schema 放进可调用列表，
+# namespace 自己不可调用（只作为分组说明）；**出口侧**则要把 namespace 还原回
+# 调用项。两侧规则相反，只修一侧会把另一侧变成回归——两个方向都由
+# `test_namespaced_sub_tool_call_carries_its_namespace_on_the_wire` 锁住。
 # ---------------------------------------------------------------------------
 
 NS_FIXTURE = (
@@ -475,6 +480,106 @@ def test_namespace_sub_tool_call_round_trips_end_to_end():
     print("test_namespace_sub_tool_call_round_trips_end_to_end: PASSED")
 
 
+class PlainToolProvider:
+    """上游模型调用一个**普通**（非 namespace）工具。"""
+
+    def __init__(self):
+        self.last_prompt = ""
+
+    async def chat(self, messages, model, conversation_id=None, **kw):
+        from providers.base import flatten_messages
+
+        self.last_prompt = flatten_messages(messages)
+        payload = json.dumps(
+            {"name": "exec_command", "arguments": {"cmd": "echo hi"}}, ensure_ascii=False
+        )
+        yield f"```tool_call\n{payload}\n```", {}
+        yield "", {"conversation_id": None}
+
+
+def _emitted_items(tools: list, provider_cls) -> list:
+    provider = provider_cls()
+    original = srv._make_provider
+    srv._make_provider = lambda key, client=None, **kw: provider
+    try:
+        client = TestClient(srv.app)
+        r = client.post(
+            "/v1/responses",
+            json={
+                "model": "gpt-5-codex",
+                "input": "go",
+                "tools": tools,
+                "stream": False,
+            },
+        )
+        assert r.status_code == 200, r.text
+        return r.json().get("output", [])
+    finally:
+        srv._make_provider = original
+
+
+def test_namespaced_sub_tool_call_carries_its_namespace_on_the_wire():
+    """[TOOL-LOOP] namespace 子工具的调用项必须带 `namespace`，普通工具**绝不能**带。
+
+    这条规则是被真实 Codex 0.145.0 路由出来的，不是猜的：客户端的工具查表键是
+    `namespace + name` **无分隔符拼接**。同一条源码规则（`parse_full_name` 在
+    拿不到 namespace 时返回 `(None, name)`）造成两个方向相反的后果：
+
+      实测（codex exec，同一份 mock 上游，只改调用项的字段形状）
+        `exec_command`  无 namespace                -> 真正执行（`hi`）
+        `exec_command`  + `namespace`              -> `unsupported call: multi_agent_v1exec_command`
+        `spawn_agent`   无 namespace                -> `unsupported call: spawn_agent`
+        `spawn_agent`   + `"bogus_ns"`             -> `unsupported call: bogus_nsspawn_agent`
+        `spawn_agent`   + 真实 namespace            -> `collab: SpawnAgent` -> `{"agent_id":…}`
+        `spawn_agent`   + 真实 namespace（功能开关关闭的 v1 配置）-> 同样被路由
+
+    所以「裸名 + 完整 schema」只是**声明侧**的正确形态（提示词与解析白名单，见上一
+    条用例）；出口侧必须把 namespace 还原回去，而且只还原在真正属于某个 namespace
+    的工具上——给普通工具加上它会立刻打断它。两个方向一起锁，因为只修一个方向会
+    把另一个方向的正确行为变成回归。
+    """
+    ns = _namespace_decl()
+    ns_name = ns["name"]
+    plain = {
+        "type": "function",
+        "name": "exec_command",
+        "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}},
+    }
+    tools = [ns, plain]
+
+    # --- 方向一：namespace 子工具的调用项带 namespace，名字仍是裸名
+    items = _emitted_items(tools, SpawnAgentProvider)
+    calls = [i for i in items if i.get("type") == "function_call"]
+    assert calls, f"namespace 子工具的调用没有回给客户端: {json.dumps(items, ensure_ascii=False)[:600]}"
+    sub = calls[0]
+    assert sub["name"] == "spawn_agent", (
+        f"名字被改写了，客户端的查表键是 namespace+name，改坏任何一个都查不到: {sub['name']!r}"
+    )
+    assert sub.get("namespace") == ns_name, (
+        "namespace 子工具的调用项没有携带 namespace——实测真实 Codex 会回 "
+        f"`unsupported call: {sub['name']}`（同一份 mock 上游下 2 次请求、工具一次都没执行）。"
+        f"实际发出的项: {json.dumps(sub, ensure_ascii=False)}"
+    )
+
+    # --- 方向二（控制组）：普通工具的调用项绝不能带 namespace
+    items = _emitted_items(tools, PlainToolProvider)
+    calls = [i for i in items if i.get("type") == "function_call"]
+    assert calls, "普通工具的调用没有回给客户端"
+    assert "namespace" not in calls[0], (
+        "普通工具被加上了 namespace——实测客户端拼成 "
+        f"`{ns_name}exec_command` 并回 `unsupported call`，一个本来正常的工具因此被打断。"
+        f"实际发出的项: {json.dumps(calls[0], ensure_ascii=False)}"
+    )
+
+    # --- 方向三：namespace 容器本身永远不是可调用的名字
+    all_names = {i.get("name") for i in _emitted_items(tools, SpawnAgentProvider)
+                 if i.get("type") == "function_call"}
+    assert ns_name not in all_names, (
+        f"namespace 自己的名字 {ns_name!r} 变成了调用名——真实客户端回 unsupported call"
+    )
+    print("test_namespaced_sub_tool_call_carries_its_namespace_on_the_wire: PASSED")
+
+
 def run_all():
     test_freeform_declaration_gets_an_executable_schema()
     test_freeform_call_replay_is_assistant_not_user()
@@ -487,6 +592,7 @@ def run_all():
     test_namespace_is_not_a_callable_name_but_is_explained()
     test_namespace_sub_tools_enter_the_parse_allowlist()
     test_namespace_sub_tool_call_round_trips_end_to_end()
+    test_namespaced_sub_tool_call_carries_its_namespace_on_the_wire()
     print("\n✅ All Responses custom/freeform tool tests passed!")
 
 

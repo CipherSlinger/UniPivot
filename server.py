@@ -103,6 +103,7 @@ from providers import (
     custom_tool_input_text,
     freeform_tool_names,
     function_call_item,
+    namespace_of_tools,
     message_item,
     reasoning_item,
     sse_done,
@@ -4103,6 +4104,10 @@ async def responses_endpoint(req: ResponsesRequest):
                 # [TOOL-LOOP] freeform（custom）工具的出口形状与 function 工具不同，
                 # 在流的起点算一次、全程复用（与 allowed 同源，避免两份判断）。
                 freeform_names = freeform_tool_names(req.tools)
+                # [TOOL-LOOP] namespace 子工具的调用项必须带回 namespace（客户端查表
+                # 键是 `namespace+name`）。与 allowed/freeform_names 同源、在流起点
+                # 算一次，避免出口两处各自判断而漂移。
+                tool_namespaces = namespace_of_tools(req.tools)
                 # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
                 stop_scan = StopSequenceScanner(stop_seq)
                 yield ev.created()
@@ -4270,12 +4275,16 @@ async def responses_endpoint(req: ResponsesRequest):
                             item_fn = custom_tool_call_item(call_id, tool_name, tool_text)
                         else:
                             args_str = json.dumps(args, ensure_ascii=False) if isinstance(args, (dict, list)) else str(args)
+                            tool_ns = tool_namespaces.get(tool_name)
                             yield ev.output_item_added(
-                                out_idx, function_call_item(call_id, tool_name, "", status="in_progress")
+                                out_idx,
+                                function_call_item(
+                                    call_id, tool_name, "", status="in_progress", namespace=tool_ns
+                                ),
                             )
                             yield ev.function_call_args_delta(call_id, out_idx, call_id, args_str)
                             yield ev.function_call_args_done(call_id, out_idx, call_id, args_str)
-                            item_fn = function_call_item(call_id, tool_name, args_str)
+                            item_fn = function_call_item(call_id, tool_name, args_str, namespace=tool_ns)
                         yield ev.output_item_done(out_idx, item_fn)
                         output_items.append(item_fn)
                         out_idx += 1
@@ -4492,6 +4501,8 @@ async def responses_endpoint(req: ResponsesRequest):
         reasoning_tokens=max(1, _est_tokens(full_reasoning)) if full_reasoning else 0,
         # [TOOL-LOOP] freeform 工具必须以 custom_tool_call 输出（同流式路径）
         freeform_tools=freeform_tool_names(req.tools),
+        # [TOOL-LOOP] namespace 子工具的调用项必须带回 namespace（同流式路径）
+        tool_namespaces=namespace_of_tools(req.tools),
     )
     # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete（与流式路径同一语义）
     if _stop_matched:

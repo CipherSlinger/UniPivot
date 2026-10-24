@@ -494,18 +494,24 @@ _NAMELESS_TOOL_NOTE_LIMIT = 8
 # 旧实现把它当普通声明走通用分支：取顶层 `name`/`description`，找不到
 # `parameters`，于是渲染成 `- \`multi_agent_v1\`: …` + `Args: {}`。两个错误同时发生：
 # 五个子工具的名字与**全部参数 schema** 消失（模型无从调用），而它被告知可调用的
-# 名字是 `multi_agent_v1` —— 一个真实客户端会拒绝的名字。客户端路由实测：
-#   `name="multi_agent_v1"`                  -> `unsupported call: multi_agent_v1`
-#   `name="spawn_agent"`（裸名）              -> `collab: SpawnAgent`（已路由）
-#   裸名 + `"namespace":"multi_agent_v1"`     -> `unsupported call: multi_agent_v1spawn_agent`
-#     （客户端把 namespace 与 name **无分隔符拼接**后再查表）
-#   `multi_agent_v1.spawn_agent` / `::` / `__` -> 全部 `unsupported call`
+# 名字是 `multi_agent_v1` —— 一个真实客户端会拒绝的名字。
 #
-# 所以唯一正确的形状是：子工具按**裸名**、带完整 schema 进入可调用列表；namespace
-# 本身不可调用，只作为分组说明。展平只有一份定义（`flatten_namespace_tools`），
-# 请求模型与提示词渲染都调它 —— 提示词决定「模型想调什么」，白名单决定「什么能被
-# 回传」，两者必须来自同一份展平结果，否则模型写出的 `spawn_agent` 会被当作未声明
-# 工具丢弃，症状与修复前完全一样。
+# [TOOL-LOOP] 客户端到底怎么路由，实测（codex exec 0.145.0，同一份 mock 上游，只改
+# 调用项的字段形状；判据是**工具有没有真的执行**，不是模型自己怎么措辞）：
+#   `exec_command` 无 namespace                  -> 真正执行（`hi`）
+#   `spawn_agent`  无 namespace                  -> `unsupported call: spawn_agent`
+#   `spawn_agent`  + 真实 namespace              -> `collab: SpawnAgent` -> `{"agent_id":…}`
+#   `spawn_agent`  + `"bogus_ns"`                -> `unsupported call: bogus_nsspawn_agent`
+#   `exec_command` + namespace                   -> `unsupported call: multi_agent_v1exec_command`
+#
+# 也就是说查表键是 `namespace + name` **无分隔符拼接**，两个方向都要对：属于某个
+# namespace 的工具，出口侧必须把 namespace 一起带上；普通工具**绝不能**带。所以
+#   - **声明侧**（提示词与解析白名单）：子工具按裸名 + 完整 schema，namespace 本身
+#     不可调用，只作分组说明。展平只有一份定义（`flatten_namespace_tools`），请求
+#     模型与提示词渲染都调它 —— 提示词决定「模型想调什么」，白名单决定「什么能被
+#     回传」，两者必须来自同一份展平结果。
+#   - **出口侧**：`namespace_of_tools()` 是「这个名字属于哪个 namespace」的唯一判据，
+#     由同一份展平结果构造，恢复调用项上的 `namespace` 字段。
 _NAMESPACE_TOOL_DECL_TYPE = "namespace"
 
 # 展平后子工具携带的分组标记（网关内部键，前缀 `_` 表示不来自客户端）。
@@ -560,6 +566,35 @@ def flatten_namespace_tools(tools: Any, _depth: int = 0) -> list:
                     child[_NAMESPACE_GROUP_KEY] = ns_name
             out.append(child)
     return out
+
+
+def namespace_of_tools(tools: Any) -> dict:
+    """`工具名 -> 它所属的 namespace`（出口侧恢复 `namespace` 字段的唯一判据）。
+
+    [TOOL-LOOP] 客户端查表用的键是 `namespace + name` 无分隔符拼接，所以出口侧的
+    调用项**必须**带回 namespace，而普通工具必须不带（实测：给 `exec_command` 加上
+    它，客户端拼成 `multi_agent_v1exec_command` 直接 `unsupported call`）。这不是
+    第二份「哪些工具在哪个 namespace」的知识：输入就是 `flatten_namespace_tools`
+    的产物，读的是它写下的同一个 `_namespace` 标记，所以提示词、白名单与出口三者
+    永远出自同一份展平结果。
+
+    名字重复时以先出现者为准：客户端若把同一个名字声明在多个 namespace 下，它自己
+    的查表也无法区分，保守地选第一个至少保证行为稳定、可复现。
+    """
+    mapping: dict = {}
+    if not isinstance(tools, list):
+        return mapping
+    for t in flatten_namespace_tools(tools):
+        if not isinstance(t, dict):
+            continue
+        ns = t.get(_NAMESPACE_GROUP_KEY)
+        if not (isinstance(ns, str) and ns):
+            continue
+        fn = t.get("function") if isinstance(t.get("function"), dict) else t
+        name = fn.get("name") if isinstance(fn, dict) else None
+        if isinstance(name, str) and name.strip():
+            mapping.setdefault(name.strip(), ns)
+    return mapping
 
 
 def _namespace_group_notes(tools: Any) -> List[str]:
