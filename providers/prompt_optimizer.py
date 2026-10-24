@@ -353,6 +353,7 @@ class PromptOptimizer:
         self,
         messages: List[Dict[str, Any]],
         max_tokens: Optional[int] = None,
+        record: bool = True,
     ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
         """执行消息列表自适应折叠优化。
 
@@ -363,12 +364,24 @@ class PromptOptimizer:
           - final_tokens: int
           - saved_tokens: int
           - phase: int (0: none, 1: tool/code fold, 2: summary convergence)
+
+        [PROTOCOL] `record=False` 只计算、不记账。`/v1/messages/count_tokens` 必须
+        走**同一个**折叠裁决（否则它报的是一个已经被丢弃的历史，实测第 15 轮
+        72926 vs 真实 17528，4.2 倍），但那是一次估算调用而非真实派发：把它的
+        「节省」计入折叠遥测，等于让诊断声称省下了实际从未发生的 token。
+        裁决只有一份，记账只发生在真实派发上。
         """
         effective_max_tokens = max_tokens if max_tokens is not None else self.max_tokens
 
-        if not messages:
+        def _bump(**deltas: int) -> None:
+            if not record:
+                return
             with self._lock:
-                self._total_inspections += 1
+                for name, delta in deltas.items():
+                    setattr(self, name, getattr(self, name) + delta)
+
+        if not messages:
+            _bump(_total_inspections=1)
             return messages, {
                 "applied": False,
                 "original_tokens": 0,
@@ -380,10 +393,9 @@ class PromptOptimizer:
         original_tokens = estimate_history_tokens(messages)
 
         if len(messages) <= 1 or self.is_disabled() or original_tokens <= effective_max_tokens:
-            with self._lock:
-                self._total_inspections += 1
-                self._total_original_tokens += original_tokens
-                self._total_final_tokens += original_tokens
+            _bump(_total_inspections=1,
+                  _total_original_tokens=original_tokens,
+                  _total_final_tokens=original_tokens)
             return messages, {
                 "applied": False,
                 "original_tokens": original_tokens,
@@ -429,10 +441,9 @@ class PromptOptimizer:
 
         # 如果中间轮次为空，说明所有消息均属于 Head 或 Tail
         if head_end >= tail_start:
-            with self._lock:
-                self._total_inspections += 1
-                self._total_original_tokens += original_tokens
-                self._total_final_tokens += original_tokens
+            _bump(_total_inspections=1,
+                  _total_original_tokens=original_tokens,
+                  _total_final_tokens=original_tokens)
             return messages, {
                 "applied": False,
                 "original_tokens": original_tokens,
@@ -458,12 +469,11 @@ class PromptOptimizer:
         if cand_tokens <= effective_max_tokens:
             if any_folded and cand_tokens < original_tokens:
                 saved_tokens = original_tokens - cand_tokens
-                with self._lock:
-                    self._total_inspections += 1
-                    self._total_folded_requests += 1
-                    self._total_saved_tokens += saved_tokens
-                    self._total_original_tokens += original_tokens
-                    self._total_final_tokens += cand_tokens
+                _bump(_total_inspections=1,
+                      _total_folded_requests=1,
+                      _total_saved_tokens=saved_tokens,
+                      _total_original_tokens=original_tokens,
+                      _total_final_tokens=cand_tokens)
                 return candidate_messages, {
                     "applied": True,
                     "original_tokens": original_tokens,
@@ -472,10 +482,9 @@ class PromptOptimizer:
                     "phase": 1,
                 }
             else:
-                with self._lock:
-                    self._total_inspections += 1
-                    self._total_original_tokens += original_tokens
-                    self._total_final_tokens += original_tokens
+                _bump(_total_inspections=1,
+                      _total_original_tokens=original_tokens,
+                      _total_final_tokens=original_tokens)
                 return messages, {
                     "applied": False,
                     "original_tokens": original_tokens,
@@ -496,13 +505,11 @@ class PromptOptimizer:
         saved_tokens = max(0, original_tokens - final_tokens)
         applied = saved_tokens > 0
 
-        with self._lock:
-            self._total_inspections += 1
-            if applied:
-                self._total_folded_requests += 1
-                self._total_saved_tokens += saved_tokens
-            self._total_original_tokens += original_tokens
-            self._total_final_tokens += final_tokens
+        _bump(_total_inspections=1,
+              _total_folded_requests=1 if applied else 0,
+              _total_saved_tokens=saved_tokens if applied else 0,
+              _total_original_tokens=original_tokens,
+              _total_final_tokens=final_tokens)
 
         return phase2_messages, {
             "applied": applied,

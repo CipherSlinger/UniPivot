@@ -3776,6 +3776,17 @@ async def count_tokens(req: AnthropicCountTokensRequest):
         tool_choice=req.tool_choice,
         parallel_allowed=not parallel_disallowed,
     )
+    # [PROTOCOL] 折叠裁决必须与 `/v1/messages` **同一份**：真实路径在估算前先调
+    # `optimize_chat_messages`，超过上下文预算时把中间历史压成一行标记；估算路径
+    # 却直接展平原始历史，于是它报的是一个网关已经丢弃的上下文。实测（同一份
+    # 请求回放，14 轮工具往返）count_tokens=32891 vs 真实 message_start=19484，
+    # 第 15 轮真实 soak 里是 72926 vs 17528（4.2 倍），差距随轮次单调放大。
+    # 客户端正是用这个数字判断「还能不能再塞一轮 / 该不该压缩」——偏高会让它在
+    # 余量充足时就开始丢真实上下文，和被修过的「偏低」是同一个错误的两端。
+    # `record=False`：这是一次估算，不是派发，不能计入折叠遥测的「已节省」。
+    gateway_messages, _fold_meta = prompt_optimizer.optimize_chat_messages(
+        gateway_messages, record=False
+    )
     prompt = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(prompt)
 

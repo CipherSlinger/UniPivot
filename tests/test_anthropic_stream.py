@@ -507,6 +507,115 @@ def test_count_tokens_sees_the_same_tools_prompt_as_messages():
     print("test_count_tokens_sees_the_same_tools_prompt_as_messages: PASSED")
 
 
+def test_count_tokens_sees_the_folded_history_messages_actually_sends():
+    """[PROTOCOL] 估算路径没走过折叠，于是它报的是一个**已经被网关丢弃的**历史。
+
+    真实 `claude -p` 15 轮 soak（3 工具调用/轮，每条工具输出填充 2400 字符）抓到的
+    16 份请求体，逐份回放给 `/v1/messages/count_tokens`，与同一份请求真实
+    `message_start.usage.input_tokens`（= 送进上游的展平提示词估算值）对比：
+
+        turn   client_msgs   count_tokens   真实 input_tokens
+          0         2            8695             8695
+          3        11           21539            21539
+          4        14          **25820**        **21855**    <- 折叠开始生效
+          5        17          **30102**        **17378**
+          ...
+         15        47          **72926**        **17528**    <- 4.2 倍
+
+    `/v1/messages` 在 `optimize_chat_messages` 之后才算 `input_tokens`，折叠把
+    30k 字符的历史压成一行标记；`count_tokens` 则直接 `flatten_messages` 原始
+    转换结果，从不折叠。超过 `GATEWAY_MAX_CONTEXT_TOKENS` 之后两者的差距随轮次
+    单调放大，到第 15 轮偏 **+55400 tokens（4.2 倍）**。
+
+    这个数字是客户端用来决定「还能不能再塞一轮 / 该不该压缩」的。系统性偏高会让
+    Claude Code 在上下文其实还有大量余量时就开始激进压缩（丢掉真实上下文），
+    和被修过的「偏低」是同一个错误的两个方向。
+
+    断言用的是**同一条请求的两条路径必须给出同一个数**，而不是某个具体数值：
+    数值随提示词文案漂移，这个等式不会。
+    """
+    from fastapi.testclient import TestClient as _TC
+
+    # 构造一段超过上下文预算的历史：14 轮工具往返，每轮工具输入/输出都远超
+    # 阶段一的折叠阈值（300/400 字符），确保折叠一定会被触发。
+    pad = 4000
+    messages = [{"role": "user", "content": "Do the long task."}]
+    for i in range(14):
+        messages.append({
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": f"step {i}"},
+                {"type": "tool_use", "id": f"toolu_{i}", "name": "Bash",
+                 "input": {"command": f"echo {i} " + "x" * pad}},
+            ],
+        })
+        messages.append({
+            "role": "user",
+            "content": [
+                {"type": "tool_result", "tool_use_id": f"toolu_{i}",
+                 "content": f"out {i} " + "y" * pad},
+            ],
+        })
+
+    body = {
+        "model": "claude-3-7-sonnet",
+        "max_tokens": 256,
+        "tools": [{"name": "Bash", "description": "run",
+                   "input_schema": {"type": "object",
+                                    "properties": {"command": {"type": "string"}}}}],
+        "messages": messages,
+    }
+
+    from providers.token_counter_cache import token_counter_cache
+
+    ScriptedProvider.script = [("ok", {"conversation_id": "c1"})]
+    default_factory = srv._make_provider
+    srv._make_provider = lambda key: ScriptedProvider()
+    try:
+        token_counter_cache.clear()
+        client = _TC(srv.app)
+
+        # 折叠裁决共用，但**记账**只属于真实派发：一次估算调用若把「节省」计入
+        # 折叠遥测，诊断就会声称省下了从未发生的 token。
+        before = dict(srv.prompt_optimizer.get_stats())
+        counted = client.post("/v1/messages/count_tokens", json=body).json()["input_tokens"]
+        after = dict(srv.prompt_optimizer.get_stats())
+        assert after == before, (
+            "count_tokens 改写了折叠遥测（估算不是派发）："
+            f"{ {k: (before[k], after[k]) for k in before if before[k] != after[k]} }"
+        )
+
+        # 从真实流式响应里读 `message_start.usage.input_tokens`：这是网关**真的**
+        # 送进上游的那个展平提示词的估算值，不是我们重新算一遍。
+        with client.stream("POST", "/v1/messages", json={**body, "stream": True}) as r:
+            assert r.status_code == 200, r.read()
+            raw = "".join(r.iter_text())
+    finally:
+        srv._make_provider = default_factory
+        token_counter_cache.clear()
+
+    real = None
+    for chunk in raw.split("\n\n"):
+        for line in chunk.split("\n"):
+            if line.startswith("data: "):
+                try:
+                    obj = json.loads(line[6:])
+                except Exception:
+                    continue
+                if obj.get("type") == "message_start":
+                    real = obj["message"]["usage"]["input_tokens"]
+    assert real is not None, f"流里没有 message_start: {raw[:300]}"
+
+    assert counted == real, (
+        "count_tokens 与真实请求的 input_tokens 不一致："
+        f"count_tokens={counted} vs message_start={real}"
+        f"（偏 {counted - real}, {counted / real:.2f} 倍）。"
+        "估算路径没有应用 `optimize_chat_messages`，报的是一个已经被网关折叠掉的"
+        "历史——客户端据此做的上下文预算判断是错的。"
+    )
+    print("test_count_tokens_sees_the_folded_history_messages_actually_sends: PASSED")
+
+
 # ------------------------------------------- 14. thinking.display = "omitted"
 
 
@@ -747,6 +856,7 @@ def run_all():
         test_count_tokens_accepts_every_system_shape_messages_accepts,
         test_count_tokens_cache_key_covers_tool_choice,
         test_count_tokens_sees_the_same_tools_prompt_as_messages,
+        test_count_tokens_sees_the_folded_history_messages_actually_sends,
         test_thinking_display_omitted_sends_no_thinking_text,
         test_thinking_display_summarized_still_sends_thinking,
         test_thinking_display_omitted_still_recovers_tool_from_reasoning,
