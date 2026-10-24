@@ -150,6 +150,46 @@ def _bodies_for(bodies: list[dict], client: str) -> list[dict]:
     return [b for b in bodies if tool in (b.get("declared_tools") or [])]
 
 
+def _overlap_ms(bodies: list[dict]) -> int:
+    """Milliseconds during which BOTH clients had a request in flight.
+
+    The whole point of `--parallel` is interleaving, and a green verdict alone
+    cannot distinguish it from two sequential runs — the markers and body counts
+    are identical either way. So the claim is measured: each client's upstream
+    calls are taken in wall-clock order from the logged `t`, and the span where
+    both are active is computed as the union overlap. Zero means the two clients
+    never actually ran at the same time and the run proves nothing about sharing.
+    """
+    spans = {}
+    for name in ("claude", "codex"):
+        ts = sorted(b["t"] for b in _bodies_for(bodies, name) if isinstance(b.get("t"), (int, float)))
+        if ts:
+            spans[name] = (ts[0], ts[-1])
+    if len(spans) < 2:
+        return 0
+    (a0, a1), (b0, b1) = spans["claude"], spans["codex"]
+    return max(0, int((min(a1, b1) - max(a0, b0)) * 1000))
+
+
+def _alternation(bodies: list[dict]) -> str:
+    """"C"/"X" per upstream call in time order, plus how often the owner changed.
+
+    A real interleaving alternates; two runs that merely happened to share a log
+    do not. Measured on a good run: `XCXCXCXCXCXCXCXCXCXCXC`, 21 alternations
+    across 22 bodies — every single call switched client, which is what two
+    agents driving one gateway actually looks like.
+    """
+    ordered = sorted(
+        (b for b in bodies if isinstance(b.get("t"), (int, float))), key=lambda b: b["t"]
+    )
+    seq = []
+    for b in ordered:
+        declared = b.get("declared_tools") or []
+        seq.append("C" if "Bash" in declared else ("X" if "exec_command" in declared else "?"))
+    switches = sum(1 for a, b in zip(seq, seq[1:]) if a != b)
+    return "".join(seq), switches
+
+
 def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
              marker: Path, stdout: str) -> dict:
     markers = sorted(p.name for p in work.glob("ROUND_*"))
@@ -319,6 +359,7 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
             gw.kill()
         getattr(gw, "_e2e_log", None) and gw._e2e_log.close()  # type: ignore[attr-defined]
 
+    overlap = _overlap_ms(bodies_all)
     for name in ("claude", "codex"):
         p = procs.get(name)
         if p is None:
@@ -329,6 +370,7 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
                        marker_paths[name], outs.get(name, ""))
         res["rounds_expected"] = args.rounds
         res["total_bodies"] = len(bodies_all)
+        res["overlap_ms"] = overlap
         results.append(res)
         print(f"[e2e] parallel {name}: "
               f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
@@ -346,6 +388,21 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         if not res["round2_saw_result"]:
             failures.append(f"{name}: none of its requests carried a tool result")
 
+    # A run where the two binaries never overlapped measures nothing about sharing,
+    # and every other check in this function would still pass. Make that loud.
+    if overlap <= 0:
+        failures.append(
+            "the two clients' upstream requests never overlapped in time — this run "
+            "proves nothing about sharing one gateway (measurement: 0 ms of overlap)"
+        )
+    # Alternation is the stronger form of the same claim: a log that is
+    # `CCCC…XXXX` overlapped for a while but was not interleaved per turn.
+    if _alternation(bodies_all)[1] < 2:
+        failures.append(
+            "the two clients' requests barely interleaved — the shared-gateway path "
+            f"was not exercised per turn (sequence: {_alternation(bodies_all)[0]})"
+        )
+
     print("\n================ E2E VERDICT (parallel) ================")
     for r in results:
         if "skipped" in r:
@@ -356,6 +413,10 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
               f"(bodies={r['bodies']}, tool_markers={len(r['markers'])}/{r['rounds_expected']}, "
               f"tool={r['chosen'][0] if r['chosen'] else None})")
+    seq, switches = _alternation(bodies_all)
+    print(f"  concurrent window: {overlap} ms of genuine overlap "
+          f"({len(bodies_all)} upstream bodies total)")
+    print(f"  interleaving: {seq} ({switches} client switches)")
     for f in failures:
         print(f"  !! {f}")
     if not args.keep:

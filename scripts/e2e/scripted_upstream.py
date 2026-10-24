@@ -34,6 +34,7 @@ import os
 import re
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 _REPO = Path(__file__).resolve().parents[2]
@@ -208,6 +209,11 @@ class LoopProvider:
 
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({
+                # Wall-clock seconds. Without it nothing can prove the two clients'
+                # requests actually OVERLAPPED in --parallel mode: two sequential
+                # runs would produce byte-identical evidence to a real interleaving
+                # and the "concurrent" claim would be an assertion, not a measurement.
+                "t": time.time(),
                 "provider": self.key,
                 "model": model,
                 "kw_keys": sorted(kw.keys()),
