@@ -43,6 +43,7 @@ Usage
     .venv/bin/python scripts/e2e/run_agent_loop.py            # both clients present
     .venv/bin/python scripts/e2e/run_agent_loop.py --client claude
     .venv/bin/python scripts/e2e/run_agent_loop.py --rounds 10  # long agent session
+    .venv/bin/python scripts/e2e/run_agent_loop.py --parallel --rounds 10  # both at once, one gateway
     .venv/bin/python scripts/e2e/run_agent_loop.py --keep     # keep artifacts for inspection
 
 Exit code 0 means every client that is installed closed the full loop: the client
@@ -88,7 +89,8 @@ def _wait_ready(url: str, timeout: float = 60.0) -> bool:
     return False
 
 
-def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path) -> subprocess.Popen:
+def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path,
+                   parallel: bool = False) -> subprocess.Popen:
     """Start the scripted upstream.
 
     `want` has to reach the **server**: it is the model in the scripted upstream
@@ -104,6 +106,7 @@ def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: P
         "E2E_WANT": want,
         "E2E_ROUNDS": str(rounds),
         "E2E_WANT_DIR": str(want_dir),
+        "E2E_PARALLEL": "1" if parallel else "0",
         "PYTHONUNBUFFERED": "1",
     }
     log = open(log_dir / f"srv_{port}.log", "wb")
@@ -135,12 +138,39 @@ def _marker_seen(marker: Path) -> bool:
     return marker.exists()
 
 
-def run_claude(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
-    """Drive `claude -p` and require a real tool execution plus a closed loop."""
-    claude = shutil.which("claude")
-    if not claude:
-        return {"client": "claude", "skipped": "claude not on PATH"}
+# How to tell one client's upstream bodies from the other's when both share a
+# gateway: each CLI declares its own shell tool and no other.
+_OWN_TOOL = {"claude": "Bash", "codex": "exec_command"}
 
+
+def _bodies_for(bodies: list[dict], client: str) -> list[dict]:
+    tool = _OWN_TOOL.get(client)
+    if not tool:
+        return bodies
+    return [b for b in bodies if tool in (b.get("declared_tools") or [])]
+
+
+def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
+             marker: Path, stdout: str) -> dict:
+    markers = sorted(p.name for p in work.glob("ROUND_*"))
+    base = work / "E2E_MARKER"
+    return {
+        "client": client,
+        "exit": exit_code,
+        "bodies": len(bodies),
+        "marker": marker.exists() or base.exists(),
+        "markers": markers,
+        "declared": (bodies[-1]["declared_tools"] if bodies else []),
+        "chosen": (bodies[-1]["chosen_tool"] if bodies else None),
+        "has_tools_section": bool(bodies and bodies[-1]["has_tools_section"]),
+        "round2_saw_result": any(
+            "Tool Result for" in (b.get("prompt_tail") or "") for b in bodies
+        ),
+        "stdout": stdout[-2000:],
+    }
+
+
+def _claude_argv(port: int, work: Path, log_dir: Path, marker: Path):
     want = f"touch {marker}"
     env = {
         **os.environ,
@@ -152,35 +182,29 @@ def run_claude(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
         "E2E_WANT": want,
     }
     (log_dir / "claudehome").mkdir(exist_ok=True)
-    proc = subprocess.run(
-        [claude, "-p", f"Run `{want}` then tell me what it printed.",
-         "--model", "claude-3-7-sonnet",
-         "--allowedTools", "Bash"],
-        cwd=str(work), env=env, capture_output=True, text=True, timeout=240,
-        stdin=subprocess.DEVNULL,
-    )
+    return [
+        shutil.which("claude"), "-p", f"Run `{want}` then tell me what it printed.",
+        "--model", "claude-3-7-sonnet", "--allowedTools", "Bash",
+    ], env
+
+
+def run_claude(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
+    """Drive `claude -p` and require a real tool execution plus a closed loop."""
+    if not shutil.which("claude"):
+        return {"client": "claude", "skipped": "claude not on PATH"}
+    argv, env = _claude_argv(port, work, log_dir, marker)
+    proc = subprocess.run(argv, cwd=str(work), env=env, capture_output=True,
+                          text=True, timeout=240, stdin=subprocess.DEVNULL)
     (log_dir / "claude.out").write_text(proc.stdout + "\n---STDERR---\n" + proc.stderr)
-    bodies = _bodies(log_dir, port)
-    return {
-        "client": "claude",
-        "exit": proc.returncode,
-        "bodies": len(bodies),
-        "marker": _marker_seen(marker),
-        "declared": (bodies[-1]["declared_tools"] if bodies else []),
-        "chosen": (bodies[-1]["chosen_tool"] if bodies else None),
-        "has_tools_section": bool(bodies and bodies[-1]["has_tools_section"]),
-        "round2_saw_result": any(
-            "Tool Result for" in (b.get("prompt_tail") or "") for b in bodies
-        ),
-        "stdout": proc.stdout[-2000:],
-    }
+    bodies = _bodies_for(_bodies(log_dir, port), "claude")
+    return _collect("claude", proc.returncode, bodies, work, marker, proc.stdout)
 
 
-def run_codex(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
-    """Drive `codex exec` and require a real tool execution plus a closed loop."""
+def _codex_argv(port: int, work: Path, log_dir: Path, marker: Path):
+    """Build the codex command + env, or (None, None) when codex is absent."""
     codex = shutil.which("codex")
     if not codex:
-        return {"client": "codex", "skipped": "codex not on PATH"}
+        return None, None
 
     want = f"touch {marker}"
     # `OPENAI_BASE_URL` is NOT honoured by codex 0.145.0 — measured against the
@@ -216,29 +240,130 @@ trust_level = "trusted"
         "CODEX_HOME": str(codex_home),
         "E2E_WANT": want,
     }
+    return [
+        codex, "exec", "--skip-git-repo-check",
+        "--dangerously-bypass-approvals-and-sandbox",
+        "-m", "gpt-5.5",
+        f"Run `{want}` then tell me what it printed.",
+    ], env
+
+
+def run_codex(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
+    """Drive `codex exec` and require a real tool execution plus a closed loop."""
+    argv, env = _codex_argv(port, work, log_dir, marker)
+    if not argv:
+        return {"client": "codex", "skipped": "codex not on PATH"}
     proc = subprocess.run(
-        [codex, "exec", "--skip-git-repo-check",
-         "--dangerously-bypass-approvals-and-sandbox",
-         "-m", "gpt-5.5",
-         f"Run `{want}` then tell me what it printed."],
-        cwd=str(work), env=env, capture_output=True, text=True, timeout=240,
+        argv, cwd=str(work), env=env, capture_output=True, text=True, timeout=240,
         stdin=subprocess.DEVNULL,
     )
     (log_dir / "codex.out").write_text(proc.stdout + "\n---STDERR---\n" + proc.stderr)
-    bodies = _bodies(log_dir, port)
-    return {
-        "client": "codex",
-        "exit": proc.returncode,
-        "bodies": len(bodies),
-        "marker": _marker_seen(marker),
-        "declared": (bodies[-1]["declared_tools"] if bodies else []),
-        "chosen": (bodies[-1]["chosen_tool"] if bodies else None),
-        "has_tools_section": bool(bodies and bodies[-1]["has_tools_section"]),
-        "round2_saw_result": any(
-            "Tool Result for" in (b.get("prompt_tail") or "") for b in bodies
-        ),
-        "stdout": proc.stdout[-2000:],
-    }
+    bodies = _bodies_for(_bodies(log_dir, port), "codex")
+    return _collect("codex", proc.returncode, bodies, work, marker, proc.stdout)
+
+
+def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list) -> int:
+    """Both real binaries at once against ONE gateway.
+
+    This is the setup developers actually run — two agents in two terminals on one
+    machine — and nothing else in the repository exercises it end to end. It puts
+    the two clients' requests through the same connection pool, the same per-node
+    semaphores, the same singleflight manager and the same session-affinity
+    registry, interleaved, for ten rounds each.
+
+    Attribution: once both clients' requests share one upstream log, "which client
+    ran this round" has to be read from the tool each request actually declared
+    (`Bash` => claude, `exec_command` => codex), and the marker paths are derived
+    the same way in the scripted upstream. Without that, one client's rounds are
+    silently credited to the other.
+    """
+    port = _free_port()
+    root = work / "parallel"
+    root.mkdir()
+    procs = {}
+    marker_paths = {}
+    for name in ("claude", "codex"):
+        (root / name).mkdir()
+        marker_paths[name] = root / name / f"{name.upper()}_E2E_MARKER"
+    gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
+                        want_dir=root, parallel=True)
+    try:
+        if not _wait_ready(f"http://127.0.0.1:{port}/health"):
+            print("[e2e] parallel: GATEWAY NOT READY")
+            return 1
+        print(f"[e2e] parallel: one gateway on :{port}; starting both binaries…")
+        for name in ("claude", "codex"):
+            d = root / name
+            if name == "claude":
+                argv, env = _claude_argv(port, d, log_dir, marker_paths[name])
+            else:
+                argv, env = _codex_argv(port, d, log_dir, marker_paths[name])
+            if not argv or not argv[0]:
+                procs[name] = None
+                continue
+            procs[name] = subprocess.Popen(
+                argv, cwd=str(d), env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, stdin=subprocess.DEVNULL,
+            )
+        outs = {}
+        for name, p in procs.items():
+            if p is None:
+                continue
+            outs[name] = p.communicate(timeout=300)[0]
+        bodies_all = _bodies(log_dir, port)
+    finally:
+        gw.terminate()
+        try:
+            gw.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+        getattr(gw, "_e2e_log", None) and gw._e2e_log.close()  # type: ignore[attr-defined]
+
+    for name in ("claude", "codex"):
+        p = procs.get(name)
+        if p is None:
+            results.append({"client": name, "skipped": f"{name} not on PATH"})
+            continue
+        bodies = _bodies_for(bodies_all, name)
+        res = _collect(name, p.returncode, bodies, root / name,
+                       marker_paths[name], outs.get(name, ""))
+        res["rounds_expected"] = args.rounds
+        res["total_bodies"] = len(bodies_all)
+        results.append(res)
+        print(f"[e2e] parallel {name}: "
+              f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
+        if not res["marker"]:
+            failures.append(f"{name}: never executed a tool (marker absent)")
+        if len(res["markers"]) < args.rounds:
+            failures.append(
+                f"{name}: {len(res['markers'])}/{args.rounds} rounds really ran with the "
+                f"other agent sending requests at the same time"
+            )
+        if res["bodies"] < 2:
+            failures.append(f"{name}: only {res['bodies']} of its own upstream requests")
+        if not res["has_tools_section"]:
+            failures.append(f"{name}: its upstream prompt carried no tool contract")
+        if not res["round2_saw_result"]:
+            failures.append(f"{name}: none of its requests carried a tool result")
+
+    print("\n================ E2E VERDICT (parallel) ================")
+    for r in results:
+        if "skipped" in r:
+            print(f"  {r['client']}: SKIPPED")
+            continue
+        ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
+              and r["round2_saw_result"] and len(r["markers"]) >= r["rounds_expected"])
+        print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
+              f"(bodies={r['bodies']}, tool_markers={len(r['markers'])}/{r['rounds_expected']}, "
+              f"tool={r['chosen'][0] if r['chosen'] else None})")
+    for f in failures:
+        print(f"  !! {f}")
+    if not args.keep:
+        shutil.rmtree(log_dir, ignore_errors=True)
+        print("  (artifacts removed; re-run with --keep to inspect)")
+    else:
+        print(f"  artifacts kept at {log_dir}")
+    return 1 if failures else 0
 
 
 def main() -> int:
@@ -248,6 +373,10 @@ def main() -> int:
     ap.add_argument("--rounds", type=int, default=1,
                     help="tool rounds to drive before the model answers (default 1, i.e. a "
                          "two-request loop). Raise it to exercise long agent sessions.")
+    ap.add_argument("--parallel", action="store_true",
+                    help="drive both clients CONCURRENTLY against one gateway — the real "
+                         "developer setup (two agents, one machine). Exercises interleaved "
+                         "requests, shared connection pool and shared concurrency budget.")
     args = ap.parse_args()
 
     log_dir = Path(tempfile.mkdtemp(prefix="unipivot_e2e_"))
@@ -258,6 +387,12 @@ def main() -> int:
     clients = ["claude", "codex"] if args.client == "both" else [args.client]
     results = []
     failures = []
+
+    if args.parallel:
+        if len(clients) < 2:
+            print("[e2e] --parallel needs both clients")
+            return 2
+        return _run_parallel(log_dir, work, args, results, failures)
 
     for name in clients:
         port = _free_port()
@@ -281,9 +416,10 @@ def main() -> int:
                 else run_codex(port, client_work, log_dir, marker)
             )
             res["rounds_expected"] = args.rounds
-            res["markers"] = sorted(
-                p.name for p in client_work.glob("ROUND_*")
-            ) if args.rounds > 1 else []
+            # `_collect` already derived `markers` from the working directory; a
+            # second derivation here was a second definition of the same fact and
+            # printed `tool_markers=0/1` on a single-round run, where no per-round
+            # marker is ever written.
             results.append(res)
             print(f"[e2e] {name}: {json.dumps({k: v for k, v in res.items() if k != 'stdout'}, ensure_ascii=False)}")
             if "skipped" in res:
@@ -325,17 +461,19 @@ def main() -> int:
         if "skipped" in r:
             print(f"  {r['client']}: SKIPPED")
         else:
-            markers_ok = (
-                len(r.get("markers") or []) >= r.get("rounds_expected", 1)
-                if r.get("rounds_expected", 1) > 1 else True
-            )
+            want_rounds = r.get("rounds_expected", 1)
+            markers = len(r.get("markers") or [])
+            markers_ok = markers >= want_rounds if want_rounds > 1 else True
             ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
                   and r["round2_saw_result"] and markers_ok)
+            # At one round no per-round marker exists by construction, so printing
+            # `tool_markers=0/1` reads as a failure on a run that is entirely green.
+            markers_txt = f"{markers}/{want_rounds}" if want_rounds > 1 else "n/a"
             print(
                 f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
                 f"(exit={r['exit']}, bodies={r['bodies']}, tool_ran={r['marker']}, "
                 f"tool={r['chosen'][0] if r['chosen'] else None}, "
-                f"tool_markers={len(r.get('markers') or [])}/{r.get('rounds_expected', 1)})"
+                f"tool_markers={markers_txt})"
             )
     for f in failures:
         print(f"  !! {f}")

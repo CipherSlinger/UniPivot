@@ -63,6 +63,42 @@ _WANT = os.environ.get("E2E_WANT", "echo e2e-ok")
 # Directory the per-round markers are written into (only used when E2E_ROUNDS > 1).
 _WANT_DIR = os.environ.get("E2E_WANT_DIR", ".")
 
+# Parallel mode: two agents share ONE gateway, so a single global E2E_WANT would
+# write one marker file for both and "claude ran 3 rounds" would be satisfiable
+# by codex. In this mode the command is derived from the tool the request
+# actually used to call (Bash => claude, exec_command => codex), which is the
+# only attribution available once both clients' requests are interleaved in the
+# same upstream log. Without it the measurement silently attributes the other
+# client's rounds to this one.
+_PARALLEL = os.environ.get("E2E_PARALLEL") == "1"
+
+
+def _client_tag(tool_name: str) -> str:
+    """Which agent CLI declared this tool. Only used to separate markers."""
+    if tool_name == "Bash":
+        return "claude"
+    if tool_name == "exec_command":
+        return "codex"
+    return tool_name or "unknown"
+
+
+def _command_for(tool_name: str, round_no: int) -> str:
+    """The command for one tool round, always carrying that round's marker.
+
+    In multi-round mode **every** round writes `ROUND_<n>`, including round one.
+    An earlier version emitted the bare base command for round 1, while the
+    runner required `ROUND_1..N` — so a perfectly healthy 3-round run reported
+    `tool_markers=2/3 ... missing ['ROUND_1']` on both real binaries. The run was
+    correct; the harness disagreed with itself about what a round marker is.
+    """
+    if _PARALLEL:
+        tag = _client_tag(tool_name)
+        d = f"{_WANT_DIR}/{tag}"
+        return f"mkdir -p {d} && touch {d}/E2E_MARKER && touch {d}/ROUND_{round_no}"
+    if _ROUNDS > 1:
+        return f"touch {_WANT} && touch {_WANT_DIR}/ROUND_{round_no}"
+    return _WANT
+
 # How many tool rounds to drive before answering. A two-round loop proves the
 # closed loop; it does NOT prove the loop *stays* closed. Real agent sessions run
 # 5-15 tool calls, and every round re-sends the accumulated history through the
@@ -198,13 +234,14 @@ class LoopProvider:
             if isinstance(args, dict) and _ROUNDS > 1:
                 for k in ("cmd", "command", "input"):
                     if isinstance(args.get(k), str):
-                        # APPEND, do not replace: the base command creates the
-                        # primary marker that proves the tool really ran at all,
-                        # and the per-round marker proves *which* round it was.
-                        # Replacing it (measured) made every multi-round run
-                        # report "the client never executed the tool" while all
-                        # five round markers sat on disk.
-                        args = {**args, k: f"{args[k]} && touch {_WANT_DIR}/ROUND_{n}"}
+                        # The command is rebuilt from the round number, never by
+                        # rewriting the base one: the base marker proves the tool
+                        # really ran at all, the per-round marker proves *which*
+                        # round. An earlier version replaced the base command
+                        # (measured) and every multi-round run reported "the
+                        # client never executed the tool" while all five round
+                        # markers sat on disk.
+                        args = {**args, k: _command_for(name, n)}
                         break
             yield "I'll check.\n", {}
             yield (
