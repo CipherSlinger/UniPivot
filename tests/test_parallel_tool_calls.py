@@ -274,6 +274,81 @@ def test_parallel_disallowed_still_caps_adjacent_blocks():
     print("test_parallel_disallowed_still_caps_adjacent_blocks: PASSED")
 
 
+def test_only_the_adjacent_shape_changes_behaviour():
+    """穷举形状矩阵：修复只允许改变「零分隔」这一种情形。
+
+    用手写的几条用例证明零回归是**弱证明**：本缺陷正是因为既有用例都碰巧用了
+    `\\n` 分隔才长期没被发现。这里把 7 种开围栏 × 7 种分隔 × 3 种收围栏 × 前后缀
+    全部跑一遍，对**真实解析结果**（而不是正则分组）断言两件事：
+
+    1. 非零分隔的每一种形状，解析出的调用必须与修复前**逐值相同**；
+    2. 零分隔的形状只允许「1 个调用 → 2 个调用」，不允许任何其他变化。
+
+    修复前的正则在这里是照抄的一份 `_PRE_FIX_PATTERN`，所以这条用例在换掉正则
+    之后仍然有意义：它比较的是两个正则对同一段文本的**行为**。
+    """
+    import re as _re
+
+    import providers.anthropic_compat as ac
+
+    pre_fix = _re.compile(
+        r"```+\s*(?:tool_call|tool|function|json|json5)\s*\n(.*?)(?:\n?```+|$)",
+        _re.DOTALL | _re.IGNORECASE,
+    )
+    body = '{"name": "Read", "arguments": {"file_path": "a"}}'
+    openers = ["```tool_call", "````tool_call", "```json", "```tool",
+               "```function", "```json5", "```TOOL_CALL"]
+    # `""` 就是本缺陷的形状；其余每一个都必须零变化。
+    separators = ["", "\n", "\n\n", " ", "\ntext\n", "```inline```",
+                  "\n```tool_calling\nx\n```"]
+    closers = ["```", "````", ""]
+
+    current = ac._BLOCK_TOOL_PATTERN
+    changed = {"adjacent": 0}
+    try:
+        for o1 in openers:
+            for o2 in openers:
+                for sep in separators:
+                    for closer in closers:
+                        for pre, post in (("", ""), ("hello ", "\nbye")):
+                            text = (f"{pre}{o1}\n{body}\n{closer}{sep}"
+                                    f"{o2}\n{body}\n```{post}")
+                            ac._BLOCK_TOOL_PATTERN = pre_fix
+                            try:
+                                before = parse_tool_calls(text)
+                            finally:
+                                ac._BLOCK_TOOL_PATTERN = current
+                            after = parse_tool_calls(text)
+
+                            if sep:
+                                assert before == after, (
+                                    f"非相邻形状被修复改变了行为 "
+                                    f"(o1={o1!r} o2={o2!r} closer={closer!r} "
+                                    f"sep={sep!r}): {before} != {after}"
+                                )
+                            else:
+                                n_before = len(before[1]) if before else 0
+                                n_after = len(after[1]) if after else 0
+                                assert (n_after - n_before) in (0, 1), (
+                                    f"相邻形状的变化超出预期 {n_before}->{n_after}"
+                                )
+                                assert n_after >= n_before, (
+                                    "相邻形状反而丢了调用 —— 修复方向错了"
+                                )
+                                if n_after > n_before:
+                                    changed["adjacent"] += 1
+    finally:
+        ac._BLOCK_TOOL_PATTERN = current
+
+    assert changed["adjacent"] > 0, (
+        "没有任何相邻形状的行为发生变化：要么修复被回退了（这条用例只用"
+        "「相邻形状多出第二个调用」来区分修复前后，回退后它测不出任何差异），"
+        "要么正则又变成别的样子而这条用例已经失效"
+    )
+    print(f"test_only_the_adjacent_shape_changes_behaviour: PASSED "
+          f"({changed['adjacent']} adjacent shapes gained the second call)")
+
+
 def run_all():
     tests = [
         test_adjacent_blocks_parse_to_two_calls,
@@ -282,6 +357,7 @@ def run_all():
         test_streamer_keeps_both_calls_when_delivered_chunk_by_chunk,
         test_all_three_protocols_return_both_calls,
         test_parallel_disallowed_still_caps_adjacent_blocks,
+        test_only_the_adjacent_shape_changes_behaviour,
     ]
     for fn in tests:
         fn()
