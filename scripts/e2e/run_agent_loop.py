@@ -496,7 +496,10 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
               f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
         if not res["marker"]:
             failures.append(f"{name}: never executed a tool (marker absent)")
-        if len(res["markers"]) < args.rounds:
+        if args.rounds > 1 and len(res["markers"]) < args.rounds:
+            # At one round no per-round marker is ever written (see the parallel
+            # mode's identical guard); `--sessions N --rounds 1` was red on a
+            # healthy run for the same reason.
             failures.append(
                 f"{name}: only {len(res['markers'])}/{args.rounds} rounds really ran "
                 f"while {len(names) - 1} sibling session(s) of the same binary sent requests"
@@ -610,8 +613,16 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
     for name in ("claude", "codex"):
         (root / name).mkdir()
         marker_paths[name] = root / name / f"{name.upper()}_E2E_MARKER"
+    # Hold each response briefly, for the same reason the same-binary mode does:
+    # the run's whole claim is that the two clients' upstream requests really
+    # overlapped, and with an instant stub that is timing luck. Measured:
+    # `--parallel --rounds 1` produced `0 ms of genuine overlap` and failed the
+    # verdict on a completely healthy run, because at one round each client only
+    # makes two requests and they missed each other. A hold makes the overlap a
+    # property of the setup rather than of the scheduler.
     gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
                         want_dir=root, parallel=True,
+                        extra_env={"E2E_HOLD_SECONDS": "0.4"},
                         two_calls=getattr(args, "two_calls", False))
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
@@ -663,10 +674,18 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         if not res["marker"]:
             failures.append(f"{name}: never executed a tool (marker absent)")
         if len(res["markers"]) < args.rounds:
-            failures.append(
-                f"{name}: {len(res['markers'])}/{args.rounds} rounds really ran with the "
-                f"other agent sending requests at the same time"
-            )
+            # At one round the stub is never asked to write a per-round marker
+            # (`_command_for` only rewrites the command when ROUNDS > 1), so this
+            # check demanded a file the harness never creates: a healthy
+            # `--parallel --rounds 1` printed `0/1 rounds really ran` on both
+            # clients (measured, and reproduced on the pre-fix baseline). The
+            # single-client mode already treats markers as n/a at one round;
+            # this is the same rule, in the mode that lacked it.
+            if args.rounds > 1:
+                failures.append(
+                    f"{name}: {len(res['markers'])}/{args.rounds} rounds really ran with the "
+                    f"other agent sending requests at the same time"
+                )
         if res["bodies"] < 2:
             failures.append(f"{name}: only {res['bodies']} of its own upstream requests")
         if not res["has_tools_section"]:

@@ -408,7 +408,13 @@ class LoopProvider:
             # The marker differs per round so the runner can prove THAT round ran,
             # not merely that some round did.
             n = done + 1
-            if isinstance(args, dict) and _ROUNDS > 1:
+            # `_SAME` is included because that mode's runner looks for the marker
+            # in `<session>/e2e_marks/`, and this branch is what puts it there:
+            # at one round the base `_WANT` is the relative `touch E2E_MARKER`,
+            # which the client's cwd resolves to the session root instead, so a
+            # healthy `--sessions 2 --rounds 1` reported "never executed a tool
+            # (marker absent)" on both sessions (measured, CLAUDE.md section 68).
+            if isinstance(args, dict) and (_ROUNDS > 1 or _SAME):
                 for k in ("cmd", "command", "input"):
                     if isinstance(args.get(k), str):
                         # The command is rebuilt from the round number, never by
