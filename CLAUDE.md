@@ -48,70 +48,16 @@ python3 -m venv .venv
 ### Running Tests
 Tests are standalone Python scripts using mocked transports (completely offline, no external test runner or network access needed):
 ```bash
-# Run all unit and integration tests
-.venv/bin/python tests/test_providers.py && \
-.venv/bin/python tests/test_server.py && \
-.venv/bin/python tests/test_session.py && \
-.venv/bin/python tests/test_healing.py && \
-.venv/bin/python tests/test_responses.py && \
-.venv/bin/python tests/test_tools.py && \
-.venv/bin/python tests/test_affinity.py && \
-.venv/bin/python tests/test_singleflight.py && \
-.venv/bin/python tests/test_failover.py && \
-.venv/bin/python tests/test_disconnect.py && \
-.venv/bin/python tests/test_token_cache.py && \
-.venv/bin/python tests/test_lifecycle.py && \
-.venv/bin/python tests/test_risk_ledger.py && \
-.venv/bin/python tests/test_probe_gate.py && \
-.venv/bin/python tests/test_refresh_gate.py && \
-.venv/bin/python tests/test_adaptive_pacing.py && \
-.venv/bin/python tests/test_graceful_drain.py && \
-.venv/bin/python tests/test_conversation_gc.py && \
-.venv/bin/python tests/test_quarantine.py && \
-.venv/bin/python tests/test_quarantine_hardstop.py && \
-.venv/bin/python tests/test_probation.py && \
-.venv/bin/python tests/test_risk_dossier.py && \
-.venv/bin/python tests/test_risk_correlation.py && \
-.venv/bin/python tests/test_credential_watch.py && \
-.venv/bin/python tests/test_credential_renewal.py && \
-.venv/bin/python tests/test_ban_inference.py && \
-.venv/bin/python tests/test_waf_escalation.py && \
-.venv/bin/python tests/test_device_identity.py && \
-.venv/bin/python tests/test_long_avoidance.py && \
-.venv/bin/python tests/test_disabled_propagation.py && \
-.venv/bin/python tests/test_dossier_dispatch_agreement.py && \
-.venv/bin/python tests/test_dispatch_audit.py && \
-.venv/bin/python tests/test_dispatch_gate.py && \
-.venv/bin/python tests/test_tool_roundtrip.py && \
-.venv/bin/python tests/test_tool_fabrication.py && \
-.venv/bin/python tests/test_tool_schema.py && \
-.venv/bin/python tests/test_responses_protocol.py && \
-.venv/bin/python tests/test_agent_loop.py && \
-.venv/bin/python tests/test_stream_keepalive.py && \
-.venv/bin/python tests/test_stop_sequences.py && \
-.venv/bin/python tests/test_stream_errors.py && \
-.venv/bin/python tests/test_stream_lifecycle.py && \
-.venv/bin/python tests/test_stream_concurrency.py && \
-.venv/bin/python tests/test_folding_fidelity.py && \
-.venv/bin/python tests/test_responses_custom_tools.py && \
-.venv/bin/python tests/test_content_normalization.py && \
-.venv/bin/python tests/test_responses_history_tools.py && \
-.venv/bin/python tests/test_stream_preflight.py && \
-.venv/bin/python tests/test_pacing_race.py && \
-.venv/bin/python tests/test_stream_completion.py && \
-.venv/bin/python tests/test_singleflight_constraints.py && \
-.venv/bin/python tests/test_handshake_budget.py && \
-.venv/bin/python tests/test_handshake_budget_fairness.py && \
-.venv/bin/python tests/test_ring_exhaustion_backoff.py && \
-.venv/bin/python tests/test_budget_resource_reclaim.py && \
-.venv/bin/python tests/test_budget_capped_evidence.py && \
-.venv/bin/python tests/test_provider_frame_robustness.py && \
-.venv/bin/python tests/test_probe_conversation_gc.py && \
-.venv/bin/python tests/test_credential_renewal_discrimination.py && \
-.venv/bin/python tests/test_login_sweep.py && \
-.venv/bin/python tests/test_health_truthfulness.py && \
-.venv/bin/python tests/test_concurrency_soak.py && \
-.venv/bin/python tests/test_unconfigured_credentials.py
+# Run ALL suites. A glob, not a hand-kept list: the list used to omit 13 of the
+# 76 files (measured) -- including tests/test_report_read_only.py, the runtime
+# tripwire that found the read-endpoint write bug -- because every new suite had
+# to be remembered in two places. The exit status is the only verdict.
+fail=0
+for f in tests/test_*.py; do
+  .venv/bin/python "$f" >/tmp/$(basename "$f").log 2>&1 || { echo "FAIL $f"; fail=$((fail+1)); }
+done
+echo "failures: $fail / $(ls tests/test_*.py | wc -l)"   # must print 0
+
 # Run individual test files
 .venv/bin/python tests/test_providers.py   # Provider protocols, SSE chunk parsing, and PoW wasm loading
 .venv/bin/python tests/test_server.py      # Server routing, OpenAI/Anthropic error transformation, and SSE streaming
@@ -183,6 +129,13 @@ Tests are standalone Python scripts using mocked transports (completely offline,
 .venv/bin/python tests/test_health_truthfulness.py # [HEALTH-TRUTH] `/health` was the third place claiming a capability the dispatcher does not have: it returned `"status": "ok"` unconditionally, so a fresh clone (`session/` empty, all five nodes `offline`/unconfigured) advertised a gateway that cannot serve a single request. Measured: HTTP 200 / `status: ok` / `qwen_configured: false … glm_configured: false` / all five `offline`. It is the only entry point operators, monitoring probes and agent setup scripts use to decide "is it up", so `ok` tells everyone to start sending requests that all end in 401 with nothing in the response pointing at the cause. Now `status` reflects **whether anything can really be served**, with `status_reason` naming the remedy (`login.py all`), `dispatchable_providers`, and a per-node `dispatchable` — and that field is derived from the **same** `evaluate_dispatch_gate()` the dispatcher asks (`configured and gate.dispatchable`), not from a second definition. This is OPT-032/033/035's defect class (a preview/dossier saying dispatchable while the boundary refuses) moved onto the readiness surface. The suite asserts the agreement as a **property over every node × state** (healthy / no-credentials / disabled) rather than enumerating scenarios, because each past drift was one missed cell; short soft coolings stay `ok` (demote-only, OPT-021's last-resort availability preserved). Pre-existing `test_healing.py:187` asserted exactly the lie (`status == "ok"` on this machine's empty `session/`) and was corrected to the new contract, not worked around.
 .venv/bin/python tests/test_concurrency_soak.py # [SOAK] The five suites above each prove one mechanism against one crafted case; this one asks whether they hold **together under load**, through the real ASGI stack with scripted upstreams and zero network. Measured: a 14-request ring soak peaks per node at qwen 3 / doubao 5 / glm 4 / deepseek 1 / kimi 1 — all ≤ their configured `PROVIDER_RISK_SPECS` limits, spread across all five (a single-node soak with qwen alone peaks at **exactly 3**, its limit; below 3 would mean no concurrency happened at all, so the assertion is two-sided). A 3×12 disconnect storm returns every resource every round — 36 upstream streams opened, node semaphores value-for-value, `LB=0`, `inflight=0`, **no accumulation across rounds**. Keepalive at 0.35 s of upstream silence emits 12 `: keepalive` frames and the payload `['a','b','c']` survives intact and ordered. Singleflight fanout with one slow follower detaches it while the leader stays unstalled (0.62 s). **Two harness requirements worth recording, both of which produced a false reading first**: requests must be **staggered**, because `select_route` reads LB `active_concurrency` acquired *after* `execute_chat`, so same-tick requests all see 0 and pile onto one node (the first version put all 14 on qwen); and each case needs its **own event loop**, because `asyncio.Semaphore` binds on first use — the global router's semaphores bind in case 1 and case 2 then raises `bound to a different event loop`, surfaced as a 502 that cools the node and poisons later measurements.
 .venv/bin/python tests/test_unconfigured_credentials.py # [DAY-ZERO] The state every new user hits first: after `git clone`, `session/` is empty but the gateway starts, and `_make_provider` raises a **local** `ProviderError(status=401, err_type="auth_error")` ("未检测到 Qwen 令牌…"). `execute_chat` only reads `exc.status`, so a conclusion that never left the machine was handed to `record_failure` as an upstream HTTP 401 — the heaviest, most patient tier there is (`auth`: 1800s × 2ⁿ, capped 24h). Measured: one agent-CLI retry (real `claude -p` issues 7 in 40s) puts all five nodes into 30-minute auth avoidance with **zero upstream calls**. The worse half is a self-lock: `note_auth_failure()` writes no fingerprint record when the credential file is *absent*, so OPT-026's renewal release (`renewed_providers()`, which only scans recorded nodes) can never find the node — the operator runs the `login.py` the gateway itself told them to run, and nothing is released. The suite pins the four things that must hold together: no ledger entry / no probation episode / no ring-wide outage trip; the node is still **not dispatchable** (a guard against fixing it into "unconfigured = healthy"); the avoidance is **not** the `auth` tier (`< 600s` — a threshold deliberately in the vacuum band, since 1800 reads back as 1799.9 and `< 1800` would pass with the defect present, the OPT-031 trap); and adding a credential file immediately restores the node. The E2E case drives the real ASGI stack and asserts **state** (ledger count, worst cooldown), not the tripwire's construction count — construction is purely local, so counting it would be [M1]'s "an assertion about a window that is not the window the code protects". Measured RED pre-fix: one request → 3 ledger entries (qwen/glm/doubao) + ring-wide outage tripped.
+.venv/bin/python tests/test_dispatcher.py  # Agent task dispatch, acceptance evaluation, and the read-vs-action endpoint split (persist only on state transitions)
+.venv/bin/python tests/test_folding_fidelity.py # [TOOL-LOOP] History folding may only shorten, never rewrite: success/failure markers, call fences immune, speaker preserved
+.venv/bin/python tests/test_load_balancer.py # Cold/hot dynamic load balancing, sliding-window metrics, and adaptive demotion
+.venv/bin/python tests/test_prompt_cache.py # Prompt-cache hashing stability and sensitivity to system/messages changes
+.venv/bin/python tests/test_prompt_optimizer.py # Prompt optimizer folding ladder and token-budget behaviour
+.venv/bin/python tests/test_risk_avoidance.py # Risk-interception avoidance and adaptive traffic shaping
+
 ```
 
 ### Official Claude Code CLI & Codex CLI Integration
