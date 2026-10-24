@@ -332,6 +332,8 @@ class SessionRecorder:
         self.key = key
         self.seen: list = []
         self.served: list = []
+        # 上游为每一轮交回的会话 id（新建时由上游自己生成，续聊时原样交回）
+        self.returned: list = []
 
     def __call__(self, pkey, client=None, **kw):
         provider = self
@@ -340,7 +342,12 @@ class SessionRecorder:
             async def chat(_self, messages, model, conversation_id=None, **kw):
                 provider.seen.append(conversation_id)
                 provider.served.append((provider.key, conversation_id, list(messages)))
-                yield "ok", {"conversation_id": conversation_id or "upstream_new_conv"}
+                # 每次新建会话都给一个**不同**的 id：如果所有新建会话都返回同一个
+                # 字符串，父线程与子 agent 的上游会话 id 会天然相等，「子 agent 没有
+                # 继承父线程的会话」就无从判断（断言会因为桩件的巧合而恒真）。
+                conv = conversation_id or f"upstream_conv_{len(provider.seen)}"
+                provider.returned.append(conv)
+                yield "ok", {"conversation_id": conv}
 
             async def delete_conversation(_self, *a, **kw):
                 provider.served.append(("delete", a, None))
@@ -431,6 +438,26 @@ def test_responses_honours_codex_client_metadata_thread_identity():
         assert recorder.seen[2] is None, (
             f"子 agent 的第一轮不该复用父线程的上游会话 id: {recorder.seen[2]!r}"
         )
+        child_conv = recorder.returned[2]  # 子 agent 第一轮拿到的那条上游会话 id
+        assert child_conv != (second_conv or "upstream_new_conv"), (
+            "子 agent 与父线程拿到了同一个上游会话 id: "
+            f"{child_conv!r} == {second_conv!r}"
+        )
+
+        # 子 agent 的第二轮必须粘到**自己**那条会话上，而不是父线程的
+        r3b = _post(child_thread, "child follow-up")
+        assert r3b.status_code == 200, r3b.text
+        assert r3b.headers.get("x-session-affinity") == "bound", (
+            "子 agent 的第二轮没有粘住自己的会话（两条对话线都必须各自独立）: "
+            f"{r3b.headers.get('x-session-affinity')!r}"
+        )
+        assert recorder.seen[3], (
+            f"子 agent 第二轮没有续用自己的上游会话: {recorder.seen[3]!r}"
+        )
+        assert recorder.seen[3] == child_conv, (
+            "子 agent 第二轮续用的上游会话不是它自己第一轮那条: "
+            f"{recorder.seen[3]!r} != {child_conv!r}"
+        )
 
         # --- 父线程不受子 agent 影响，仍然续用自己那条会话
         r4 = _post(parent_thread, "third question")
@@ -439,9 +466,9 @@ def test_responses_honours_codex_client_metadata_thread_identity():
             "子 agent 的请求打断了父线程的粘滞——父子并发是真实 Codex 的常态。"
             f"实际: {r4.headers.get('x-session-affinity')!r}"
         )
-        assert recorder.seen[3] == second_conv, (
+        assert recorder.seen[4] == second_conv, (
             "父线程续用的上游会话 id 变了（被另一条会话线覆盖）: "
-            f"{recorder.seen[3]!r} != {second_conv!r}"
+            f"{recorder.seen[4]!r} != {second_conv!r}"
         )
     finally:
         srv._make_provider = orig_make_provider
