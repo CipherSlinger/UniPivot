@@ -22,6 +22,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+# [OPT-019] 隔离运行：真实 reports/ 与 session/ 目录不得被测试写入。
+# 本套件的集成用例会走 `/v1/tasks/evaluation`——那是一个**动作**接口，落盘是它的
+# 正常行为；不隔离的话每跑一次测试就把三个被跟踪的报告文件写脏。
+os.environ["TESTING"] = "1"
+
 from fastapi.testclient import TestClient
 
 from healing.agent_runner import AgentInfo, find_agent_cli

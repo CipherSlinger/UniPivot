@@ -14,6 +14,7 @@ import json
 import logging
 import os
 import sys
+import tempfile
 import time
 import uuid
 from dataclasses import asdict, dataclass, field
@@ -55,6 +56,18 @@ class TaskEvaluator:
 
     def __init__(self, project_root: Optional[Path] = None):
         self.project_root = project_root or PROJECT_ROOT
+        # 落盘位置必须跟着注入的根目录走：此前 `generate_report()` 用的是模块级
+        # `REPORTS_DIR`，`project_root` 只是个装饰品——诚实性完全依赖调用方恰好
+        # 在 patch() 里跑。见 `tests/test_report_read_only.py`。
+        #
+        # [OPT-019] 同一类缺口的另一半：`TESTING=1` 下落到临时目录，否则一条
+        # 走 `/v1/tasks/evaluation` 的集成用例每跑一次就把三个被跟踪的文件写脏。
+        # 注入 `project_root` 的调用方（含需要断言落盘的用例）不受影响——
+        # 显式注入永远优先，临时目录只接管「本来会写进开发者检出」的那一格。
+        if project_root is None and os.getenv("TESTING") == "1":
+            self.reports_dir = Path(tempfile.mkdtemp(prefix="gateway_reports_"))
+        else:
+            self.reports_dir = self.project_root / "reports"
 
     async def run_regression_tests(self) -> Tuple[bool, str]:
         """运行本地核心测试集以确保项目无回归破损。"""
@@ -148,9 +161,11 @@ class TaskEvaluator:
         self,
         tasks: Optional[List[TaskResult]] = None,
         model_metrics: Optional[Dict[str, Dict[str, Any]]] = None,
+        persist: bool = True,
     ) -> Dict[str, Any]:
         """评估本项目优化空间，并输出《项目优化空间与迭代需求建议书》（JSON + Markdown）。"""
-        REPORTS_DIR.mkdir(parents=True, exist_ok=True)
+        reports_dir = self.reports_dir
+        reports_dir.mkdir(parents=True, exist_ok=True)
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
         # 默认收集或分析的基础模型度量
@@ -606,20 +621,21 @@ class TaskEvaluator:
         md_content = "\n".join(md_lines)
 
         # 持久化文件
-        json_path = REPORTS_DIR / "optimization_recommendations.json"
-        proposal_json_path = REPORTS_DIR / "optimization_proposal.json"
-        md_path = REPORTS_DIR / "optimization_recommendations.md"
+        json_path = reports_dir / "optimization_recommendations.json"
+        proposal_json_path = reports_dir / "optimization_proposal.json"
+        md_path = reports_dir / "optimization_recommendations.md"
 
-        try:
-            with open(json_path, "w", encoding="utf-8") as f:
-                json.dump(report_data, f, ensure_ascii=False, indent=2)
-            with open(proposal_json_path, "w", encoding="utf-8") as f:
-                json.dump(report_data, f, ensure_ascii=False, indent=2)
-            with open(md_path, "w", encoding="utf-8") as f:
-                f.write(md_content)
-            logger.info("优化建议书已生成: %s, %s, %s", json_path, proposal_json_path, md_path)
-        except Exception as e:
-            logger.error("持久化优化建议书失败: %s", e)
+        if persist:
+            try:
+                with open(json_path, "w", encoding="utf-8") as f:
+                    json.dump(report_data, f, ensure_ascii=False, indent=2)
+                with open(proposal_json_path, "w", encoding="utf-8") as f:
+                    json.dump(report_data, f, ensure_ascii=False, indent=2)
+                with open(md_path, "w", encoding="utf-8") as f:
+                    f.write(md_content)
+                logger.info("优化建议书已生成: %s, %s, %s", json_path, proposal_json_path, md_path)
+            except Exception as e:
+                logger.error("持久化优化建议书失败: %s", e)
 
         report_data["markdown_report"] = md_content
         report_data["report_paths"] = {
@@ -641,9 +657,12 @@ class TaskDispatcher:
     ):
         self.port = port
         self.gateway_api_key = gateway_api_key
-        self.project_root = project_root or PROJECT_ROOT
         self.tasks: Dict[str, TaskResult] = {}
-        self.evaluator = TaskEvaluator(self.project_root)
+        # 把**原始参数**交给评估器：由它一处决定「显式注入优先、TESTING=1 落临时目录、
+        # 否则跟随 project_root」。这里先解析成 PROJECT_ROOT 会把「调用方没注入」
+        # 伪装成「调用方注入了一个具体目录」，临时目录那一格就永远不会命中。
+        self.evaluator = TaskEvaluator(project_root)
+        self.project_root = self.evaluator.project_root
         self._ensure_dirs()
 
     def _ensure_dirs(self) -> None:

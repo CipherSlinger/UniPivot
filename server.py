@@ -1492,10 +1492,17 @@ async def dispatch_rd_task(req: DispatchTaskRequest):
 
 @app.get("/v1/tasks/evaluation")
 @app.get("/tasks/evaluation")
-@app.get("/v1/reports/latest")
-@app.get("/reports/latest")
 async def get_tasks_evaluation():
-    """获取最新成果验收与优化空间评估报告（包含 JSON 度量与 Markdown 建议书）。"""
+    """获取最新成果验收与优化空间评估报告（包含 JSON 度量与 Markdown 建议书）。
+
+    注意：`/v1/reports/latest` **不**在这里注册。它曾同时挂在本函数和下面的
+    `get_latest_optimization_report` 上，先注册的赢，于是后者（先读快照、
+    没有才生成——本身就是只读契约）成了够不着的死代码，而这个动作接口
+    反而抢走了读路径，每次 GET 都重写 `reports/` 下三个被跟踪的文件。
+    现在两条路径各有唯一处理函数：`/v1/tasks/evaluation` 是**动作**（汇总任务并落盘），
+    `/v1/reports/latest` 是**读取**（返回快照，绝不写）。见
+    `tests/test_report_read_only.py::test_each_report_path_has_exactly_one_handler`。
+    """
     report = task_dispatcher.get_latest_evaluation_report()
     return JSONResponse(report)
 
@@ -2057,9 +2064,19 @@ async def get_latest_optimization_report():
             except Exception:
                 pass
 
-    evaluator = TaskEvaluator()
-    report = evaluator.evaluate_optimization_opportunities()
+    report = await _generate_optimization_report(TaskEvaluator())
     return JSONResponse(report)
+
+
+# 报告生成是纯 CPU 的字典拼装（实测中位 4.11 ms / 次），外加三次同步文件写入。
+# 它挂在**读**接口上，所以不能占用事件循环——放进工作线程，判据见
+# `tests/test_report_read_only.py::test_report_generation_runs_off_the_event_loop`。
+async def _generate_optimization_report(evaluator):
+    import anyio
+
+    return await anyio.to_thread.run_sync(
+        lambda: evaluator.evaluate_optimization_opportunities(persist=False)
+    )
 
 
 @app.get("/")
