@@ -218,6 +218,57 @@ def test_long_description_is_truncated():
     print("test_long_description_is_truncated: PASSED")
 
 
+def test_tool_preconditions_survive_into_the_prompt():
+    """工具**自身**描述里写的前提条件必须到达模型——不能只留首行。
+
+    旧实现是 `description.strip().split("\\n")[0][:200]`：取首行、截 200 字。
+    但真实声明的首行是**标题**（`# Edit`、`# SendMessage`），前提条件全在第二行
+    往后。实测真实 20 工具抓包（`tests/fixtures/claude_code_20_tools.json`）：
+
+        SendMessage 4259 -> 13      Edit 360 -> 44      Bash 1096 -> 47
+
+    于是 `Edit` 的那句「You must Read the file in this conversation before editing,
+    or the call will fail」整句消失。网关不做参数校验，提示词是模型唯一的契约，
+    所以这不是排版问题：模型被告知调用 `Edit`，却没被告知调用它的前提。
+
+    这条用例读**真实抓包**而不是手写样例：手写样例只会证明"我写的这条能过"。
+    """
+    from pathlib import Path as _P
+
+    fixture = _P(__file__).resolve().parent / "fixtures" / "claude_code_20_tools.json"
+    tools = json.loads(fixture.read_text(encoding="utf-8"))
+    text = format_tools_system_prompt(tools)
+
+    # 前提条件句——每一句都在真实声明里、都在首行之后，都必须真的送到模型面前。
+    for probe in (
+        "You must Read the file in this conversation before editing",   # Edit
+        "must be an absolute path",                                      # Read
+        "Overwriting an existing file you haven't Read will fail",       # Write
+        "Working directory persists between",                            # Bash
+    ):
+        assert probe in text, f"工具前提条件没有到达模型: {probe!r}"
+
+    # 且每个工具的描述不是标题后就被切断：平均长度必须远超旧的 200 字上限。
+    assert len(text) > 20000, f"工具提示词仍然过短（{len(text)}），可疑"
+    print("test_tool_preconditions_survive_into_the_prompt: PASSED")
+
+
+def test_description_truncation_is_announced_not_silent():
+    """超长描述被截断时，必须以可见方式标注，而不是让模型以为描述到此为止。"""
+    tools = [{
+        "type": "function",
+        "function": {
+            "name": "Noisy",
+            "description": "y" * 40000,
+            "parameters": {"type": "object", "properties": {}},
+        },
+    }]
+    text = format_tools_system_prompt(tools)
+    assert "y" * 40000 not in text, "40000 字符的工具描述未被截断（提示词无界）"
+    assert "chars)" in text, "截断没有标注，模型会以为描述到此为止"
+    print("test_description_truncation_is_announced_not_silent: PASSED")
+
+
 # ------------------------------------------------- 6. 第二份指令拷贝已删除
 
 def test_duplicate_instruction_block_is_gone():
@@ -492,6 +543,8 @@ def run_all():
         test_tool_choice_directives,
         test_responses_flat_tool_choice_is_enforced,
         test_long_description_is_truncated,
+        test_tool_preconditions_survive_into_the_prompt,
+        test_description_truncation_is_announced_not_silent,
         test_duplicate_instruction_block_is_gone,
         test_oversized_tool_set_degrades_gracefully,
         test_schema_budget_does_not_silently_drop_required_param_semantics,

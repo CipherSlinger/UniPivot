@@ -268,6 +268,49 @@ _TOOL_SCHEMA_DESCRIPTION_LADDER = (
     (80, 0),
     (0, 0),                                  # 只留结构，描述全压掉
 )
+
+# [TOOL-SCHEMA] 工具**自身**描述的额度阶梯（与上表的「参数描述」是两个不同的字段）。
+#
+# 旧实现只有一条规则：`description.strip().split("\n")[0][:200]` —— 取首行、截 200 字。
+# 但真实声明的首行是**标题**而不是内容：`# SendMessage`、`# Edit`，真正的前提条件
+# 写在第二行往后。实测真实 20 工具抓包（`tests/fixtures/claude_code_20_tools.json`）：
+#
+#   SendMessage  4259 -> 13      Skill  1416 -> 15      Bash 1096 -> 47
+#   Edit 里那句「You must Read the file in this conversation before editing, or the
+#   call will fail」**整句消失**；Read 的「file_path must be an absolute path」同理。
+#
+# 也就是说，模型被要求遵守的前提条件，恰恰是被固定截断丢掉的那部分——而模型没有
+# 任何其他途径知道它们（网关不做参数校验，提示词就是唯一契约）。总量并不大：
+# 首行截断合计 2078 字符，完整描述（压掉换行空白）28022 字符，13.5 倍；而这是
+# **整份系统提示词**里信息密度最高的一段。
+#
+# 与参数描述一样按预算分档，而不是按位置：整份提示词"刚好装得下"的最轻一档。
+_TOOL_DESC_BUDGET = 20000
+
+
+def _normalize_tool_description(text: str) -> str:
+    """把多行描述压成一段：`- ` 列表项之间用 `; `，其余空白并成单个空格。
+
+    保留全部句子，只去掉排版空白。首行标题（`# SendMessage`）也保留——它是工具
+    自述的名字，放在最前面读起来仍然通顺。
+    """
+    parts = [seg.strip() for seg in str(text or "").split("\n")]
+    segs = [p for p in parts if p]
+    out = "; ".join(segs)
+    return " ".join(out.split())
+
+
+def _cap_tool_description(text: str, cap: Optional[int]) -> str:
+    """按额度截断，并**显式标注**截断（`…`）——静默截断会让模型以为描述到此为止。"""
+    norm = _normalize_tool_description(text)
+    if cap is None or len(norm) <= cap:
+        return norm
+    dropped = len(norm) - cap
+    return norm[:cap].rstrip() + f" …(+{dropped} chars)"
+
+
+# (工具描述上限)；None = 不截断（只做空白归一）。按需逐档收紧，保证有界。
+_TOOL_DESC_LADDER = (None, 2000, 800, 400, 160, 40)
 # 字面量键：其值是**数据**而非子 schema，必须原样保留、不得递归裁剪。
 _TOOL_SCHEMA_LITERAL_KEYS = ("default", "const", "enum", "examples")
 
@@ -738,11 +781,11 @@ def format_tools_system_prompt(
         if t.get("type") == "function" and "function" in t and isinstance(t["function"], dict):
             fn = t["function"]
             name = fn.get("name", "")
-            desc = (fn.get("description", "") or "").strip().split("\n")[0][:200]
+            raw_desc = fn.get("description", "") or ""
             schema = fn.get("parameters", {}) or {}
         else:
             name = t.get("name", "")
-            desc = (t.get("description", "") or "").strip().split("\n")[0][:200]
+            raw_desc = t.get("description", "") or ""
             schema = t.get("input_schema", {}) or t.get("parameters", {}) or {}
             # [TOOL-LOOP] Responses 的 custom / freeform 声明（`{"type":"custom",
             # "name":"apply_patch"}`）**没有 schema**，原先落到这里就是一个空
@@ -751,8 +794,8 @@ def format_tools_system_prompt(
             # 原文。合成 schema 让「怎么传原文」变成显式契约，而不是靠模型猜。
             if not schema and t.get("type") in _FREEFORM_TOOL_DECL_TYPES:
                 schema = freeform_tool_input_schema()
-                if not desc:
-                    desc = "Freeform tool: pass its complete raw input text in the `input` field."
+                if not raw_desc:
+                    raw_desc = "Freeform tool: pass its complete raw input text in the `input` field."
 
         # [TOOL-LOOP] 没有名字的声明**不可能被调用**：模型写不出调用名，
         # `tool_names_of` 也不会把它放进白名单。真实 Codex 请求里恰好有两个这样的
@@ -766,11 +809,11 @@ def format_tools_system_prompt(
         if not isinstance(name, str) or not name.strip():
             # 说明行同样要受预算约束：客户端可以声明任意多个无名条目，而这段文本
             # 是要送进上下文的。超出上限后只计数，不再追加。
-            note = _nameless_tool_note(t, desc)
+            note = _nameless_tool_note(t, _normalize_tool_description(raw_desc))
             if note and len(nameless_notes) < _NAMELESS_TOOL_NOTE_LIMIT:
                 nameless_notes.append(note)
             continue
-        callable_tools.append((name.strip(), desc, schema))
+        callable_tools.append((name.strip(), raw_desc, schema))
 
     # 第二遍：选档。取「整体刚好装进预算」的最轻压缩档；所有工具**同一档**渲染。
     # 一档都装不下（>=40 个巨型工具）时才退回紧凑摘要兜底，保证提示词仍有界。
@@ -785,15 +828,29 @@ def format_tools_system_prompt(
             tier = (required_cap, other_cap)
             break
 
+    # 工具**自身**描述选档：与 schema 参数描述同一条纪律——按整份提示词的预算
+    # 取「刚好装得下」的最轻一档，而不是按位置拍一个常数。旧实现固定「首行 + 200
+    # 字」，对真实抓包等于丢掉 13.5 倍的前提条件，见 _TOOL_DESC_LADDER 的实测。
+    desc_cap: Optional[int] = _TOOL_DESC_LADDER[0]
+    for cand in _TOOL_DESC_LADDER:
+        desc_total = sum(
+            len(_cap_tool_description(d, cand)) for _, d, _ in callable_tools
+        )
+        if desc_total <= _TOOL_DESC_BUDGET:
+            desc_cap = cand
+            break
+
     if tier is None:
         # 病态集合：结构保真也装不下，退回紧凑摘要（每个工具仍保留名字与类型骨架）。
         for name, desc, schema in callable_tools:
-            rendered.append(f"- `{name}({_compact_args_summary(schema)})`: {desc}")
+            summary_desc = _cap_tool_description(desc, desc_cap)
+            rendered.append(f"- `{name}({_compact_args_summary(schema)})`: {summary_desc}")
     else:
         required_cap, other_cap = tier
         for name, desc, schema in callable_tools:
             schema_json = _render_schema_json_capped(
                 schema, required_cap=required_cap, other_cap=other_cap)
+            desc = _cap_tool_description(desc, desc_cap)
             rendered.append(f"- `{name}`: {desc}\n  Args: {schema_json}")
 
     lines.extend(rendered)
