@@ -165,7 +165,9 @@ class TaskEvaluator:
     ) -> Dict[str, Any]:
         """评估本项目优化空间，并输出《项目优化空间与迭代需求建议书》（JSON + Markdown）。"""
         reports_dir = self.reports_dir
-        reports_dir.mkdir(parents=True, exist_ok=True)
+        # 建目录也是写副作用：`persist=False` 的纯计算调用（读接口）连目录都不该建。
+        if persist:
+            reports_dir.mkdir(parents=True, exist_ok=True)
         now_str = time.strftime("%Y-%m-%d %H:%M:%S")
 
         # 默认收集或分析的基础模型度量
@@ -809,6 +811,10 @@ class TaskDispatcher:
                     f.write(f"综合验收评估: {'成功' if eval_summary.get('overall_success') else '未通过'}\n")
                     f.flush()
 
+                # 任务到达终态 = 落盘时机的正确锚点（此时干预/成果真的变了）。
+                # 读取接口不得承担落盘：见 get_latest_evaluation_report。
+                self.persist_evaluation_report()
+
             except Exception as e:
                 logger.error("研发任务执行失败 [%s]: %s", task_id, e)
                 task.status = "failed"
@@ -818,12 +824,36 @@ class TaskDispatcher:
                 task.error_message = str(e)
                 with open(log_file, "a", encoding="utf-8") as f:
                     f.write(f"\n任务执行异常: {e}\n")
+                # 失败同样是终态：落盘一次，别让读取接口替这次跃迁买单。
+                self.persist_evaluation_report()
 
         # 启动后台非阻塞任务
         asyncio.create_task(_runner())
         return task
 
-    def get_latest_evaluation_report(self) -> Dict[str, Any]:
-        """汇总所有研发任务成果，并输出整体优化空间评估报告。"""
+    def persist_evaluation_report(self) -> Dict[str, Any]:
+        """**动作**路径：生成并落盘。只在任务状态真正变化时调用。
+
+        `evaluate_optimization_opportunities()` 的内容完全由代码常量决定
+        （`tasks` 参数收下了却从未被读），所以「报告变了」与「任务状态变了」
+        是同一件事——落盘应当挂在状态跃迁上（任务终态、手工触发），而不是挂在
+        `GET /v1/tasks/evaluation` 上。见 `get_latest_evaluation_report` 的说明。
+        """
         all_tasks = list(self.tasks.values())
-        return self.evaluator.evaluate_optimization_opportunities(tasks=all_tasks)
+        return self.evaluator.evaluate_optimization_opportunities(tasks=all_tasks, persist=True)
+
+    def get_latest_evaluation_report(self) -> Dict[str, Any]:
+        """**读取**路径：汇总并返回，绝不写盘。
+
+        这个函数此前调用 `evaluate_optimization_opportunities()` 时用了默认的
+        `persist=True`，于是 `GET /v1/tasks/evaluation` 每次调用都重写
+        `reports/` 下三个被 git 跟踪的文件——和 `/v1/reports/latest` 完全同一个
+        缺陷，只是藏得更深（`GET` 处理函数 -> 本函数 -> 评估器，三层）。运行时
+        跳闸器一请求就抓到了它，而按调用图静态扫描两次都没抓到。
+
+        重新生成而**不落盘**是有意为之：`reports/` 里的快照可能来自另一个进程
+        （重启后内存里的 `tasks` 是空的），此时读取当前进程内存重新生成，比返回
+        一份过期快照更诚实；落盘仍由状态跃迁负责。
+        """
+        all_tasks = list(self.tasks.values())
+        return self.evaluator.evaluate_optimization_opportunities(tasks=all_tasks, persist=False)

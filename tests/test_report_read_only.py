@@ -242,6 +242,132 @@ def test_evaluator_writes_under_its_own_project_root():
     print("test_evaluator_writes_under_its_own_project_root: PASSED")
 
 
+# ------------------------------- 5. 更一般的形式：GET 处理函数不得写盘
+
+def test_no_get_route_writes_to_disk_at_runtime():
+    """运行时地面真相：**任何** GET 路由都不得写盘——无论写在多少层之下。
+
+    这条用例的前身是静态可达性分析（从 GET 处理函数顺着调用图往下找写操作），
+    它有两个致命的近似误差，合起来正好把它变成一条**会说谎**的断言：
+
+    1. **假阴性**：第一版只扫处理函数体，而修复前的写动作藏在两层之下
+       （`get_tasks_evaluation` -> `TaskDispatcher.get_latest_evaluation_report`
+       -> `TaskEvaluator.evaluate_optimization_opportunities`），于是修复前的代码
+       直接通过——为「防止读接口写盘」而写的用例，对那个真实的写盘无感。
+    2. **假阳性**：改成按调用图解析后，它按**名字**匹配，`dict.get()` 被当成了
+       `DeviceIdentityStore.get`（一个确实会落盘的 mint-once 方法），于是报告
+       `/v1/admin/dispatch-audit` 在写盘——实测该接口只读，是被冤枉的。
+
+    静态分析在这里本质上是在猜「代码会做什么」，而这件事可以直接观测：把写
+    原语（`open` 的写模式、`Path.write_text/bytes`、`json.dump`、`os.replace`、
+    `mkdir`）全部挂上跳闸器，然后**真的**把每个无参 GET 路由请求一遍。写一次
+    即失败，并打印是哪条路由、哪个调用点写的。
+
+    这是本缺陷的一般形式：写动作可以藏在任意深度，而运行时观测不需要知道它在哪。
+    """
+    import builtins
+    import io
+    import json as _json
+
+    ROOT = Path(__file__).resolve().parent.parent
+    _orig_io_open = io.open
+    _orig_builtins_open = builtins.open
+    _orig_dump = _json.dump
+    _orig_replace = os.replace
+    _orig_mkdir = Path.mkdir
+    _orig_write_text = Path.write_text
+    _orig_write_bytes = Path.write_bytes
+
+    writes: list = []
+    active = {"on": False}
+
+    def _note(what: str, target) -> None:
+        if not active["on"]:
+            return
+        import traceback
+
+        frames = [
+            f"{Path(f.filename).name}:{f.lineno}:{f.name}"
+            for f in traceback.extract_stack()[:-2]
+            if "site-packages" not in f.filename and "/tests/" not in f.filename
+        ]
+        writes.append(f"{what} -> {target} @ {' <- '.join(frames[-3:][::-1])}")
+
+    def _guard_open(file, mode="r", *a, **kw):
+        if any(c in str(mode) for c in "wxa+"):
+            _note(f"open(mode={mode!r})", file)
+        return _orig_io_open(file, mode, *a, **kw)
+
+    def _guard_builtins_open(file, mode="r", *a, **kw):
+        if any(c in str(mode) for c in "wxa+"):
+            _note(f"builtins.open(mode={mode!r})", file)
+        return _orig_builtins_open(file, mode, *a, **kw)
+
+    def _guard_dump(obj, fp, *a, **kw):
+        _note("json.dump", getattr(fp, "name", fp))
+        return _orig_dump(obj, fp, *a, **kw)
+
+    def _guard_replace(src, dst, *a, **kw):
+        _note("os.replace", dst)
+        return _orig_replace(src, dst, *a, **kw)
+
+    def _guard_mkdir(self, *a, **kw):
+        _note("mkdir", self)
+        return _orig_mkdir(self, *a, **kw)
+
+    def _guard_write_text(self, *a, **kw):
+        _note("Path.write_text", self)
+        return _orig_write_text(self, *a, **kw)
+
+    def _guard_write_bytes(self, *a, **kw):
+        _note("Path.write_bytes", self)
+        return _orig_write_bytes(self, *a, **kw)
+
+    patched = {
+        (io, "open"): _guard_open,
+        (builtins, "open"): _guard_builtins_open,
+        (_json, "dump"): _guard_dump,
+        (os, "replace"): _guard_replace,
+        (Path, "mkdir"): _guard_mkdir,
+        (Path, "write_text"): _guard_write_text,
+        (Path, "write_bytes"): _guard_write_bytes,
+    }
+    for (mod, attr), fn in patched.items():
+        setattr(mod, attr, fn)
+
+    client = TestClient(srv.app)
+    probed, skipped_param = [], []
+    try:
+        active["on"] = True
+        for route in srv.app.routes:
+            path = getattr(route, "path", None)
+            methods = getattr(route, "methods", None) or set()
+            if path is None or "GET" not in methods:
+                continue
+            if "{" in path:  # 需要路径参数的路由另算，避免把 404 当成读路径
+                skipped_param.append(path)
+                continue
+            client.get(path, follow_redirects=False)
+            probed.append(path)
+    finally:
+        active["on"] = False
+        io.open = _orig_io_open
+        builtins.open = _orig_builtins_open
+        _json.dump = _orig_dump
+        os.replace = _orig_replace
+        Path.mkdir = _orig_mkdir
+        Path.write_text = _orig_write_text
+        Path.write_bytes = _orig_write_bytes
+
+    assert not writes, (
+        f"GET 路由在写盘（读接口不得产生写副作用）: "
+        + "; ".join(dict.fromkeys(writes))
+    )
+    assert "/v1/reports/latest" in probed, f"未探测到核心读接口，用例失效: {probed}"
+    print(f"test_no_get_route_writes_to_disk_at_runtime: PASSED "
+          f"({len(probed)} GET routes probed, {len(skipped_param)} need path params)")
+
+
 def _evaluator_cls():
     from healing.task_dispatcher import TaskEvaluator
     return TaskEvaluator
@@ -254,6 +380,7 @@ def run_all():
         test_absent_snapshot_is_generated_once_not_persisted,
         test_report_generation_runs_off_the_event_loop,
         test_no_path_is_registered_twice,
+        test_no_get_route_writes_to_disk_at_runtime,
         test_evaluator_writes_under_its_own_project_root,
     ]
     for fn in tests:
