@@ -416,6 +416,36 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
         if not res["has_tools_section"]:
             failures.append(f"{name}: its upstream prompt carried no tool contract")
 
+    # [SESSION-ID] Two sessions of one binary MUST end up in two different
+    # upstream conversations, and each must stay in its own. The scripted
+    # upstream used to answer a literal "c1" for every conversation, which made
+    # this unobservable: "both sessions reuse their own" and "both share one"
+    # produced byte-identical logs (measured: 8 bodies, 2 sessions, all `c1`).
+    served = [b.get("served_conv") for b in bodies_all if b.get("served_conv")]
+    fresh = [b for b in bodies_all if not b.get("conversation_id")]
+    if args.rounds > 1:
+        if len(fresh) > len(names):
+            failures.append(
+                f"{len(names)} sessions started {len(fresh)} upstream conversations "
+                "— a session lost its conversation partway through"
+            )
+        if len(set(served)) < len(names):
+            failures.append(
+                f"{len(names)} sessions were served by only {len(set(served))} upstream "
+                f"conversation(s) {sorted(set(served))} — their contexts bleed into each other"
+            )
+        # Every continuation must carry the tool result of the turn it continues.
+        # Round-one bodies have none by definition, so they are excluded by the
+        # same predicate that identifies them: no incoming conversation id.
+        blind = [i for i, b in enumerate(bodies_all)
+                 if b.get("conversation_id") and not b.get("payload_has_tool_result")]
+        if blind:
+            failures.append(
+                f"{len(blind)} continuation request(s) reached upstream without the tool "
+                f"result (body indices {blind}) — the model was asked to continue a loop "
+                "whose result it never saw"
+            )
+
     seq, switches = _alternation(bodies_all)
     print("\n================ E2E VERDICT (same binary, N sessions) ================")
     for r in results:
@@ -426,7 +456,8 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
               and r["has_tools_section"])
         print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
               f"(rounds={len(r['markers'])}/{r['rounds_expected']})")
-    print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary")
+    print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary, "
+          f"{len(set(served))} distinct upstream conversation(s)")
     for f in failures:
         print(f"  !! {f}")
     if not args.keep:

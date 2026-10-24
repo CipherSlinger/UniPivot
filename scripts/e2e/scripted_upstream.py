@@ -29,6 +29,7 @@ Run (the runner `run_agent_loop.py` does this for you):
 
 from __future__ import annotations
 
+import itertools
 import json
 import os
 import re
@@ -266,6 +267,11 @@ def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
     return "no_such_tool", {}
 
 
+# Distinct ids for distinct conversations. `itertools.count` is safe here: the
+# mint happens synchronously inside one event loop.
+_MINTED = itertools.count(1)
+
+
 class LoopProvider:
     """Serves round 1 (tool call) and round 2 (final answer) from the same state."""
 
@@ -275,6 +281,18 @@ class LoopProvider:
     async def chat(self, messages, model, **kw):
         prompt = _flatten(messages)
         chosen = _pick_declared_tool(prompt)
+
+        # [MOUNT] A real upstream MINTS a conversation id and hands it back; the
+        # gateway reuses it on every later turn. This stub used to answer a
+        # literal "c1" for every conversation, which made the one property the
+        # run exists to measure unobservable: with one constant id, "each
+        # session reuses its own upstream conversation" and "all sessions share
+        # one conversation" produce byte-identical evidence. Measured in
+        # `--sessions 2` mode: 8 bodies from 2 sessions, all `c1`.
+        # The counter is module-level on purpose: `LoopProvider` is constructed
+        # per request (the gateway's `_make_provider` is a factory), so a
+        # per-instance counter would hand every request the same "…_1".
+        conv = kw.get("conversation_id") or f"upstream_{self.key}_{next(_MINTED)}"
 
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -292,6 +310,11 @@ class LoopProvider:
                 # request that starts a brand-new upstream conversation looks
                 # byte-identical to one that continues it.
                 "conversation_id": kw.get("conversation_id"),
+                # The conversation this request was actually served in: the
+                # incoming id when the gateway continued one, a freshly minted
+                # one otherwise. `conversation_id` alone cannot answer "do two
+                # sessions stay apart?" because a fresh conversation logs None.
+                "served_conv": conv,
                 # [SESSION-ID] What the provider really puts on the wire: full
                 # history on a fresh conversation, only the new turn when the
                 # upstream session is reused. This is the cost the agent pays.
@@ -341,12 +364,12 @@ class LoopProvider:
                 "```tool_call\n"
                 + json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
                 + "\n```"
-            ), {"conversation_id": "c1"}
-            yield "", {"conversation_id": "c1"}
+            ), {"conversation_id": conv}
+            yield "", {"conversation_id": conv}
             return
 
-        yield "The command printed e2e-ok. Done.", {"conversation_id": "c1"}
-        yield "", {"conversation_id": "c1"}
+        yield "The command printed e2e-ok. Done.", {"conversation_id": conv}
+        yield "", {"conversation_id": conv}
 
     async def delete_conversation(self, *a, **kw):
         return None
