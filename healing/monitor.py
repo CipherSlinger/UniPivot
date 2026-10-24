@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import httpx
 
 from providers.base import ProviderError
+from providers.stream_completion import observe
 
 logger = logging.getLogger("healing.monitor")
 
@@ -45,6 +46,23 @@ class ProviderHealth:
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+
+def _schedule_probe_conversation_cleanup(
+    provider: Any, provider_key: str, conversation_id: str
+) -> None:
+    """把探针创建的临时会话交给 ConversationGC（失败也不能影响探测结果）。
+
+    [PROBE-GC] 探针是**网关自己**制造的流量，没有客户端会话可归属，所以它建的
+    上游会话必须由网关自己回收。走 GC 而不是直接 `delete_conversation`，是为了
+    沿用既有的冷却门（冷却中的节点不该被删除请求再碰一次）与跨重启持久化。
+    """
+    try:
+        from providers.conversation_gc import conversation_gc
+
+        conversation_gc.schedule(provider, provider_key, conversation_id)
+    except Exception:  # noqa: BLE001 - 清理失败绝不能让探针报「上游不健康」
+        logger.debug("探针会话 %s 的回收调度失败", conversation_id, exc_info=True)
 
 
 class HealthMonitor:
@@ -337,13 +355,50 @@ class HealthMonitor:
                 max_tokens=2,
             )
 
-            # 接收到任意数据包或正常结束即视为通道健康
-            async def _consume_first_chunk():
-                async for _delta, _meta in probe_stream:
-                    return True
+            # [PROBE-GC] 探针以 conversation_id=None 调用，上游会建一个临时会话。
+            # 之前这里只读首帧就 return，把 meta 连同 conversation_id 一起丢掉，
+            # 于是 300s × 5 节点 = 每天 1440 个「hi」对话永久留在用户侧栏——
+            # 既污染账面，又给出「每 60 秒一个 hi」的自动化时序特征。
+            #
+            # 同时把「读到首帧就算健康」改成「消费到流真正结束」：三家适配器
+            # (deepseek/doubao/glm) 的 conversation_id 在**末位**元数据帧里，
+            # 只读首帧根本拿不到它；而 has_marker 的那两家顺带给出确切的完整性
+            # 判据（`observe`，缺键 = 未知，不会误伤无标记协议）。
+            probe_conversation_id: Optional[str] = None
+            probe_complete: Optional[bool] = None
+            probe_saw_frame = False
+
+            async def _consume_stream():
+                nonlocal probe_conversation_id, probe_complete, probe_saw_frame
+                async for _delta, meta in probe_stream:
+                    probe_saw_frame = True
+                    if isinstance(meta, dict):
+                        cid = meta.get("conversation_id")
+                        if cid:
+                            probe_conversation_id = str(cid)
+                        probe_complete = observe(meta, probe_complete)
                 return True
 
-            await asyncio.wait_for(_consume_first_chunk(), timeout=15.0)
+            try:
+                await asyncio.wait_for(_consume_stream(), timeout=15.0)
+            except asyncio.TimeoutError:
+                # 五个上游都**不支持** max_tokens，提问「hi」可能换来一段长回答，
+                # 所以这里的超时不再等同于「上游没响应」：已经收到帧就说明通道
+                # 是通的，只是这一轮回答还没结束——判不健康会制造假故障。
+                if not probe_saw_frame:
+                    raise
+                logger.debug("探针超时但已收到数据帧，按健康处理: %s", name)
+                if probe_conversation_id:
+                    _schedule_probe_conversation_cleanup(
+                        provider, name, probe_conversation_id
+                    )
+                return True, None
+
+            if probe_conversation_id:
+                _schedule_probe_conversation_cleanup(provider, name, probe_conversation_id)
+            # 只有协议**真有**完成标记且没看到时才判截断；None = 未知，不惩罚。
+            if probe_complete is False:
+                return False, "探测流未收到完成标记（上游截断）"
             return True, None
         except asyncio.TimeoutError:
             return False, f"探测超时 (15s): 上游无响应"
