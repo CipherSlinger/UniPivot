@@ -191,20 +191,29 @@ def test_report_generation_runs_off_the_event_loop():
 
 # --------------------------------------- 3. 路由唯一性：同一路径不得注册两次
 
-def test_each_report_path_has_exactly_one_handler():
-    """同一个路径注册两次时，先注册的赢——后一个是死代码，且没有任何报错。
+def test_no_path_is_registered_twice():
+    """同一个 (路径, 方法) 注册两次时，先注册的赢——后一个是死代码，且没有任何报错。
 
     `get_latest_optimization_report`（先读快照、没有才生成，本身就是只读契约）
-    此前就是这样被 `get_tasks_evaluation` 完全遮住的。
+    此前就是这样被 `get_tasks_evaluation` 完全遮住的。这条断言覆盖**全部**路由，
+    不只看这两个：重复注册不会报错、不会告警，只会在某天悄悄换掉一个处理函数，
+    而唯一的征兆是「我明明改了它却不生效」。
     """
-    seen = {}
+    from collections import defaultdict
+
+    seen = defaultdict(list)
     for route in srv.app.routes:
         path = getattr(route, "path", None)
-        if path in ("/v1/reports/latest", "/reports/latest", "/v1/tasks/evaluation", "/tasks/evaluation"):
-            seen.setdefault(path, []).append(route.endpoint.__name__)
-    dupes = {p: names for p, names in seen.items() if len(names) > 1}
-    assert not dupes, f"同一路径注册了多个处理函数（后者为死代码）: {dupes}"
-    print(f"test_each_report_path_has_exactly_one_handler: PASSED ({sorted(seen)})")
+        if path is None:
+            continue
+        methods = tuple(sorted(getattr(route, "methods", None) or []))
+        seen[(path, methods)].append(route.endpoint.__name__)
+    dupes = {k: v for k, v in seen.items() if len(v) > 1}
+    assert not dupes, (
+        "同一 (路径, 方法) 注册了多个处理函数（后者永远不会被派发）: "
+        + ", ".join(f"{k[0]} {k[1]} -> {v}" for k, v in sorted(dupes.items()))
+    )
+    print(f"test_no_path_is_registered_twice: PASSED ({len(seen)} unique routes)")
 
 
 # ------------------------------------------- 4. 存储位置随注入的根目录走
@@ -244,7 +253,7 @@ def run_all():
         test_stored_snapshot_is_served_verbatim,
         test_absent_snapshot_is_generated_once_not_persisted,
         test_report_generation_runs_off_the_event_loop,
-        test_each_report_path_has_exactly_one_handler,
+        test_no_path_is_registered_twice,
         test_evaluator_writes_under_its_own_project_root,
     ]
     for fn in tests:
