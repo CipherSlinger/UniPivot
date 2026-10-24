@@ -2850,6 +2850,33 @@ class FailoverRouter:
         """
         return self.cooldown_tracker._env_float("GATEWAY_TIMEOUT_COOLDOWN", 60.0)
 
+    @staticmethod
+    def _kwargs_for_candidate(
+        chat_args: dict, primary_provider_key: str, provider_key: str
+    ) -> dict:
+        """为某个候选节点构造调用参数——关键是**上游会话 id 是节点私有的**。
+
+        [TOOL-LOOP] 故障转移是「换了一个会话空间」，与 `resolve_affinity` 的
+        handoff 分支同义，却是第二个入口：那条分支会剥离异构上游 id（M3），而这里
+        `call_kwargs = dict(chat_args)` 把原绑定节点的 id 逐字交给了每一个候选。
+
+        实测（glm 主选 429 → 改派 doubao）：doubao 收到 `conversation_id="glm-conv"`。
+        承重的不是那串字符，而是它在上游触发的分支——五家都是
+        `prompt = continuation_content(...) if conversation_id else flatten_messages(...)`，
+        非空即「续聊」，于是目标节点只收到最后一轮增量（实测 18 字符 vs 全量 83），
+        对着一个它无从续上的会话作答：一个没有报错的错答案。更糟的是随后
+        `record_turn` 会把目标节点自己返回的 id 记回**原绑定节点**名下，
+        一次改派就把粘滞关系永久污染（实测 registry: `glm / doubao-conv`）。
+
+        因此：主选节点保留 id（逐值不变），换节点时置 None，让目标节点新开上游
+        会话并展平全量历史。客户端自己的线程 id 不在此列——它从不被当作上游 id
+        传下去（见 session_affinity 的 [TOOL-LOOP] 说明）。
+        """
+        kwargs = dict(chat_args)
+        if provider_key != primary_provider_key:
+            kwargs["conversation_id"] = None
+        return kwargs
+
     async def execute_chat(
         self,
         primary_provider_key: str,
@@ -3164,7 +3191,7 @@ class FailoverRouter:
                     provider = provider_factory(provider_key)
 
                     # 3. 试探性获取首包 (确保在流交给外部客户端前捕获初始化错误与上游 4xx/5xx)
-                    call_kwargs = dict(chat_args)
+                    call_kwargs = self._kwargs_for_candidate(chat_args, primary_provider_key, provider_key)
                     call_kwargs["model"] = wire_model
 
                     raw_stream = provider.chat(**call_kwargs)

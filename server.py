@@ -54,6 +54,7 @@ from providers import (
     CapabilityRing,
     RING_DEFINITIONS,
     FailoverRouter,
+    FailoverEvent,
     AdaptiveLoadBalancer,
     BalancingDecision,
     PROVIDER_RISK_SPECS,
@@ -969,6 +970,55 @@ def _make_affinity_headers(decision: AffinityDecision) -> dict[str, str]:
     if decision.status == "degraded" and decision.provider_key:
         headers["x-session-affinity-degraded"] = decision.provider_key
     return headers
+
+
+def _affinity_record(
+    affinity_decision: AffinityDecision,
+    serving_provider: str,
+    served_conv_id: Optional[str],
+) -> tuple[str, Optional[str]]:
+    """决定把本轮的「会话归属」记在谁名下、记什么上游会话 id。
+
+    [TOOL-LOOP] 上游会话 id 是**节点私有**的：它是 `provider.conversation_id`
+    在当前账号会话空间里的一把钥匙，换一家厂商就毫无意义（对方的服务端既不认识
+    也无法续上）。而这一轮真正服务请求的节点未必就是绑定节点——有两条路径会把
+    请求送到别处：
+
+      * **短冷却降级**（M3）：绑定节点 15 秒退避中，本轮由候选节点服务，但归属
+        刻意仍留在原节点，冷却一结束就回去；
+      * **透明故障转移**（本函数存在的第二个理由）：绑定节点 429/5xx，派发循环
+        改派到同能力环的另一个节点。
+
+    两条路径的共同点是：`served_conv_id` 属于**服务本次请求的那个节点**。把它记
+    到绑定节点名下，绑定节点下一轮就会拿着一个自己不认识的外来 id 去「续聊」，
+    而 `SessionAffinityManager` 只在新值非空时覆盖、且没有任何清除接口，所以
+    一次改派就永久污染粘滞关系（实测：`glm` 名下记着 `doubao-conv`，此后每一轮
+    glm 都被喂这个外来 id）。
+
+    规则因此只有一条：**归属节点 == 服务节点，才记本轮观测到的上游 id；否则记
+    None**——None 意味着「网关没有为这个归属节点持有可回放的上游会话」，下一次
+    请求会新开一个并展平全量历史，这正是正确行为。
+    """
+    bound = affinity_decision.provider_key or serving_provider
+    if bound == serving_provider:
+        return bound, served_conv_id
+    return bound, None
+
+
+def _serving_provider(
+    affinity_decision: AffinityDecision,
+    failover_event: Optional[FailoverEvent],
+    dispatched_provider: str,
+) -> str:
+    """本轮**真实**服务的节点：绑定节点被改派时以故障转移的目标为准。
+
+    `dispatched_provider` 是派发前的初选，`failover_event.to_provider` 才是上游
+    实际应答的那一个。两者在无故障转移时相同，故障转移后必须用后者——否则归属
+    会记到一个本轮根本没被调用、甚至正处在失败冷却里的节点上。
+    """
+    if failover_event is not None and failover_event.to_provider:
+        return failover_event.to_provider
+    return dispatched_provider
 
 
 def _make_singleflight_headers(decision: SingleFlightDecision) -> dict[str, str]:
@@ -2401,6 +2451,11 @@ async def chat_completions(req: ChatCompletionRequest):
                 "response_format": req.response_format,
                 "max_tokens": req.max_tokens,
             },
+            # [SINGLEFLIGHT] 会话身份同样会改变正确答案：已绑定的会话走续聊、
+            # 只发增量，全新会话展平全量历史。两者 messages 可以逐字相同
+            # （父 agent 与它派生的子 agent 就是如此），合并即错答案。
+            session_key=req.conversation_id,
+            upstream_conv_id=affinity_decision.upstream_conv_id,
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)
@@ -2599,11 +2654,16 @@ async def chat_completions(req: ChatCompletionRequest):
                     yield "data: [DONE]\n\n"
 
                     if conversation_id:
+                        _bound, _conv = _affinity_record(
+                            affinity_decision,
+                            _serving_provider(affinity_decision, failover_event, dispatched_provider),
+                            conversation_id,
+                        )
                         session_affinity_manager.record_turn(
                             req.conversation_id or conversation_id,
-                            dispatched_provider,
+                            _bound,
                             dispatched_model,
-                            conversation_id,
+                            _conv,
                         )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -2827,20 +2887,19 @@ async def chat_completions(req: ChatCompletionRequest):
                 yield "data: [DONE]\n\n"
 
                 if conversation_id:
-                    # [M3] 若本次因原节点短冷却而改由别家服务，会话归属**不得**跟着
-                    # 改嫁：否则一次频控退避就会把长程会话永久迁到另一个厂商，导致
-                    # 上游上下文全部重建。归属仍记在原节点上，并清掉本轮观测到的
-                    # 上游会话 id（它属于服务本次请求的那个节点，不能回放给原节点）。
-                    keep_provider = (
-                        affinity_decision.provider_key
-                        if affinity_decision.status == "degraded"
-                        else dispatched_provider
+                    # [M3] 若本次因原节点短冷却或故障转移而改由别家服务，会话归属
+                    # **不得**跟着改嫁，且本轮观测到的上游 id 也不得记到原节点名下
+                    # （它属于服务本次请求的那个节点）。判据只有一处：见 `_affinity_record`。
+                    _bound, _conv = _affinity_record(
+                        affinity_decision,
+                        _serving_provider(affinity_decision, failover_event, dispatched_provider),
+                        conversation_id,
                     )
                     session_affinity_manager.record_turn(
                         req.conversation_id or conversation_id,
-                        keep_provider,
+                        _bound,
                         dispatched_model,
-                        None if affinity_decision.status == "degraded" else conversation_id,
+                        _conv,
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -2975,17 +3034,18 @@ async def chat_completions(req: ChatCompletionRequest):
             terminate_aborted_group(flight_decision.group)
 
     if conversation_id:
-        # [M3] 短冷却降级期间不迁移会话归属（见流式分支同处注释）。
-        keep_provider = (
-            affinity_decision.provider_key
-            if affinity_decision.status == "degraded"
-            else dispatched_provider
+        # [M3] 短冷却降级 / 故障转移期间不迁移会话归属，也不把本次上游 id
+        # 记到原节点名下（见流式分支同处注释，判据在 `_affinity_record`）。
+        _bound, _conv = _affinity_record(
+            affinity_decision,
+            _serving_provider(affinity_decision, failover_event, dispatched_provider),
+            conversation_id,
         )
         session_affinity_manager.record_turn(
             req.conversation_id or conversation_id,
-            keep_provider,
+            _bound,
             dispatched_model,
-            None if affinity_decision.status == "degraded" else conversation_id,
+            _conv,
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3193,6 +3253,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 "stop_sequences": req.stop_sequences,
                 "max_tokens": req.max_tokens,
             },
+            # [SINGLEFLIGHT] 会话身份决定前文在上游还是在本轮提示词里（见 chat 同处注释）。
+            session_key=client_session_id,
+            upstream_conv_id=affinity_decision.upstream_conv_id,
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)
@@ -3383,11 +3446,16 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     yield sse_message_stop()
 
                     if client_session_id or conv_id:
+                        _bound, _up = _affinity_record(
+                            affinity_decision,
+                            _serving_provider(affinity_decision, failover_event, dispatched_provider),
+                            conv_id,
+                        )
                         session_affinity_manager.record_turn(
                             client_session_id or conv_id,
-                            dispatched_provider,
+                            _bound,
                             dispatched_model,
-                            conv_id,
+                            _up,
                         )
 
                     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -3549,17 +3617,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 yield sse_message_stop()
 
                 if client_session_id or conv_id:
-                    # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
-                    keep_provider = (
-                        affinity_decision.provider_key
-                        if affinity_decision.status == "degraded"
-                        else dispatched_provider
+                    # [M3] 短冷却降级 / 故障转移期间不迁移会话归属（判据见 `_affinity_record`）。
+                    _bound, _up = _affinity_record(
+                        affinity_decision,
+                        _serving_provider(affinity_decision, failover_event, dispatched_provider),
+                        conv_id,
                     )
                     session_affinity_manager.record_turn(
                         client_session_id or conv_id,
-                        keep_provider,
+                        _bound,
                         dispatched_model,
-                        None if affinity_decision.status == "degraded" else conv_id,
+                        _up,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -3701,17 +3769,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             terminate_aborted_group(flight_decision.group)
 
     if client_session_id or conv_id:
-        # [M3] 短冷却降级期间不迁移会话归属（见 chat 流式分支同处注释）。
-        keep_provider = (
-            affinity_decision.provider_key
-            if affinity_decision.status == "degraded"
-            else dispatched_provider
+        # [M3] 短冷却降级 / 故障转移期间不迁移会话归属（判据见 `_affinity_record`）。
+        _bound, _up = _affinity_record(
+            affinity_decision,
+            _serving_provider(affinity_decision, failover_event, dispatched_provider),
+            conv_id,
         )
         session_affinity_manager.record_turn(
             client_session_id or conv_id,
-            keep_provider,
+            _bound,
             dispatched_model,
-            None if affinity_decision.status == "degraded" else conv_id,
+            _up,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4013,6 +4081,9 @@ async def responses_endpoint(req: ResponsesRequest):
                 "text": req.text,
                 "max_output_tokens": req.max_output_tokens,
             },
+            # [SINGLEFLIGHT] 会话身份决定前文在上游还是在本轮提示词里（见 chat 同处注释）。
+            session_key=client_session_id,
+            upstream_conv_id=affinity_decision.upstream_conv_id,
         )
         flight_decision = await singleflight_manager.get_or_create(flight_key)
         sf_headers = _make_singleflight_headers(flight_decision)
@@ -4367,11 +4438,16 @@ async def responses_endpoint(req: ResponsesRequest):
                 yield sse_done()
 
                 if client_session_id or conv_id:
+                    _bound, _up = _affinity_record(
+                        affinity_decision,
+                        _serving_provider(affinity_decision, failover_event, dispatched_provider),
+                        conv_id,
+                    )
                     session_affinity_manager.record_turn(
                         client_session_id or conv_id,
-                        dispatched_provider,
+                        _bound,
                         dispatched_model,
-                        conv_id,
+                        _up,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4468,11 +4544,16 @@ async def responses_endpoint(req: ResponsesRequest):
             terminate_aborted_group(flight_decision.group)
 
     if client_session_id or conv_id:
+        _bound, _up = _affinity_record(
+            affinity_decision,
+            _serving_provider(affinity_decision, failover_event, dispatched_provider),
+            conv_id,
+        )
         session_affinity_manager.record_turn(
             client_session_id or conv_id,
-            dispatched_provider,
+            _bound,
             dispatched_model,
-            conv_id,
+            _up,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):

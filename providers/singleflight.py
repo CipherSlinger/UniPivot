@@ -235,6 +235,8 @@ class SingleFlightManager:
         stream: bool = False,
         protocol: str = "openai_chat",
         constraints: Optional[Dict[str, Any]] = None,
+        session_key: Optional[str] = None,
+        upstream_conv_id: Optional[str] = None,
     ) -> str:
         """计算请求特征指纹 (SHA-256)。
 
@@ -253,6 +255,18 @@ class SingleFlightManager:
         加字段只会让键**更**具体（合并变少），绝不会把两条不该合并的请求并到
         一起 —— 这是唯一安全的方向。`None` 与 `{}` 等价，所以未传约束的调用点
         逐值保持原语义。
+
+        [SINGLEFLIGHT] `session_key` / `upstream_conv_id` 是同一条判据的又一次
+        应用，缺陷形状与 [S3] 完全相同：**会话身份决定哪一段历史算作「前文」**。
+        已绑定上游会话的请求走续聊分支、只发本轮增量；全新会话的请求展平全量
+        历史。两者的 `messages` 可以逐字相同（agent 派生的子 agent 与父 agent
+        发同样的指令、声明同样的工具），而正确答案完全不同。实测：会话 A 已绑定、
+        会话 B 全新、messages 逐字相同 → 指纹相同 → B 领到 A 的续聊答案，上游
+        只被调用一次，B 的会话从未创建，而它的响应头却写着 `bound`。
+        一个没有报错的错答案。
+
+        没有会话身份的请求（匿名一次性调用）两者都是 `None`，逐值不变——它们
+        之间确实可以互换，仍然合并。
         """
         payload = {
             "protocol": protocol,
@@ -265,6 +279,10 @@ class SingleFlightManager:
             "stream": stream,
             # 空字典与缺省必须产生同一个 payload；`sort_keys` 负责顺序无关
             "constraints": constraints or {},
+            # 会话身份：决定前文在上游还是在本轮提示词里，因此改变正确答案。
+            # 匿名请求两者都是 None，与修复前逐值等价。
+            "session_key": session_key or "",
+            "upstream_conv_id": upstream_conv_id or "",
         }
         raw_str = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()
