@@ -89,8 +89,35 @@ def _wait_ready(url: str, timeout: float = 60.0) -> bool:
     return False
 
 
+def _fetch_peaks(port: int) -> dict:
+    """Peak in-flight requests per account, as observed by the upstream itself."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/e2e/concurrency", timeout=5
+        ) as r:
+            return json.load(r).get("peak") or {}
+    except Exception:  # noqa: BLE001 - telemetry must never fail a run
+        return {}
+
+
+def _configured_limits() -> dict:
+    """max_concurrency per provider, read from the gateway's own spec table.
+
+    Read rather than hardcoded: a test that asserts against a copy of the limit
+    keeps passing after the limit changes, which is the failure mode that makes
+    concurrency regressions invisible (CLAUDE.md section 36).
+    """
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+        from providers.failover import PROVIDER_RISK_SPECS
+        return {k: m.max_concurrency for k, m in PROVIDER_RISK_SPECS.items()}
+    except Exception:  # noqa: BLE001
+        return {}
+
+
 def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path,
-                   parallel: bool = False, same: bool = False) -> subprocess.Popen:
+                   parallel: bool = False, same: bool = False,
+                   extra_env: dict | None = None) -> subprocess.Popen:
     """Start the scripted upstream.
 
     `want` has to reach the **server**: it is the model in the scripted upstream
@@ -109,6 +136,7 @@ def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: P
         "E2E_PARALLEL": "1" if parallel else "0",
         "E2E_SAME": "1" if same else "0",
         "PYTHONUNBUFFERED": "1",
+        **(extra_env or {}),
     }
     log = open(log_dir / f"srv_{port}.log", "wb")
     proc = subprocess.Popen(
@@ -340,8 +368,12 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
     root.mkdir()
     names = [f"{args.client}-{i + 1}" for i in range(args.sessions)]
     procs = {}
+    # Hold each response briefly so concurrent sessions really pile up: a fast
+    # stub makes "peak in-flight" a matter of timing luck, and a semaphore that
+    # leaks would then be indistinguishable from one that holds.
     gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
-                        want_dir=root, parallel=True, same=True)
+                        want_dir=root, parallel=True, same=True,
+                        extra_env={"E2E_HOLD_SECONDS": "0.4"})
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
             print("[e2e] same: GATEWAY NOT READY")
@@ -369,6 +401,7 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
                 continue
             outs[name] = p.communicate(timeout=300)[0]
         bodies_all = _bodies(log_dir, port)
+        peaks = _fetch_peaks(port)
     finally:
         gw.terminate()
         try:
@@ -458,6 +491,21 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
               f"(rounds={len(r['markers'])}/{r['rounds_expected']})")
     print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary, "
           f"{len(set(served))} distinct upstream conversation(s)")
+    if peaks:
+        # What the ACCOUNT really saw, counted upstream. The per-node semaphore
+        # exists to keep this bounded, and the gateway's own counter cannot
+        # witness it: section 36 measured peak 6 against a qwen account limited
+        # to 3 while the gateway's side looked fine.
+        limits = _configured_limits()
+        print(f"  peak in-flight per account: {peaks} (configured: "
+              f"{ {k: limits.get(k) for k in peaks} })")
+        for pk, peak in peaks.items():
+            limit = limits.get(pk)
+            if limit is not None and peak > limit:
+                failures.append(
+                    f"{pk}: {peak} concurrent upstream requests against a limit of "
+                    f"{limit} — the semaphore did not cover the streamed body"
+                )
     for f in failures:
         print(f"  !! {f}")
     if not args.keep:

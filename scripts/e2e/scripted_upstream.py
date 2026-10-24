@@ -29,6 +29,7 @@ Run (the runner `run_agent_loop.py` does this for you):
 
 from __future__ import annotations
 
+import asyncio
 import itertools
 import json
 import os
@@ -61,6 +62,11 @@ LOG = LOG_DIR / f"bodies_{os.environ.get('E2E_PORT', '0')}.jsonl"
 
 # What the tool is asked to do. A shell tool echoes it; a file tool writes it.
 _WANT = os.environ.get("E2E_WANT", "echo e2e-ok")
+
+# Seconds to hold a response open, making concurrent requests pile up on purpose.
+# Without it "peak in-flight" depends on timing luck: five fast requests may never
+# overlap, and a broken semaphore would look identical to a working one.
+_HOLD = float(os.environ.get("E2E_HOLD_SECONDS", "0") or 0)
 
 # Directory the per-round markers are written into (only used when E2E_ROUNDS > 1).
 _WANT_DIR = os.environ.get("E2E_WANT_DIR", ".")
@@ -271,6 +277,10 @@ def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
 # mint happens synchronously inside one event loop.
 _MINTED = itertools.count(1)
 
+# In-flight / peak per ACCOUNT, observed at the upstream itself.
+_INFLIGHT: dict = {}
+_PEAK: dict = {}
+
 
 class LoopProvider:
     """Serves round 1 (tool call) and round 2 (final answer) from the same state."""
@@ -293,6 +303,23 @@ class LoopProvider:
         # per request (the gateway's `_make_provider` is a factory), so a
         # per-instance counter would hand every request the same "…_1".
         conv = kw.get("conversation_id") or f"upstream_{self.key}_{next(_MINTED)}"
+
+        # [CONCURRENCY] How many requests this ACCOUNT has in flight at once.
+        # This is the quantity an anti-bot system scores ("one account, several
+        # parallel sessions"), and the only place it is directly observable: the
+        # gateway's own semaphore is what is supposed to bound it, so measuring
+        # the gateway's counter would be asking the suspect for its alibi.
+        _INFLIGHT[self.key] = _INFLIGHT.get(self.key, 0) + 1
+        _PEAK[self.key] = max(_PEAK.get(self.key, 0), _INFLIGHT[self.key])
+        try:
+            if _HOLD:
+                await asyncio.sleep(_HOLD)
+            async for item in self._chat(messages, model, conv, prompt, chosen, **kw):
+                yield item
+        finally:
+            _INFLIGHT[self.key] -= 1
+
+    async def _chat(self, messages, model, conv, prompt, chosen, **kw):
 
         with open(LOG, "a", encoding="utf-8") as f:
             f.write(json.dumps({
@@ -382,3 +409,15 @@ def install() -> None:
 
 install()
 app = srv.app
+
+
+@app.get("/e2e/concurrency")
+async def _concurrency():
+    """Peak in-flight requests per ACCOUNT, as observed by the upstream.
+
+    Exists because the gateway's own counters cannot answer the question: the
+    per-node semaphore is the suspect, not the witness (CLAUDE.md section 36
+    measured peak 6 against a qwen account configured for 3 by reading the
+    gateway's side and nearly missed it). Zero upstream calls to read.
+    """
+    return {"peak": dict(_PEAK), "current": dict(_INFLIGHT)}
