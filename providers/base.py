@@ -249,6 +249,28 @@ def continuation_content(messages: List[dict]) -> str:
     把上一轮的旧提问重复发出去（实测：返回 'read foo.py' 而不是工具输出），模型
     永远接不上工具调用。现改为取「最后一条 user 之后」的全部消息：没有工具循环时
     行为与原先逐值相同（零回归），有工具循环时如实送达工具调用与结果。
+
+    [SESSION-CONTINUITY] 但「历史」与「常驻契约」是两回事，续聊只该省掉前者。
+
+    系统消息不是历史轮次，它是**现在这一刻生效的指令**：系统提示、工具声明
+    （`server.py` 把 `format_tools_system_prompt` 的产物并进 `messages[0]`）、
+    `tool_choice` / `response_format` 的当轮约束都在里面。上游会话只保存了**首轮**
+    的那一份，之后任何更新（Claude Code 每轮都发新的 system-reminder：环境、规则、
+    文件状态）都无从得知。此前它们被当作「历史」一并省掉，实测：
+
+        首轮  prompt = "System: You are Claude Code. …\\n\\n## Tools Available\\n…\\n\\nUser: q1"  (1069 字符)
+        次轮  prompt = "q2"                                                                    (2 字符)
+
+    三条各自的后果，全部无报错（HTTP 200 + `finish_reason:"stop"`）：模型从第二轮起
+    不知道自己有哪些工具；首轮之后才声明的工具（MCP 动态挂载、子 agent 的工具集）
+    **从未**出现过；客户端当轮声明的 `tool_choice:"none"` 根本没送达。对 agent 客户端
+    这正是最要命的形态——首轮能用，之后「模型突然不调工具了」。
+
+    代价是每轮重发一次系统块。这仍然是纯收益：agent 客户端本来每轮就重发全量历史，
+    而丢掉的契约没有任何补偿机制；系统块相对历史也很小。
+
+    位置：系统块放在增量**之前**，与首轮的 `flatten_messages` 顺序一致（`System:`
+    行在前，随后才是本轮输入），模型看到的结构不因「首轮/续聊」而改变。
     """
     if not messages:
         return ""
@@ -267,14 +289,26 @@ def continuation_content(messages: List[dict]) -> str:
     else:
         tail = messages[last_user_idx + 1:]
 
+    # 常驻契约：最后一条 user **之前**的全部 system 消息（含首轮之后追加的那些）。
+    # 已经在尾部的 system 不再重复——尾部本来就会逐条渲染。
+    head_system = [
+        m for m in messages[:max(last_user_idx, 0)]
+        if isinstance(m, dict) and str(m.get("role") or "").lower() == "system"
+    ]
+    contract_lines = [ln for ln in (_message_line(m, id_map) for m in head_system) if ln]
+
     if not tail:
-        return text_of(messages[last_user_idx].get("content"))
+        base = text_of(messages[last_user_idx].get("content"))
+        return "\n\n".join(contract_lines + [base]) if contract_lines else base
 
     lines = [ln for ln in (_message_line(m, id_map) for m in tail) if ln]
     if not lines:
         # 尾部全部不可表达（例如 assistant 空内容）：退回上一条 user，避免发出空提示
-        return text_of(messages[last_user_idx].get("content")) if last_user_idx >= 0 else ""
-    return "\n\n".join(lines)
+        base = text_of(messages[last_user_idx].get("content")) if last_user_idx >= 0 else ""
+        if not base:
+            return "\n\n".join(contract_lines)
+        return "\n\n".join(contract_lines + [base]) if contract_lines else base
+    return "\n\n".join(contract_lines + lines)
 
 
 def last_user_content(messages: List[dict]) -> str:

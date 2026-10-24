@@ -366,7 +366,15 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                 if item.strip():
                     messages.append({"role": "user", "content": item})
             elif isinstance(item, dict):
+                # [PROTOCOL] `type` 是可选的：OpenAI SDK 的 `EasyInputMessage`
+                # （`{"role": "user", "content": "hi"}`）根本不带它，而这是最常见的
+                # 手写/SDK 形状。此前 `item.get("type")` 取到 None，随后
+                # `item_type.endswith("_call")` 抛 AttributeError —— 一个合法请求变成
+                # 500，错误体里还带着网关的内部 traceback。等价性由 OpenAI 自己的
+                # 定义给出：条目有 `role` 就是一条 message。
                 item_type = item.get("type")
+                if not isinstance(item_type, str) or not item_type:
+                    item_type = "message" if "role" in item else ""
                 if item_type == "message":
                     role = item.get("role", "user")
                     c_text = extract_responses_content(item.get("content"))

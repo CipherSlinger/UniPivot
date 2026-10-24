@@ -195,14 +195,24 @@ def test_continuation_sends_tool_result_not_stale_question():
 
 
 def test_continuation_without_tools_is_unchanged():
-    """零回归：普通一轮对���，续聊发送的内容与旧实现逐值相同。"""
+    """零回归：普通一轮对话，续聊发送的就是本轮输入，不重发历史轮次。
+
+    [SESSION-CONTINUITY] 这条原本断言 `== "今天天气如何"` —— 即系统消息连同历史
+    一起被丢掉。那个断言把缺陷当成了契约：`messages[0]` 里承载的不只是系统提示，
+    还有 `server.py` 并进去的工具声明与当轮约束，第二轮起整段消失（见
+    `tests/test_continuation_contract.py`）。现改为断言**真正该不变的**那部分：
+    历史轮次不重发。
+    """
     msgs = [
         {"role": "system", "content": "sys"},
         {"role": "user", "content": "你好"},
         {"role": "assistant", "content": "你好！"},
         {"role": "user", "content": "今天天气如何"},
     ]
-    assert continuation_content(msgs) == "今天天气如何"
+    out = continuation_content(msgs)
+    assert "今天天气如何" in out, out
+    assert "你好" not in out, f"续聊不该重发历史轮次，实测: {out!r}"
+    assert "sys" in out, f"系统契约必须送达（见 test_continuation_contract.py），实测: {out!r}"
     print("test_continuation_without_tools_is_unchanged: PASSED")
 
 

@@ -233,6 +233,58 @@ def test_unknown_anthropic_blocks_are_announced_not_dropped():
         assert probe in text, f"未知块 {probe} 静默消失了，模型会以为它不存在"
 
 
+def test_item_without_a_type_is_a_message():
+    """**靶点**：`{"role": "user", "content": "hi"}` 是合法输入，此前是 HTTP 500。
+
+    OpenAI SDK 的 `EasyInputMessage` 根本不带 `type`。`item.get("type")` 返回 None，
+    随后 `item_type.endswith("_call")` 抛 `AttributeError: 'NoneType' object has no
+    attribute 'endswith'`，整个请求变成 500 —— 一个合法请求被网关自己的内部异常拒绝，
+    错误体里还带着 traceback。OpenAI 自己的定义给出了等价关系：条目有 `role` 就是
+    一条 message。
+    """
+    captured = {}
+
+    class P:
+        async def chat(self, messages, model, conversation_id=None, **kw):
+            captured["prompt"] = flatten_messages(messages)
+            yield "ok", {}
+            yield "", {"conversation_id": None}
+
+    before = srv._make_provider
+    srv._make_provider = lambda key, client=None: P()
+    try:
+        r = TestClient(srv.app).post("/v1/responses", json={
+            "model": "gpt-4o",
+            "input": [{"role": "user", "content": "hi"}],
+        })
+    finally:
+        srv._make_provider = before
+
+    assert r.status_code == 200, (
+        f"不带 type 的 SDK 形状被拒绝为 {r.status_code}：{r.text[:300]}"
+    )
+    assert "hi" in captured.get("prompt", ""), (
+        f"用户内容没有到达上游提示词: {captured.get('prompt')!r}"
+    )
+    print("test_item_without_a_type_is_a_message: PASSED")
+
+
+def test_typed_and_untyped_messages_render_identically():
+    """同一份内容，带不带 `type` 都必须渲染成同一条上游消息（一条规则，不是两条）。"""
+    typed = ResponsesRequest(**{
+        "model": "gpt-4o",
+        "input": [{"type": "message", "role": "user", "content": "hi"}],
+    })
+    untyped = ResponsesRequest(**{"model": "gpt-4o", "input": [{"role": "user", "content": "hi"}]})
+    a = convert_responses_to_gateway_messages(typed)
+    b = convert_responses_to_gateway_messages(untyped)
+    assert a == b, (
+        "同一个 message 因为带不带 type 而渲染成两种结果——这正是[第 43 节]"
+        f"（一种事实两处解释）的形态。带 type: {a} / 不带: {b}"
+    )
+    print("test_typed_and_untyped_messages_render_identically: PASSED")
+
+
 def run_all():
     test_assistant_message_tool_calls_are_replayed()
     test_both_history_shapes_render_identically()
@@ -241,6 +293,8 @@ def run_all():
     test_server_side_action_records_are_not_user_messages()
     test_truly_unknown_items_are_announced_not_dumped()
     test_unknown_anthropic_blocks_are_announced_not_dropped()
+    test_item_without_a_type_is_a_message()
+    test_typed_and_untyped_messages_render_identically()
     print("\n✅ All Responses history tool-call tests passed!")
 
 
