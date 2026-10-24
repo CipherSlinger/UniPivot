@@ -90,7 +90,7 @@ def _wait_ready(url: str, timeout: float = 60.0) -> bool:
 
 
 def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path,
-                   parallel: bool = False) -> subprocess.Popen:
+                   parallel: bool = False, same: bool = False) -> subprocess.Popen:
     """Start the scripted upstream.
 
     `want` has to reach the **server**: it is the model in the scripted upstream
@@ -107,6 +107,7 @@ def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: P
         "E2E_ROUNDS": str(rounds),
         "E2E_WANT_DIR": str(want_dir),
         "E2E_PARALLEL": "1" if parallel else "0",
+        "E2E_SAME": "1" if same else "0",
         "PYTHONUNBUFFERED": "1",
     }
     log = open(log_dir / f"srv_{port}.log", "wb")
@@ -302,6 +303,114 @@ def run_codex(port: int, work: Path, log_dir: Path, marker: Path) -> dict:
     return _collect("codex", proc.returncode, bodies, work, marker, proc.stdout)
 
 
+def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) -> int:
+    """N concurrent sessions of the SAME client against ONE gateway.
+
+    This is the harder shape and the one the risk line exists for: several agent
+    sessions of one binary, all routed to the same upstream account. Different
+    vendors exercising one gateway is easy; the "one account, several parallel
+    sessions" signature is what per-node semaphores and pacing are there to bound,
+    and it is the shape an anti-bot system scores as automation.
+
+    Attribution does not use the tool name (both sessions declare `Bash`). Each
+    session runs in its own working directory and the scripted upstream emits a
+    *relative* marker path, so `e2e_marks/ROUND_n` resolves per session with no
+    coordination — the filesystem the client really runs in decides it.
+    """
+    port = _free_port()
+    root = work / "same"
+    root.mkdir()
+    names = [f"{args.client}-{i + 1}" for i in range(args.sessions)]
+    procs = {}
+    gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
+                        want_dir=root, parallel=True, same=True)
+    try:
+        if not _wait_ready(f"http://127.0.0.1:{port}/health"):
+            print("[e2e] same: GATEWAY NOT READY")
+            return 1
+        print(f"[e2e] same: one gateway on :{port}; starting {len(names)} "
+              f"{args.client} sessions…")
+        for name in names:
+            d = root / name
+            d.mkdir()
+            marker = d / "e2e_marks" / "E2E_MARKER"
+            if args.client == "claude":
+                argv, env = _claude_argv(port, d, log_dir, marker)
+            else:
+                argv, env = _codex_argv(port, d, log_dir, marker)
+            if not argv or not argv[0]:
+                procs[name] = None
+                continue
+            procs[name] = subprocess.Popen(
+                argv, cwd=str(d), env=env, stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT, text=True, stdin=subprocess.DEVNULL,
+            )
+        outs = {}
+        for name, p in procs.items():
+            if p is None:
+                continue
+            outs[name] = p.communicate(timeout=300)[0]
+        bodies_all = _bodies(log_dir, port)
+    finally:
+        gw.terminate()
+        try:
+            gw.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            gw.kill()
+        getattr(gw, "_e2e_log", None) and gw._e2e_log.close()  # type: ignore[attr-defined]
+
+    for name in names:
+        p = procs.get(name)
+        if p is None:
+            results.append({"client": name, "skipped": f"{args.client} not on PATH"})
+            continue
+        d = root / name
+        marks = d / "e2e_marks"
+        res = _collect(name, p.returncode, bodies_all, marks, marks / "E2E_MARKER",
+                       outs.get(name, ""))
+        res["rounds_expected"] = args.rounds
+        # Both sessions declare `Bash`, so upstream bodies CANNOT be attributed
+        # per session — only the marker directories can, and they already do.
+        # Reporting the shared total as this session's `bodies` would print
+        # `bodies=12` for each of two 6-request sessions: a per-session number
+        # that is really the sum. Say "shared" rather than invent a split.
+        res.pop("bodies", None)
+        res["shared_bodies"] = len(bodies_all)
+        res["attributable_by"] = "marker-directory"
+        results.append(res)
+        print(f"[e2e] same {name}: "
+              f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
+        if not res["marker"]:
+            failures.append(f"{name}: never executed a tool (marker absent)")
+        if len(res["markers"]) < args.rounds:
+            failures.append(
+                f"{name}: only {len(res['markers'])}/{args.rounds} rounds really ran "
+                f"while {len(names) - 1} sibling session(s) of the same binary sent requests"
+            )
+        if not res["has_tools_section"]:
+            failures.append(f"{name}: its upstream prompt carried no tool contract")
+
+    seq, switches = _alternation(bodies_all)
+    print("\n================ E2E VERDICT (same binary, N sessions) ================")
+    for r in results:
+        if "skipped" in r:
+            print(f"  {r['client']}: SKIPPED")
+            continue
+        ok = (r["marker"] and len(r["markers"]) >= r["rounds_expected"]
+              and r["has_tools_section"])
+        print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
+              f"(rounds={len(r['markers'])}/{r['rounds_expected']})")
+    print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary")
+    for f in failures:
+        print(f"  !! {f}")
+    if not args.keep:
+        shutil.rmtree(log_dir, ignore_errors=True)
+        print("  (artifacts removed; re-run with --keep to inspect)")
+    else:
+        print(f"  artifacts kept at {log_dir}")
+    return 1 if failures else 0
+
+
 def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list) -> int:
     """Both real binaries at once against ONE gateway.
 
@@ -438,6 +547,10 @@ def main() -> int:
                     help="drive both clients CONCURRENTLY against one gateway — the real "
                          "developer setup (two agents, one machine). Exercises interleaved "
                          "requests, shared connection pool and shared concurrency budget.")
+    ap.add_argument("--sessions", type=int, default=2,
+                    help="with --parallel: how many concurrent sessions of ONE binary to "
+                         "drive (they all hit the same upstream account). Use --client to "
+                         "pick which binary; default 2.")
     args = ap.parse_args()
 
     log_dir = Path(tempfile.mkdtemp(prefix="unipivot_e2e_"))
@@ -448,6 +561,11 @@ def main() -> int:
     clients = ["claude", "codex"] if args.client == "both" else [args.client]
     results = []
     failures = []
+
+    if args.parallel and args.client != "both":
+        # N sessions of one binary — the "one account, several parallel sessions"
+        # shape. Distinct from --parallel's two *different* vendors.
+        return _run_same(log_dir, work, args, results, failures)
 
     if args.parallel:
         if len(clients) < 2:

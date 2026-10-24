@@ -73,6 +73,15 @@ _WANT_DIR = os.environ.get("E2E_WANT_DIR", ".")
 # client's rounds to this one.
 _PARALLEL = os.environ.get("E2E_PARALLEL") == "1"
 
+# Same-binary mode: two sessions of ONE client type, both routed to the SAME
+# upstream account. The tool-name trick cannot separate them (both declare
+# `Bash`), so attribution instead uses a **relative** marker path: each session
+# runs in its own working directory, so `e2e_marks/ROUND_n` resolves to a
+# different directory per session with no coordination at all. That is stronger
+# than tagging, because it cannot be forged by the model -- it is the filesystem
+# the client's own process is running in.
+_SAME = os.environ.get("E2E_SAME") == "1"
+
 
 def _client_tag(tool_name: str) -> str:
     """Which agent CLI declared this tool. Only used to separate markers."""
@@ -92,6 +101,12 @@ def _command_for(tool_name: str, round_no: int) -> str:
     `tool_markers=2/3 ... missing ['ROUND_1']` on both real binaries. The run was
     correct; the harness disagreed with itself about what a round marker is.
     """
+    if _SAME:
+        # Relative on purpose: the client's own cwd decides where this lands,
+        # so two concurrent sessions of the same binary write to two different
+        # directories without the upstream knowing which is which.
+        return (f"mkdir -p e2e_marks && touch e2e_marks/E2E_MARKER "
+                f"&& touch e2e_marks/ROUND_{round_no}")
     if _PARALLEL:
         tag = _client_tag(tool_name)
         d = f"{_WANT_DIR}/{tag}"
