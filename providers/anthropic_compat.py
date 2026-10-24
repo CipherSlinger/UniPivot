@@ -897,8 +897,29 @@ def format_response_format_prompt(response_format: Any) -> str:
 # 正常调用（本仓库的既有用例即来自实测）。所以防伪造**不靠猜格式**，而靠两道
 # 校验——`_extract_single_tool_strict` 要求契约形状，`allowed` 要求名字确实是客户端
 # 声明过的工具。格式白名单只负责挡掉 `python`/`ts` 这类显然不相关的代码块。
+# [TOOL-LOOP] 收尾围栏必须是**惰性**的，而且不能把下一块的开头吞掉。
+#
+# 原收尾是 `\n?```+`——贪婪。面对两个背靠背写出的工具块（真实 codex 抓包里的
+# 字节形状，见 CLAUDE.md 第 68 节）：
+#
+#     ```tool_call\n{...}\n``````tool_call\n{...}\n```
+#
+# 第一块的收尾会把后一块的**开**头那三个反引号一起吃掉（匹配到 6 个），于是
+# `finditer` 从吞掉的位置之后继续扫描，第二块再也不匹配：模型发起的两个调用
+# 只有一个到达客户端，另一个连同它的调用一起消失，且没有任何报错。
+#
+# 修复方式是把收尾从"吃掉所有能吃的反引号"改成"**惰性**吃掉，但不在后跟一个
+# 语言标记时停手"：`\`{3,}?` 优先只吃三颗，负向前瞻 `(?!\s*LANG(?![A-Za-z0-9_]))`
+# 保证停手点不是一个新块的开头。于是相邻块被正确切开，而四个反引号的围栏、
+# 语言别名、未闭合的截断块、正文里的行内反引号全部逐值不变（见
+# `tests/test_parallel_tool_calls.py::test_fence_shapes_are_unchanged`）。
+#
+# `(?![A-Za-z0-9_])` 是必要的：`tool_calling` / `json5x` 不是语言标记，不能被
+# 当成新块的开始。
+_TOOL_FENCE_LANG = r"(?:tool_call|tool|function|json|json5)"
 _BLOCK_TOOL_PATTERN = re.compile(
-    r"```+\s*(?:tool_call|tool|function|json|json5)\s*\n(.*?)(?:\n?```+|$)",
+    r"```+\s*" + _TOOL_FENCE_LANG + r"\s*\n(.*?)"
+    r"(?:\n?`{3,}?(?!\s*" + _TOOL_FENCE_LANG + r"(?![A-Za-z0-9_]))|$)",
     re.DOTALL | re.IGNORECASE,
 )
 _XML_TOOL_PATTERN = re.compile(

@@ -117,7 +117,8 @@ def _configured_limits() -> dict:
 
 def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path,
                    parallel: bool = False, same: bool = False,
-                   extra_env: dict | None = None) -> subprocess.Popen:
+                   extra_env: dict | None = None,
+                   two_calls: bool = False) -> subprocess.Popen:
     """Start the scripted upstream.
 
     `want` has to reach the **server**: it is the model in the scripted upstream
@@ -135,6 +136,7 @@ def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: P
         "E2E_WANT_DIR": str(want_dir),
         "E2E_PARALLEL": "1" if parallel else "0",
         "E2E_SAME": "1" if same else "0",
+        "E2E_TWO_CALLS": "1" if two_calls else "0",
         "PYTHONUNBUFFERED": "1",
         **(extra_env or {}),
     }
@@ -177,6 +179,57 @@ def _bodies_for(bodies: list[dict], client: str) -> list[dict]:
     if not tool:
         return bodies
     return [b for b in bodies if tool in (b.get("declared_tools") or [])]
+
+
+def _failures_for(failures: list[str], owner: str, clients: list[str]) -> list[str]:
+    """The failures that make ``owner``'s verdict FAIL.
+
+    Every per-client failure is appended as `f"{name}: ..."`, and the verdict
+    used to *recompute* a pass/fail from a hand-picked subset of those same
+    facts. The two disagreed the moment a check was added to one and not the
+    other: a run that fired `only the FIRST of two tool calls … SECOND_CALL
+    marker absent` still printed `codex: PASS` on the line above it (measured,
+    CLAUDE.md section 68). A verdict that disagrees with the failure list is
+    the "the report lies" defect this repo keeps fixing, so the verdict now
+    derives PASS from the list itself and there is one place a check can be
+    added.
+
+    A failure prefixed with *another* client's name is that client's alone. A
+    failure with no client prefix is ring-wide — "their contexts bleed into
+    each other", a group exceeded its concurrency limit — and fails every
+    session, because no session can be called healthy while the shared gateway
+    is doing that.
+    """
+    out = []
+    for m in failures:
+        owners = [c for c in clients if m.startswith(f"{c}: ")]
+        if not owners or owner in owners:
+            out.append(m)
+    return out
+
+
+def _blind_continuations(bodies: list[dict]) -> list[tuple[int, dict]]:
+    """Continuation requests that reached upstream WITHOUT the tool result.
+
+    A continuation is *the request the gateway handed an upstream conversation
+    id to* — that, not its position in the log, is what makes it a second turn.
+    Slicing `bodies[1:]` assumed one session's requests are contiguous: with N
+    sessions sharing one gateway the second session's FIRST request (correctly
+    carrying no result) landed in the slice, so a fully healthy run reported
+    `round2_saw_result: false` (measured, CLAUDE.md section 68). Round-one
+    bodies have no result by definition and are excluded by the same predicate
+    that identifies them: no incoming conversation id.
+    """
+    return [
+        (i, b) for i, b in enumerate(bodies)
+        if b.get("conversation_id") and not b.get("payload_has_tool_result")
+    ]
+
+
+def _every_continuation_saw_its_result(bodies: list[dict]) -> bool:
+    """True when there is at least one continuation and none of them went blind."""
+    has_continuation = any(b.get("conversation_id") for b in bodies)
+    return has_continuation and not _blind_continuations(bodies)
 
 
 def _overlap_ms(bodies: list[dict]) -> int:
@@ -239,9 +292,18 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
         # agent. The two are different prompts and only one of them is real.
         # EVERY round after the first must carry one — `any()` would let a run
         # that loses the result at round 3 still report PASS.
-        "round2_saw_result": len(bodies) > 1 and all(
-            b.get("payload_has_tool_result") for b in bodies[1:]
-        ),
+        #
+        # "After the first" is a property of a REQUEST, not of a list index:
+        # a continuation is exactly the request the gateway hands an upstream
+        # conversation id to. Slicing `bodies[1:]` instead assumed one session's
+        # bodies are contiguous, so with N sessions sharing a log the second
+        # session's FIRST request (no result yet, correctly) landed in the slice
+        # and the whole run reported `round2_saw_result: false` while every real
+        # continuation carried its result (measured, CLAUDE.md section 68).
+        # The same-binary verdict ignored the field, so it never failed a green
+        # run — the parallel verdict did use it, which makes the derivation,
+        # not the assertion, the thing to fix.
+        "round2_saw_result": _every_continuation_saw_its_result(bodies),
         # [SESSION-ID] The upstream conversation id the gateway hands the provider
         # is the only observable proof that session affinity works for THIS client.
         # Neither real binary ever sends `conversation_id` (Claude Code puts its
@@ -373,7 +435,8 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
     # leaks would then be indistinguishable from one that holds.
     gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
                         want_dir=root, parallel=True, same=True,
-                        extra_env={"E2E_HOLD_SECONDS": "0.4"})
+                        extra_env={"E2E_HOLD_SECONDS": "0.4"},
+                        two_calls=getattr(args, "two_calls", False))
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
             print("[e2e] same: GATEWAY NOT READY")
@@ -442,12 +505,24 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
         # reuse its own upstream conversation, so the shared log must contain at
         # least one continuation. Reported as a shared fact, never as per-session.
         if args.rounds > 1 and not res.get("session_reused"):
+            # Prefixed with the session name on purpose: the fact is read from a
+            # shared log, but the verdict below derives this session's PASS from
+            # its own failures, so an unprefixed message would print PASS on the
+            # line above it.
             failures.append(
-                "no request in the shared log reused an upstream conversation "
+                f"{name}: no request in the shared log reused an upstream conversation "
                 f"across {args.rounds} rounds (all bodies: {res.get('upstream_convs')})"
             )
         if not res["has_tools_section"]:
             failures.append(f"{name}: its upstream prompt carried no tool contract")
+        if getattr(args, "two_calls", False) and not (marks / "SECOND_CALL").exists():
+            # The second call in a parallel-tool-use turn never ran. Agents emit
+            # these constantly, and a client that executes only the first call
+            # looks like it "sometimes skips half the work" with no error.
+            failures.append(
+                f"{name}: only the FIRST of two tool calls in one turn executed "
+                "(SECOND_CALL marker absent)"
+            )
 
     # [SESSION-ID] Two sessions of one binary MUST end up in two different
     # upstream conversations, and each must stay in its own. The scripted
@@ -468,10 +543,7 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
                 f"conversation(s) {sorted(set(served))} — their contexts bleed into each other"
             )
         # Every continuation must carry the tool result of the turn it continues.
-        # Round-one bodies have none by definition, so they are excluded by the
-        # same predicate that identifies them: no incoming conversation id.
-        blind = [i for i, b in enumerate(bodies_all)
-                 if b.get("conversation_id") and not b.get("payload_has_tool_result")]
+        blind = [i for i, _ in _blind_continuations(bodies_all)]
         if blind:
             failures.append(
                 f"{len(blind)} continuation request(s) reached upstream without the tool "
@@ -485,8 +557,7 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
         if "skipped" in r:
             print(f"  {r['client']}: SKIPPED")
             continue
-        ok = (r["marker"] and len(r["markers"]) >= r["rounds_expected"]
-              and r["has_tools_section"])
+        ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
         print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
               f"(rounds={len(r['markers'])}/{r['rounds_expected']})")
     print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary, "
@@ -540,7 +611,8 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         (root / name).mkdir()
         marker_paths[name] = root / name / f"{name.upper()}_E2E_MARKER"
     gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
-                        want_dir=root, parallel=True)
+                        want_dir=root, parallel=True,
+                        two_calls=getattr(args, "two_calls", False))
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
             print("[e2e] parallel: GATEWAY NOT READY")
@@ -601,6 +673,11 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
             failures.append(f"{name}: its upstream prompt carried no tool contract")
         if not res["round2_saw_result"]:
             failures.append(f"{name}: none of its requests carried a tool result")
+        if getattr(args, "two_calls", False) and not (root / name / "SECOND_CALL").exists():
+            failures.append(
+                f"{name}: only the FIRST of two tool calls in one turn executed "
+                "(SECOND_CALL marker absent)"
+            )
         if args.rounds > 1 and not res.get("session_reused"):
             failures.append(
                 f"{name}: never reused an upstream conversation across "
@@ -628,9 +705,7 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         if "skipped" in r:
             print(f"  {r['client']}: SKIPPED")
             continue
-        ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
-              and r["round2_saw_result"] and len(r["markers"]) >= r["rounds_expected"]
-              and (r["rounds_expected"] <= 1 or r.get("session_reused")))
+        ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
         print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
               f"(bodies={r['bodies']}, tool_markers={len(r['markers'])}/{r['rounds_expected']}, "
               f"tool={r['chosen'][0] if r['chosen'] else None})")
@@ -652,6 +727,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--client", choices=("claude", "codex", "both"), default="both")
     ap.add_argument("--keep", action="store_true", help="keep artifacts for inspection")
+    ap.add_argument("--two-calls", action="store_true",
+                    help="emit TWO tool calls in one assistant turn (parallel tool use, "
+                         "which real agents do constantly); both must execute")
     ap.add_argument("--rounds", type=int, default=1,
                     help="tool rounds to drive before the model answers (default 1, i.e. a "
                          "two-request loop). Raise it to exercise long agent sessions.")
@@ -694,7 +772,8 @@ def main() -> int:
         client_work.mkdir()
         marker = client_work / f"{name.upper()}_E2E_MARKER"
         proc = _start_gateway(port, log_dir, want=f"touch {marker}",
-                              rounds=args.rounds, want_dir=client_work)
+                              rounds=args.rounds, want_dir=client_work,
+                              two_calls=getattr(args, "two_calls", False))
         try:
             if not _wait_ready(f"http://127.0.0.1:{port}/health"):
                 failures.append(f"{name}: gateway never became ready on :{port}")
@@ -737,6 +816,15 @@ def main() -> int:
                     )
             if not res["has_tools_section"]:
                 failures.append(f"{name}: the upstream prompt carried no tool contract")
+            if getattr(args, "two_calls", False) and not (client_work / "SECOND_CALL").exists():
+                # Two calls in one assistant turn, and only the first executed.
+                # Agents emit parallel calls constantly, so this is the "it does
+                # half the work sometimes" report. Without this check the mode
+                # above passed while proving nothing about the second call.
+                failures.append(
+                    f"{name}: only the FIRST of two tool calls in one turn executed "
+                    "(SECOND_CALL marker absent)"
+                )
             if not res["round2_saw_result"]:
                 failures.append(f"{name}: no captured request carried a tool result")
             if args.rounds > 1 and not res["session_reused"]:
@@ -761,14 +849,10 @@ def main() -> int:
         else:
             want_rounds = r.get("rounds_expected", 1)
             markers = len(r.get("markers") or [])
-            markers_ok = markers >= want_rounds if want_rounds > 1 else True
-            # A multi-round run that never reuses an upstream conversation is a
-            # failing run even though every tool really executed: the loop closes
-            # while each turn rebuilds the upstream context from scratch. Printing
-            # PASS beside that `!!` line would be the "the report lies" defect.
-            reuse_ok = markers_ok and (want_rounds <= 1 or r.get("session_reused"))
-            ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
-                  and r["round2_saw_result"] and markers_ok and reuse_ok)
+            # PASS is derived from the failure list, never recomputed beside it:
+            # a verdict written from a hand-picked subset printed PASS on the
+            # line above a fired failure (see `_failures_for`).
+            ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
             # At one round no per-round marker exists by construction, so printing
             # `tool_markers=0/1` reads as a failure on a run that is entirely green.
             markers_txt = f"{markers}/{want_rounds}" if want_rounds > 1 else "n/a"

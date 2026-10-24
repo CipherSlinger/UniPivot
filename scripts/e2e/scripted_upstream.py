@@ -68,6 +68,13 @@ _WANT = os.environ.get("E2E_WANT", "echo e2e-ok")
 # overlap, and a broken semaphore would look identical to a working one.
 _HOLD = float(os.environ.get("E2E_HOLD_SECONDS", "0") or 0)
 
+# Emit TWO ```tool_call blocks in one assistant turn, with different arguments.
+# Real agents do this constantly (a client that runs calls in parallel), and it is
+# the one shape the gateway's per-protocol collection points handle by appending
+# to a list — so a defect here drops the second call silently, leaving an agent
+# that looks like it "sometimes ignores half the work".
+_TWO_CALLS = os.environ.get("E2E_TWO_CALLS") == "1"
+
 # Directory the per-round markers are written into (only used when E2E_ROUNDS > 1).
 _WANT_DIR = os.environ.get("E2E_WANT_DIR", ".")
 
@@ -121,6 +128,25 @@ def _command_for(tool_name: str, round_no: int) -> str:
     if _ROUNDS > 1:
         return f"touch {_WANT} && touch {_WANT_DIR}/ROUND_{round_no}"
     return _WANT
+
+
+def _second_call_marker(tool_name: str) -> str:
+    """Where the SECOND call of a two-call turn proves it ran — per mode.
+
+    The marker has to sit in the directory that *that mode's runner* inspects,
+    and the three modes each use a different one (same-binary: the client's own
+    cwd; two-vendor: `{want_dir}/{tag}`; single: `{want_dir}`). It used to be the
+    hardcoded relative string `e2e_marks/SECOND_CALL`, which only resolves in
+    same-binary mode: in the other two the directory does not exist, `touch`
+    failed, and — because nothing asserted the marker there — a turn that
+    executed only the first call still reported PASS (measured, CLAUDE.md
+    section 68). A marker nobody checks is not evidence.
+    """
+    if _SAME:
+        return "e2e_marks/SECOND_CALL"
+    if _PARALLEL:
+        return f"{_WANT_DIR}/{_client_tag(tool_name)}/SECOND_CALL"
+    return f"{_WANT_DIR}/SECOND_CALL"
 
 # How many tool rounds to drive before answering. A two-round loop proves the
 # closed loop; it does NOT prove the loop *stays* closed. Real agent sessions run
@@ -368,7 +394,15 @@ class LoopProvider:
         # text contains the literal "[Tool Result for <id>]", so a bare
         # substring check fires on round one and the loop never happens
         # (measured; see CLAUDE.md section 60).
-        done = len(re.findall(r"\[Tool Result for [A-Za-z0-9_-]+", prompt))
+        # A **round** is one user→tool-call→result cycle, not one tool result.
+        # With `E2E_TWO_CALLS` each round produces two calls and therefore two
+        # results, so counting results made round one look like two completed
+        # rounds: the stub answered instead of driving round two, and a healthy
+        # run reported `rounds=1/2` (measured, CLAUDE.md section 68). The
+        # per-round divisor is what keeps the two notions apart.
+        results = len(re.findall(r"\[Tool Result for [A-Za-z0-9_-]+", prompt))
+        calls_per_round = 2 if _TWO_CALLS else 1
+        done = results // calls_per_round
         if done < _ROUNDS:
             name, args = chosen
             # The marker differs per round so the runner can prove THAT round ran,
@@ -386,12 +420,25 @@ class LoopProvider:
                         # markers sat on disk.
                         args = {**args, k: _command_for(name, n)}
                         break
+            calls = [(name, args)]
+            if _TWO_CALLS:
+                # The second call must be *distinguishable* in the marker
+                # directory, otherwise "both ran" and "one ran twice" look the
+                # same on disk.
+                many = dict(args)
+                second_marker = _second_call_marker(name)
+                for k in ("cmd", "command", "input"):
+                    if isinstance(many.get(k), str):
+                        many[k] = many[k] + f" && touch {second_marker}"
+                        break
+                calls.append((name, many))
             yield "I'll check.\n", {}
-            yield (
-                "```tool_call\n"
-                + json.dumps({"name": name, "arguments": args}, ensure_ascii=False)
-                + "\n```"
-            ), {"conversation_id": conv}
+            for cname, cargs in calls:
+                yield (
+                    "```tool_call\n"
+                    + json.dumps({"name": cname, "arguments": cargs}, ensure_ascii=False)
+                    + "\n```"
+                ), {"conversation_id": conv}
             yield "", {"conversation_id": conv}
             return
 
