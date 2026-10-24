@@ -673,6 +673,43 @@ def refresh_glm(timeout: int = 60) -> Optional[Session]:
     return login_glm(headless=True, timeout=timeout)
 
 
+def _sweep_skip_reason(provider: str) -> str:
+    """[LOGIN-SWEEP] `all` 展开时，判断该节点是否应被跳过；返回成因，`""` 表示照常登录。
+
+    为什么需要这一条：`login.py all` 是网关自己的拒绝信息让运维执行的命令
+    （`credential_watch.py:230`、`failover.py:2766` 都写着「请执行
+    `.venv/bin/python login.py all` 重新登录全部厂商」），也是 OPT-026/027/029
+    人工解除避让的唯一入口。但它过去**无条件下探五个节点**，不问一句该不该碰。
+
+    这与网关其余每一个上游触点都不同：`CooldownTracker.touch_avoidance_reason()`
+    是后台触点的唯一判据（OPT-034），而档案对 `ban` 的结论是逐字写着的
+    「重新登录亦无效……任何尝试只会延长封禁，唯一正确策略是识别、退避并在窗口内
+    **零误触**」。于是网关自相矛盾：建议运维执行一条会去碰「碰一下就更糟」的账号
+    的命令。这正是 OPT-035 那一类「建议与代码行为不一致」，只是发生在建议一侧。
+
+    判据必须**区分成因**，不能一刀切「有避让就跳过」：
+    - `quarantined` / `disabled` -> 跳过。重登对这两者**无效**（封禁作用在账号本身
+      而非令牌；禁用是运维的部署声明），触碰只有害处。
+    - `cooldown` -> **照常登录**。冷却恰恰是重登要修复的东西：OPT-029 的长效人机
+      验证避让，唯一解除路径就是「人工完成滑块 -> 凭证文件变化 -> 网关自动解除」。
+      把冷却也跳过，等于关掉唯一的修复入口——那正是 OPT-026 已经修过的自锁缺陷。
+
+    复用 `touch_avoidance_reason()` 而不是另写一套谓词：同一条声明只允许有一个
+    判读处（本仓库反复出现的「同一份配置两处各自解读」缺陷）。
+
+    只读、零上游调用；任何异常都回退为 `""`（宁可照常登录，也不能因为诊断出错
+    就把运维的修复入口堵死）。
+    """
+    try:
+        from providers.failover import CooldownTracker
+
+        tracker = CooldownTracker()
+        reason = tracker.touch_avoidance_reason(provider)
+    except Exception:  # noqa: BLE001 - 判读失败绝不能让 `all` 变成空操作
+        return ""
+    return reason if reason in ("quarantined", "disabled") else ""
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="扫码登录并自动捕获网页端令牌（Playwright 驱动系统 Chrome）")
     parser.add_argument("provider", choices=["qwen", "deepseek", "doubao", "kimi", "glm", "all"], help="要登录的站点")
@@ -691,6 +728,19 @@ def main() -> int:
     timeout = 60 if args.refresh else 300
     failed = False
     for name in providers:
+        # [LOGIN-SWEEP] 只有 `all` 这一「批量展开」才过滤：运维显式点名某个节点，
+        # 就是在覆盖网关的判断，不得被代替决定。见 _sweep_skip_reason 的说明。
+        if args.provider == "all":
+            skip = _sweep_skip_reason(name)
+            if skip:
+                hint = (
+                    "该节点持有封禁租约（账号级封禁，重登无效，触碰只会延长封禁）"
+                    if skip == "quarantined"
+                    else "该节点已被 DISABLED_PROVIDERS 声明出局（重登无效，需修改配置）"
+                )
+                print(f"== {name.capitalize()}（跳过）==")
+                print(f"  [跳过] {hint}。如确需登录，请显式执行：login.py {name}")
+                continue
         mode_str = "静默刷新" if args.refresh else "弹窗登录/人机校验"
         print(f"== {name.capitalize()}（{mode_str}）==")
         try:
