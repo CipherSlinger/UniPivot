@@ -159,11 +159,88 @@ def test_tool_call_reaches_upstream_prompt_end_to_end():
     print("test_tool_call_reaches_upstream_prompt_end_to_end: PASSED")
 
 
+def test_server_side_action_records_are_not_user_messages():
+    """服务端动作回执（web_search_call 等）不得以原始 JSON 落成**用户发言**。
+
+    第 43 节为 `reasoning` 修过一次的正是同一个兜底分支，但其余类型仍然漏：
+    客户端把上一轮 output 原样回放时，`web_search_call` / `file_search_call` /
+    `computer_call` / `mcp_call` / `image_generation_call` / `code_interpreter_call`
+    全部落进 `else`，被 `extract_responses_content` 序列化成 JSON 塞进 user 通道。
+    模型于是看到「用户说了一段自己没有发过的调用记录」——上下文污染，且它无法
+    知道那次搜索**实际上发生过**，可能立刻重复同一请求。
+
+    回执必须以 **assistant** 身份出现，并保留动作内容（谁搜了什么）。
+    """
+    for item_type in ("web_search_call", "file_search_call", "computer_call",
+                      "mcp_call", "image_generation_call", "code_interpreter_call"):
+        req = ResponsesRequest.model_validate({
+            "model": "gpt-4o",
+            "input": [
+                {"type": "message", "role": "user", "content": "查一下"},
+                {"type": item_type, "id": "s1", "status": "completed",
+                 "action": {"type": "search", "query": "claude docs"}},
+            ],
+        })
+        msgs = convert_responses_to_gateway_messages(req)
+        users = [m for m in msgs if m["role"] == "user"]
+        leaked = [m for m in users if '"type":' in str(m.get("content", ""))]
+        assert not leaked, (
+            f"{item_type} 以原始 JSON 落进了用户通道: {leaked[0]['content'][:90]!r}"
+        )
+        last = msgs[-1]
+        assert last["role"] == "assistant", (
+            f"{item_type} 的回执不是 assistant 身份: {last}"
+        )
+        assert "claude docs" in last["content"], (
+            f"{item_type} 的回执丢掉了动作内容，模型会重复同一请求: {last['content']!r}"
+        )
+    print("test_server_side_action_records_are_not_user_messages: PASSED")
+
+
+def test_truly_unknown_items_are_announced_not_dumped():
+    """完全未知的类型：既不得灌原始 JSON，也不得静默消失。
+
+    静默消失让模型把「它没看到」当成「它不存在」，然后据此作答。
+    """
+    req = ResponsesRequest.model_validate({
+        "model": "gpt-4o",
+        "input": [
+            {"type": "message", "role": "user", "content": "hi"},
+            {"type": "some_future_item_type", "payload": {"secret": 1}},
+        ],
+    })
+    msgs = convert_responses_to_gateway_messages(req)
+    # 断言必须落在**消息正文**上。第一版这里 `json.dumps(msgs)` 后再找 `"secret"`，
+    # 而嵌套字符串里的引号会被转义成 `\"secret\"`，于是无论代码怎么写都找不到——
+    # 一条永远为真的断言（它在修复前的代码上照样通过）。
+    blob = "\n".join(str(m.get("content", "")) for m in msgs)
+    assert "secret" not in blob, f"未知条目被整体序列化进了提示词: {blob[-160:]!r}"
+    assert "some_future_item_type" in blob, "未知条目完全消失了，模型无从知道有内容缺失"
+    print("test_truly_unknown_items_are_announced_not_dumped: PASSED")
+
+
+def test_unknown_anthropic_blocks_are_announced_not_dropped():
+    """Anthropic 侧的同一类缺陷：未知块类型此前**静默消失**。"""
+    from providers.anthropic_compat import extract_anthropic_content
+
+    text = extract_anthropic_content([
+        {"type": "text", "text": "before"},
+        {"type": "server_tool_use", "id": "s1"},
+        {"type": "web_search_tool_result", "content": [{"title": "x"}]},
+    ])
+    assert "before" in text
+    for probe in ("server_tool_use", "web_search_tool_result"):
+        assert probe in text, f"未知块 {probe} 静默消失了，模型会以为它不存在"
+
+
 def run_all():
     test_assistant_message_tool_calls_are_replayed()
     test_both_history_shapes_render_identically()
     test_multiple_tool_calls_in_one_message_all_survive()
     test_tool_call_reaches_upstream_prompt_end_to_end()
+    test_server_side_action_records_are_not_user_messages()
+    test_truly_unknown_items_are_announced_not_dumped()
+    test_unknown_anthropic_blocks_are_announced_not_dropped()
     print("\n✅ All Responses history tool-call tests passed!")
 
 

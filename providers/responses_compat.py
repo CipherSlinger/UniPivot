@@ -243,6 +243,52 @@ def _tool_call_block(tc: Any) -> str:
     return f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```"
 
 
+# Responses 里**服务端执行**的调用记录。它们由模型发起、由服务器执行，回放时
+# 必须以 assistant 身份出现并带上动作内容——不是用户说的话，也不是可执行调用。
+_SERVER_SIDE_ITEM_TYPES = {
+    "web_search_call",
+    "file_search_call",
+    "computer_call",
+    "mcp_call",
+    "mcp_list_tools",
+    "image_generation_call",
+    "code_interpreter_call",
+}
+
+
+def _server_side_action_text(item_type: str, item: dict) -> str:
+    """把服务端动作回执渲染成一句模型可用的说明。
+
+    保留**动作是什么**（搜索词、执行的命令、调用的工具名），因为模型据此决定
+    下一步要不要再查；只写「发生了一次搜索」会让它重复同一请求。
+    """
+    label = item_type.removesuffix("_call").replace("_", " ") or "server action"
+    action = item.get("action") if isinstance(item.get("action"), dict) else {}
+    # 各类型把「做了什么」放在不同字段里，按优先级找一个可读的。
+    detail = ""
+    for key in ("query", "command", "name", "tool", "type", "prompt"):
+        val = action.get(key) if action else None
+        if val is None and isinstance(item.get(key), (str, int, float)):
+            val = item.get(key)
+        if val:
+            detail = str(val)
+            break
+    if not detail:
+        for key in ("queries", "search_query", "input"):
+            val = item.get(key) or (action.get(key) if action else None)
+            if isinstance(val, list) and val:
+                detail = ", ".join(str(v) for v in val[:3])
+                break
+            if isinstance(val, str) and val:
+                detail = val
+                break
+    status = item.get("status")
+    suffix = f" (status: {status})" if status and status != "completed" else ""
+    if detail:
+        return f"[Server action: {label} — {detail}]{suffix}"
+    return f"[Server action: {label} was performed by the server; its payload is not available]{suffix}"
+
+
 def _reasoning_item_text(item: dict) -> str:
     """从 Responses 的 reasoning output item 中取出可回放的思考文本。
 
@@ -356,6 +402,26 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                     # 存储型引用（本网关无 responses 存储，无法解析）与压缩占位：
                     # 它们**不是内容**，跳过远好于把原始 JSON 当成用户输入。
                     continue
+                elif item_type in _SERVER_SIDE_ITEM_TYPES or (
+                    item_type.endswith("_call")
+                    and item_type not in ("function_call", "custom_tool_call", "shell_call")
+                ):
+                    # [TOOL-LOOP] 服务端自己执行的调用记录（`web_search_call`、
+                    # `file_search_call`、`computer_call`、`mcp_call`、
+                    # `image_generation_call`、`code_interpreter_call`、`mcp_list_tools`…）。
+                    #
+                    # 此前它们全都落进下面的兜底分支，被 `extract_responses_content`
+                    # 序列化成一段原始 JSON，当成 **user 发言**发给上游——模型看到的是
+                    # 一条自己没有发出过的调用记录（第 43 节为 `reasoning` 修过的正是
+                    # 同一个兜底分支，这里补上它剩下的那一半）。这些条目**不是用户说的话**：
+                    # 它们是服务器动作的回执，模型需要知道的是「发生过什么」，而不是
+                    # 收到一段 JSON 去猜。
+                    #
+                    # 回执归属 **assistant**（动作由模型发起），并且保留动作的关键内容，
+                    # 而不是只写一句「发生了一次搜索」——模型据此决定下一步是否要再搜。
+                    record = _server_side_action_text(item_type, item)
+                    if record:
+                        messages.append({"role": "assistant", "content": record})
                 elif item_type == "function_call":
                     name = item.get("name") or (
                         item.get("function", {}).get("name")
@@ -450,9 +516,17 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                                 c_text = (c_text + "\n" + "\n".join(tc_parts)).strip()
                         messages.append({"role": role, "content": c_text})
                 else:
-                    c_text = extract_responses_content(item)
-                    if c_text:
-                        messages.append({"role": "user", "content": c_text})
+                    # 到这里已经不是任何一种已知条目。**绝不能**再把它序列化成
+                    # 原始 JSON 当成用户发言：那是第 43 节（reasoning）与本节
+                    # （服务端动作回执）两次缺陷的共同形态——模型收到一段自己不认识的
+                    # JSON，上下文被污染，且错误地以为用户说了这些。未知类型只留一句
+                    # 带类型的说明，让模型知道此处有它看不到的内容，而不是让它去猜。
+                    unknown_type = str(item.get("type") or "unknown")
+                    messages.append({
+                        "role": "user",
+                        "content": f"[Client item omitted: {unknown_type} — "
+                                   "this gateway cannot render it]",
+                    })
 
     return messages
 

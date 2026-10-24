@@ -226,6 +226,13 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
                     parts.append(IMAGE_PLACEHOLDER)
             elif "text" in block and block["text"]:
                 parts.append(str(block["text"]))
+            else:
+                # 未知块类型既不是文本也不是已知结构。旧实现让它**静默消失**——
+                # 客户端明明发了内容，模型却完全不知道它存在，于是把「没看到」
+                # 当成「没有」，据此作答。与 Responses 侧同一类缺陷（原始 JSON
+                # 灌进用户通道），这里的诚实做法是留下一条带类型的占位说明。
+                b_unknown = str(b_type or "unknown")
+                parts.append(f"[Content omitted: {b_unknown} — this gateway cannot render it]")
     return "\n".join(parts)
 
 
