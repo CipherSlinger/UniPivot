@@ -217,11 +217,12 @@ CODEX_HOME=/path/to/that/dir codex exec "Implement a binary search function in p
 
 #### 3. Real-Binary End-to-End Acceptance (the only test that answers "do agents actually work?")
 ```bash
-.venv/bin/python scripts/e2e/run_agent_loop.py                 # both binaries, if installed
-.venv/bin/python scripts/e2e/run_agent_loop.py --client codex  # one arm
-.venv/bin/python scripts/e2e/run_agent_loop.py --keep          # keep artifacts to inspect
+.venv/bin/python scripts/e2e/run_agent_loop.py                  # both binaries, if installed
+.venv/bin/python scripts/e2e/run_agent_loop.py --client codex   # one arm
+.venv/bin/python scripts/e2e/run_agent_loop.py --rounds 10      # a long agent session
+.venv/bin/python scripts/e2e/run_agent_loop.py --keep           # keep artifacts to inspect
 ```
-A pass requires **three** independent proofs, not the client's stdout: the marker file was really created on disk by the real binary, at least two upstream bodies were captured (a tool result came back), and the captured prompt carried both the tool contract and `[Tool Result for <id>]`. A missing binary is SKIPPED, never counted as a pass. This is not part of the offline suite — it needs the real `claude` / `codex` binaries and takes ~30s per arm.
+A pass requires **four** independent proofs, not the client's stdout: a marker file really created on disk by the real binary, **one marker per round** (so "round *n* executed" is proven, not inferred), at least two upstream bodies captured (a tool result came back), and the captured prompt carrying both the tool contract and `[Tool Result for <id>]`. A missing binary is SKIPPED, never counted as a pass. This is not part of the offline suite — it needs the real `claude` / `codex` binaries and takes ~30s per arm.
 
 ---
 
@@ -693,10 +694,12 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
     - **The harness itself is now in the repository, not in `/tmp`.** Every `tests/test_*.py` suite is offline and asserts on the gateway's own objects; those suites stay green even if the client rejects every byte the gateway sends. `scripts/e2e/scripted_upstream.py` + `scripts/e2e/run_agent_loop.py` make the **real binary** the judge of the one question the project exists to answer, and they assert the loop on three independent pieces of evidence: the marker file the client really created (not the gateway's claim), at least two upstream bodies (a tool result came back), and the captured prompt really carried both the tool contract and `[Tool Result for <id>]`.
     - **Both agent CLIs verified green, measured — this is the product's acceptance criterion, not a demo:**
       ```
-      claude: PASS (exit=0, rounds=2, tool_ran=True, tool=Bash)          # 2.1.293, Bash chosen out of 24 declared
-      codex:  PASS (exit=0, rounds=2, tool_ran=True, tool=exec_command)  # 0.145.0, exec_command out of 9 declared
+      claude: PASS (exit=0, bodies=11, tool_ran=True, tool=Bash,         tool_markers=10/10)  # 2.1.293
+      codex:  PASS (exit=0, bodies=11, tool_ran=True, tool=exec_command, tool_markers=10/10)  # 0.145.0
       ```
-      In both cases the marker file was created by the **real binary** and round 2 received `[Tool Result for <id>]` in the captured upstream prompt.
+      Both arms also pass at 2 and 5 rounds. In every case **one marker file per round** was created by the real binary, so the proof is "round *n* really executed", not "some round did"; and the final answer came only after the client had seen every `[Tool Result for <id>]` in the captured prompt.
+    - **`--rounds` exists because two rounds prove the loop closes, not that it *stays* closed.** A two-request loop only exercises the first history replay. Real agent sessions run 5–15 calls, and each round re-sends the whole accumulated history through the protocol handlers — so an item-indexing defect (section 32b), a history-replay defect (sections 43/45) or a stop-truncation defect (section 35) can be invisible at round 2 and fatal at round 5. Driving 10 rounds with both real binaries is the cheapest instrument that covers the shape the product is actually used in.
+    - **Two harness traps in the multi-round path, both measured.** The per-round marker command must be **appended** to the base one (`base && touch ROUND_n`); an earlier version replaced it, and every multi-round run reported "the client never executed the tool" while all five `ROUND_*` markers sat on disk — a harness defect that reads exactly like a product defect. And each client needs its **own** working directory, or "round 3 of claude" is satisfiable by "round 3 of codex".
     - **The Codex arm was red for a while and the failure was not where it looked.** It failed with `name '_collect_reclaim_task' is not defined` — a half-landed refactor in `providers/failover.py` where the upstream stream's `finally` referenced a task name that existed nowhere in the repo (`grep` hit only that one line). Every streaming request died at the reclaim seam, so no `[Tool Result]` could ever come back and the loop could not close. The durable fix is `_close_raw_stream()`: it dispatches the close as an **independent task** and shields the wait, so the upstream is closed *before* `_release_sem()` even on the cancellation path. Verified with counters on the real HTTP path: `opened == closed` per node, semaphores returned value-for-value, `active_concurrency == 0`, across all three protocols. **The lesson: a resource-release path that only runs on the disconnect branch is invisible to any test that never disconnects — the E2E binary was the instrument that surfaced it.**
     - **Three harness traps, each of which produced a false reading before it was fixed** (all recorded in CLAUDE.md section 60 for the earlier `/tmp` version, and now encoded in the script): a `pkill -f` in the same compound Bash command kills its own process group and returns 144, so the `nohup` half never runs and the next `curl` gets 000; the round detector must match a **real** id (`\[Tool Result for [A-Za-z0-9_-]+`) because the gateway's own tool-contract text contains the literal `[Tool Result for <id>]`; and the tool must be chosen from the names the client **declared** (picking the first declared name selects `Agent` on Claude Code, which spawns a subagent instead of running the marker command — the loop "closes" while measuring the wrong thing). The script now prefers a configured shell-tool order (`Bash`, `exec_command`, …) but only among declared names.
 

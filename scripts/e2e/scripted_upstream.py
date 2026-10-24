@@ -60,6 +60,16 @@ LOG = LOG_DIR / f"bodies_{os.environ.get('E2E_PORT', '0')}.jsonl"
 # What the tool is asked to do. A shell tool echoes it; a file tool writes it.
 _WANT = os.environ.get("E2E_WANT", "echo e2e-ok")
 
+# Directory the per-round markers are written into (only used when E2E_ROUNDS > 1).
+_WANT_DIR = os.environ.get("E2E_WANT_DIR", ".")
+
+# How many tool rounds to drive before answering. A two-round loop proves the
+# closed loop; it does NOT prove the loop *stays* closed. Real agent sessions run
+# 5-15 tool calls, and every round re-sends the accumulated history through the
+# protocol handlers, so a defect in history replay, item indexing or stop
+# truncation can be invisible at round 2 and fatal at round 5.
+_ROUNDS = max(1, int(os.environ.get("E2E_ROUNDS", "1")))
+
 # Which declared tool to drive, in preference order. It still has to be *declared
 # by the client* — this list only decides among declared names, it never invents
 # one. Each client declares a different shell tool: Claude Code `Bash`, Codex
@@ -179,9 +189,23 @@ class LoopProvider:
         # text contains the literal "[Tool Result for <id>]", so a bare
         # substring check fires on round one and the loop never happens
         # (measured; see CLAUDE.md section 60).
-        already_ran = re.search(r"\[Tool Result for [A-Za-z0-9_-]+", prompt) is not None
-        if not already_ran:
+        done = len(re.findall(r"\[Tool Result for [A-Za-z0-9_-]+", prompt))
+        if done < _ROUNDS:
             name, args = chosen
+            # The marker differs per round so the runner can prove THAT round ran,
+            # not merely that some round did.
+            n = done + 1
+            if isinstance(args, dict) and _ROUNDS > 1:
+                for k in ("cmd", "command", "input"):
+                    if isinstance(args.get(k), str):
+                        # APPEND, do not replace: the base command creates the
+                        # primary marker that proves the tool really ran at all,
+                        # and the per-round marker proves *which* round it was.
+                        # Replacing it (measured) made every multi-round run
+                        # report "the client never executed the tool" while all
+                        # five round markers sat on disk.
+                        args = {**args, k: f"{args[k]} && touch {_WANT_DIR}/ROUND_{n}"}
+                        break
             yield "I'll check.\n", {}
             yield (
                 "```tool_call\n"

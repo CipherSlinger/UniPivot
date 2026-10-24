@@ -22,6 +22,13 @@ What it proves
 
 Design notes that cost real debugging time
 ------------------------------------------
+* `--rounds > 1` **appends** the per-round marker command to the base one. An
+  earlier version replaced it, so every multi-round run reported "the client
+  never executed the tool" while all five ROUND_* markers sat on disk (measured).
+  The base marker proves the tool ran at all; the per-round one proves *which*
+  round — both are needed, so the command is `base && touch ROUND_n`.
+* Each client gets its own working directory. Sharing one makes "round 3 of
+  claude" satisfiable by "round 3 of codex".
 * A probe server must be started in its **own** Bash invocation: `pkill -f` in a
   compound command kills its own process group and returns 144, so the `nohup`
   half never runs and the next `curl` gets 000.
@@ -35,9 +42,13 @@ Usage
 -----
     .venv/bin/python scripts/e2e/run_agent_loop.py            # both clients present
     .venv/bin/python scripts/e2e/run_agent_loop.py --client claude
+    .venv/bin/python scripts/e2e/run_agent_loop.py --rounds 10  # long agent session
     .venv/bin/python scripts/e2e/run_agent_loop.py --keep     # keep artifacts for inspection
 
-Exit code 0 means every client that is installed closed a full two-round loop.
+Exit code 0 means every client that is installed closed the full loop: the client
+really ran each round's tool (one marker file per round), and its final answer
+came after it had seen every tool result.
+
 A missing binary is *skipped*, never silently counted as a pass.
 """
 
@@ -77,7 +88,7 @@ def _wait_ready(url: str, timeout: float = 60.0) -> bool:
     return False
 
 
-def _start_gateway(port: int, log_dir: Path, want: str) -> subprocess.Popen:
+def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path) -> subprocess.Popen:
     """Start the scripted upstream.
 
     `want` has to reach the **server**: it is the model in the scripted upstream
@@ -91,6 +102,8 @@ def _start_gateway(port: int, log_dir: Path, want: str) -> subprocess.Popen:
         "E2E_LOG_DIR": str(log_dir),
         "E2E_PORT": str(port),
         "E2E_WANT": want,
+        "E2E_ROUNDS": str(rounds),
+        "E2E_WANT_DIR": str(want_dir),
         "PYTHONUNBUFFERED": "1",
     }
     log = open(log_dir / f"srv_{port}.log", "wb")
@@ -232,6 +245,9 @@ def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--client", choices=("claude", "codex", "both"), default="both")
     ap.add_argument("--keep", action="store_true", help="keep artifacts for inspection")
+    ap.add_argument("--rounds", type=int, default=1,
+                    help="tool rounds to drive before the model answers (default 1, i.e. a "
+                         "two-request loop). Raise it to exercise long agent sessions.")
     args = ap.parse_args()
 
     log_dir = Path(tempfile.mkdtemp(prefix="unipivot_e2e_"))
@@ -245,8 +261,14 @@ def main() -> int:
 
     for name in clients:
         port = _free_port()
-        marker = work / f"{name.upper()}_E2E_MARKER"
-        proc = _start_gateway(port, log_dir, want=f"touch {marker}")
+        # One working directory per client: the per-round markers of the two arms
+        # would otherwise be indistinguishable, and "round 3 of claude" could be
+        # satisfied by "round 3 of codex".
+        client_work = work / name
+        client_work.mkdir()
+        marker = client_work / f"{name.upper()}_E2E_MARKER"
+        proc = _start_gateway(port, log_dir, want=f"touch {marker}",
+                              rounds=args.rounds, want_dir=client_work)
         try:
             if not _wait_ready(f"http://127.0.0.1:{port}/health"):
                 failures.append(f"{name}: gateway never became ready on :{port}")
@@ -254,10 +276,14 @@ def main() -> int:
                 continue
             print(f"[e2e] {name}: gateway up on :{port}; driving the real binary…")
             res = (
-                run_claude(port, work, log_dir, marker)
+                run_claude(port, client_work, log_dir, marker)
                 if name == "claude"
-                else run_codex(port, work, log_dir, marker)
+                else run_codex(port, client_work, log_dir, marker)
             )
+            res["rounds_expected"] = args.rounds
+            res["markers"] = sorted(
+                p.name for p in client_work.glob("ROUND_*")
+            ) if args.rounds > 1 else []
             results.append(res)
             print(f"[e2e] {name}: {json.dumps({k: v for k, v in res.items() if k != 'stdout'}, ensure_ascii=False)}")
             if "skipped" in res:
@@ -273,6 +299,15 @@ def main() -> int:
                     f"{name}: only {res['bodies']} upstream request(s) — a two-round "
                     f"loop needs at least 2; the tool result never came back"
                 )
+            if args.rounds > 1:
+                want_markers = {f"ROUND_{i}" for i in range(1, args.rounds + 1)}
+                missing = sorted(want_markers - set(res.get("markers") or []))
+                if missing:
+                    failures.append(
+                        f"{name}: only {len(res.get('markers') or [])}/{args.rounds} tool "
+                        f"rounds really executed (missing {missing}) — the loop stopped "
+                        f"early; bodies={res['bodies']}"
+                    )
             if not res["has_tools_section"]:
                 failures.append(f"{name}: the upstream prompt carried no tool contract")
             if not res["round2_saw_result"]:
@@ -290,11 +325,17 @@ def main() -> int:
         if "skipped" in r:
             print(f"  {r['client']}: SKIPPED")
         else:
-            ok = r["marker"] and r["bodies"] >= 2 and r["has_tools_section"] and r["round2_saw_result"]
+            markers_ok = (
+                len(r.get("markers") or []) >= r.get("rounds_expected", 1)
+                if r.get("rounds_expected", 1) > 1 else True
+            )
+            ok = (r["marker"] and r["bodies"] >= 2 and r["has_tools_section"]
+                  and r["round2_saw_result"] and markers_ok)
             print(
                 f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
-                f"(exit={r['exit']}, rounds={r['bodies']}, tool_ran={r['marker']}, "
-                f"tool={r['chosen'][0] if r['chosen'] else None})"
+                f"(exit={r['exit']}, bodies={r['bodies']}, tool_ran={r['marker']}, "
+                f"tool={r['chosen'][0] if r['chosen'] else None}, "
+                f"tool_markers={len(r.get('markers') or [])}/{r.get('rounds_expected', 1)})"
             )
     for f in failures:
         print(f"  !! {f}")
