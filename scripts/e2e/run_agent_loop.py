@@ -115,6 +115,26 @@ def _configured_limits() -> dict:
         return {}
 
 
+def _write_env() -> dict:
+    """Env the *gateway* needs to serve a file-writing tool call.
+
+    Separate from the client's env on purpose: the client needs the sentence
+    (`E2E_WANT`), the scripted upstream needs the path and content that sentence
+    refers to. Conflating them is how a write-mode run ends up asking a patch tool
+    to run `touch …`.
+
+    The path is the **relative** `_WRITE_NAME`, never an absolute one: one gateway
+    serves both clients (and, in `--sessions` mode, several sessions), so the only
+    way the same tool call can land in the right working directory for each of
+    them is to let each client's own cwd resolve it.
+    """
+    return {
+        "E2E_WRITE": "1" if _WRITE_MODE() else "0",
+        "E2E_WANT_PATH": _WRITE_NAME,
+        "E2E_WANT_CONTENT": _WANT_CONTENT,
+    }
+
+
 def _start_gateway(port: int, log_dir: Path, want: str, rounds: int, want_dir: Path,
                    parallel: bool = False, same: bool = False,
                    extra_env: dict | None = None,
@@ -276,11 +296,26 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
              marker: Path, stdout: str) -> dict:
     markers = sorted(p.name for p in work.glob("ROUND_*"))
     base = work / "E2E_MARKER"
+    # [E2E-WRITE] In write mode the marker file IS the file the agent was told to
+    # create, so its *content* is the evidence: `touch` and a real `Write` are
+    # indistinguishable by existence alone, and the question this mode exists to
+    # answer is whether the model's text survived the transport — a tool call
+    # whose arguments were mangled still creates an (empty) file at the right
+    # path. Read it here rather than in each verdict so all three run modes
+    # (single, parallel, same-binary) get the same measurement.
+    written: str | None = None
+    if marker.exists():
+        try:
+            written = marker.read_text(encoding="utf-8", errors="replace")
+        except OSError:                      # pragma: no cover - unreadable is not "absent"
+            written = ""
     return {
         "client": client,
         "exit": exit_code,
         "bodies": len(bodies),
         "marker": marker.exists() or base.exists(),
+        "written": written,
+        "content_ok": (written.strip() == _WANT_CONTENT) if written is not None else None,
         "markers": markers,
         "declared": (bodies[-1]["declared_tools"] if bodies else []),
         "chosen": (bodies[-1]["chosen_tool"] if bodies else None),
@@ -319,8 +354,80 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
     }
 
 
+def _WRITE_MODE() -> bool:
+    """[E2E-WRITE] Whether this run drives a file-writing tool.
+
+    A function, not a module constant: `--write` is parsed after import, and a
+    module-level constant would then be a second reading of the same
+    configuration decided before the flag existed.
+
+    It reads `os.environ` rather than an argparse value on purpose. `main()` sets
+    the variable once and every child process (the gateway and the client) starts
+    from `os.environ`, so the runner, the scripted upstream and the client cannot
+    hold three different opinions about which mode this run is in — the defect
+    shape this file's own comments keep recording.
+    """
+    return os.environ.get("E2E_WRITE") == "1"
+
+
+# [E2E-WRITE] The content the client must actually write to disk.
+#
+# Compared **after stripping**, because the two clients cannot produce
+# byte-identical files for the same instruction: Claude Code's `Write` puts the
+# string verbatim, while Codex's `apply_patch` necessarily ends each added line
+# with a newline. An exact match would fail one of them for a reason that has
+# nothing to do with the gateway, and the assertion that matters is "our content
+# arrived", not "the trailing newline was formatted the same way".
+_WANT_CONTENT = "e2e-ok"
+
+# [E2E-WRITE] The written file's name, deliberately **relative**.
+#
+# The three run modes attribute evidence differently (per-client working
+# directory, per-client subdirectory, per-session directory), and a relative
+# target inherits that attribution for free: each client process resolves it
+# against its own cwd, so two concurrent clients cannot satisfy each other's
+# assertion and no per-session path has to be negotiated with a single shared
+# gateway. An absolute path here would require the upstream to know which client
+# is calling — information it does not have.
+_WRITE_NAME = "e2e_marker.txt"
+
+
+def _write_target(work: Path) -> Path:
+    """Where this working directory's written file must land."""
+    return work / _WRITE_NAME
+
+
+def _write_failure(res: dict, name: str) -> str | None:
+    """The write-mode content verdict, shared by all three run modes.
+
+    One definition on purpose: the three verdict blocks already differ in how they
+    attribute evidence, and a per-mode copy of "did the content arrive" is exactly
+    how one arm keeps passing while another silently stops checking. An absent
+    file is left to the existing marker check — reporting it twice would print two
+    failures for one cause.
+    """
+    if not _WRITE_MODE() or not res.get("marker"):
+        return None
+    if res.get("content_ok"):
+        return None
+    return (
+        f"{name}: the agent created the file but its CONTENT is wrong "
+        f"(wrote {res.get('written')!r}, expected {_WANT_CONTENT!r}) — a tool call "
+        "with mangled arguments still creates a file at the right path, so an "
+        "existence check cannot see this"
+    )
+
+
 def _claude_argv(port: int, work: Path, log_dir: Path, marker: Path):
-    want = f"touch {marker}"
+    # [E2E-WRITE] In write mode the client must CREATE the marker file rather
+    # than `touch` it, so the instruction and the permitted tool both change.
+    # The measurement only means something if the file did not exist before: a
+    # patch that edits a pre-created file passes even when our content never
+    # arrived.
+    if _WRITE_MODE():
+        want = f"Write the file {marker} with exactly this content: e2e-ok"
+    else:
+        want = f"touch {marker}"
     env = {
         **os.environ,
         "ANTHROPIC_BASE_URL": f"http://127.0.0.1:{port}",
@@ -331,9 +438,17 @@ def _claude_argv(port: int, work: Path, log_dir: Path, marker: Path):
         "E2E_WANT": want,
     }
     (log_dir / "claudehome").mkdir(exist_ok=True)
+    # [E2E-WRITE] `--allowedTools` used to be the literal "Bash", so the ONE
+    # capability the project exists for — an agent that *writes code* — was
+    # never driven by the real binary. Measuring it needs the client to permit
+    # the file tool; leaving it hardcoded meant a `Write` run was denied by the
+    # client and hung until the harness timeout, which reads as a gateway
+    # failure and is not one.
+    allowed = os.environ.get("E2E_ALLOWED_TOOLS") or ("Write,Edit,Read" if _WRITE_MODE() else "Bash")
+    prompt = want if _WRITE_MODE() else f"Run `{want}` then tell me what it printed."
     return [
-        shutil.which("claude"), "-p", f"Run `{want}` then tell me what it printed.",
-        "--model", "claude-3-7-sonnet", "--allowedTools", "Bash",
+        shutil.which("claude"), "-p", prompt,
+        "--model", "claude-3-7-sonnet", "--allowedTools", allowed,
     ], env
 
 
@@ -355,7 +470,16 @@ def _codex_argv(port: int, work: Path, log_dir: Path, marker: Path):
     if not codex:
         return None, None
 
-    want = f"touch {marker}"
+    # [E2E-WRITE] Codex declares no `Write`; its only file-writing path is the
+    # freeform `apply_patch` tool, so the instruction must describe a file rather
+    # than a shell command. The sentence still names a plain file and content —
+    # the *client's* model decides how to express that, and the scripted upstream
+    # answers in whichever declared tool fits. Prompting "apply_patch …" would be
+    # the harness teaching the tool it is supposed to be measuring.
+    if _WRITE_MODE():
+        want = f"Create the file {marker} containing exactly this text: {_WANT_CONTENT}"
+    else:
+        want = f"touch {marker}"
     # `OPENAI_BASE_URL` is NOT honoured by codex 0.145.0 — measured against the
     # real binary: with only that env var set, `ModelProviderInfo` reports
     # `base_url: None` and the CLI connects to `wss://api.openai.com/v1/responses`
@@ -389,11 +513,12 @@ trust_level = "trusted"
         "CODEX_HOME": str(codex_home),
         "E2E_WANT": want,
     }
+    prompt = want if _WRITE_MODE() else f"Run `{want}` then tell me what it printed."
     return [
         codex, "exec", "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
         "-m", "gpt-5.5",
-        f"Run `{want}` then tell me what it printed.",
+        prompt,
     ], env
 
 
@@ -430,12 +555,17 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
     root.mkdir()
     names = [f"{args.client}-{i + 1}" for i in range(args.sessions)]
     procs = {}
+    # One marker definition per session, kept beside `procs` so the spawn loop and
+    # the verdict cannot disagree about where the evidence lands.
+    session_markers: dict[str, Path] = {}
     # Hold each response briefly so concurrent sessions really pile up: a fast
     # stub makes "peak in-flight" a matter of timing luck, and a semaphore that
     # leaks would then be indistinguishable from one that holds.
-    gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
+    gw = _start_gateway(port, log_dir,
+                        want=(f"write {_WRITE_NAME}" if _WRITE_MODE() else "touch E2E_MARKER"),
+                        rounds=args.rounds,
                         want_dir=root, parallel=True, same=True,
-                        extra_env={"E2E_HOLD_SECONDS": "0.4"},
+                        extra_env={"E2E_HOLD_SECONDS": "0.4", **_write_env()},
                         two_calls=getattr(args, "two_calls", False))
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
@@ -446,7 +576,11 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
         for name in names:
             d = root / name
             d.mkdir()
-            marker = d / "e2e_marks" / "E2E_MARKER"
+            # [E2E-WRITE] Same per-mode split as the other two run modes; the
+            # relative target resolves against this session's cwd, which is what
+            # keeps two concurrent sessions of one binary apart.
+            marker = _write_target(d) if _WRITE_MODE() else d / "e2e_marks" / "E2E_MARKER"
+            session_markers[name] = marker
             if args.client == "claude":
                 argv, env = _claude_argv(port, d, log_dir, marker)
             else:
@@ -480,7 +614,11 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
             continue
         d = root / name
         marks = d / "e2e_marks"
-        res = _collect(name, p.returncode, bodies_all, marks, marks / "E2E_MARKER",
+        # `_collect` derives the per-round marker list from `work`; in write mode
+        # the marker itself lives in the session root (the agent writes it there),
+        # so the path comes from the spawn loop rather than being re-derived here.
+        res = _collect(name, p.returncode, bodies_all, marks,
+                       session_markers.get(name, marks / "E2E_MARKER"),
                        outs.get(name, ""))
         res["rounds_expected"] = args.rounds
         # Both sessions declare `Bash`, so upstream bodies CANNOT be attributed
@@ -496,6 +634,9 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
               f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
         if not res["marker"]:
             failures.append(f"{name}: never executed a tool (marker absent)")
+        _wf = _write_failure(res, name)
+        if _wf:
+            failures.append(_wf)
         if args.rounds > 1 and len(res["markers"]) < args.rounds:
             # At one round no per-round marker is ever written (see the parallel
             # mode's identical guard); `--sessions N --rounds 1` was red on a
@@ -612,7 +753,14 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
     marker_paths = {}
     for name in ("claude", "codex"):
         (root / name).mkdir()
-        marker_paths[name] = root / name / f"{name.upper()}_E2E_MARKER"
+        # [E2E-WRITE] One marker definition per mode, not two that can drift:
+        # in shell mode the marker is a file the shell `touch`es, in write mode
+        # it is the file the agent itself creates. Both sides (the verdict below
+        # and `_collect`'s content read) take the path from here.
+        marker_paths[name] = (
+            _write_target(root / name) if _WRITE_MODE()
+            else root / name / f"{name.upper()}_E2E_MARKER"
+        )
     # Hold each response briefly, for the same reason the same-binary mode does:
     # the run's whole claim is that the two clients' upstream requests really
     # overlapped, and with an instant stub that is timing luck. Measured:
@@ -620,9 +768,11 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
     # verdict on a completely healthy run, because at one round each client only
     # makes two requests and they missed each other. A hold makes the overlap a
     # property of the setup rather than of the scheduler.
-    gw = _start_gateway(port, log_dir, want="touch E2E_MARKER", rounds=args.rounds,
+    gw = _start_gateway(port, log_dir,
+                        want=(f"write {_WRITE_NAME}" if _WRITE_MODE() else "touch E2E_MARKER"),
+                        rounds=args.rounds,
                         want_dir=root, parallel=True,
-                        extra_env={"E2E_HOLD_SECONDS": "0.4"},
+                        extra_env={"E2E_HOLD_SECONDS": "0.4", **_write_env()},
                         two_calls=getattr(args, "two_calls", False))
     try:
         if not _wait_ready(f"http://127.0.0.1:{port}/health"):
@@ -673,6 +823,9 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
               f"{json.dumps({k: v for k, v in res.items() if k not in ('stdout', 'declared')}, ensure_ascii=False)}")
         if not res["marker"]:
             failures.append(f"{name}: never executed a tool (marker absent)")
+        _wf = _write_failure(res, name)
+        if _wf:
+            failures.append(_wf)
         if len(res["markers"]) < args.rounds:
             # At one round the stub is never asked to write a per-round marker
             # (`_command_for` only rewrites the command when ROUNDS > 1), so this
@@ -760,7 +913,27 @@ def main() -> int:
                     help="with --parallel: how many concurrent sessions of ONE binary to "
                          "drive (they all hit the same upstream account). Use --client to "
                          "pick which binary; default 2.")
+    ap.add_argument("--write", action="store_true",
+                    help="drive the client's FILE-WRITING tool (Claude Code `Write`, Codex "
+                         "`apply_patch`) and assert the file's content, instead of running a "
+                         "shell command. This is the capability the project exists for: a "
+                         "shell `touch` proves the tool loop closes, not that an agent can "
+                         "write code through it.")
     args = ap.parse_args()
+
+    if args.write and (args.two_calls or args.rounds > 1):
+        # Both of those modes rebuild the tool arguments as a shell command
+        # (`_command_for` / `_second_call_marker` append `&& touch …`), which a
+        # patch argument cannot carry. Refusing beats silently running a shell
+        # loop and labelling it a write measurement.
+        print("[e2e] --write cannot be combined with --rounds/--two-calls "
+              "(those modes rebuild the call as a shell command)")
+        return 2
+    if args.write:
+        # The runner, the client and the scripted upstream each read this
+        # variable; setting it once here is why none of them can disagree about
+        # the mode. It is also inherited by every child process via `**os.environ`.
+        os.environ["E2E_WRITE"] = "1"
 
     log_dir = Path(tempfile.mkdtemp(prefix="unipivot_e2e_"))
     work = log_dir / "work"
@@ -789,10 +962,17 @@ def main() -> int:
         # satisfied by "round 3 of codex".
         client_work = work / name
         client_work.mkdir()
-        marker = client_work / f"{name.upper()}_E2E_MARKER"
-        proc = _start_gateway(port, log_dir, want=f"touch {marker}",
-                              rounds=args.rounds, want_dir=client_work,
-                              two_calls=getattr(args, "two_calls", False))
+        marker = (
+            _write_target(client_work) if _WRITE_MODE()
+            else client_work / f"{name.upper()}_E2E_MARKER"
+        )
+        proc = _start_gateway(
+            port, log_dir,
+            want=(f"write {_WRITE_NAME}" if _WRITE_MODE() else "touch E2E_MARKER"),
+            rounds=args.rounds, want_dir=client_work,
+            extra_env=_write_env(),
+            two_calls=getattr(args, "two_calls", False),
+        )
         try:
             if not _wait_ready(f"http://127.0.0.1:{port}/health"):
                 failures.append(f"{name}: gateway never became ready on :{port}")
@@ -819,6 +999,9 @@ def main() -> int:
                     f"{name}: the client never really executed the tool "
                     f"(marker absent; chosen={res['chosen']}, declared={res['declared'][:6]})"
                 )
+            _wf = _write_failure(res, name)
+            if _wf:
+                failures.append(_wf)
             if res["bodies"] < 2:
                 failures.append(
                     f"{name}: only {res['bodies']} upstream request(s) — a two-round "

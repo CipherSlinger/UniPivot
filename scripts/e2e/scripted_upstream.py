@@ -63,6 +63,20 @@ LOG = LOG_DIR / f"bodies_{os.environ.get('E2E_PORT', '0')}.jsonl"
 # What the tool is asked to do. A shell tool echoes it; a file tool writes it.
 _WANT = os.environ.get("E2E_WANT", "echo e2e-ok")
 
+# [E2E-WRITE] Drive a FILE-WRITING tool instead of a shell tool.
+#
+# Why this is a separate mode rather than "just pick Write": the two clients
+# write files through completely different declarations. Claude Code has a
+# `Write` tool with `{file_path, content}`; Codex has NO `Write` at all — the
+# only way it edits a file is the freeform `apply_patch` custom tool, whose
+# argument is a raw patch under `{"input": ...}`. Driving `apply_patch` with a
+# shell command (which `_args_for` used to do for any `input` field) produces a
+# parse failure the client reports as "the patch is not a patch", so the run
+# would measure the transport and prove nothing about editing code.
+_WRITE = os.environ.get("E2E_WRITE") == "1"
+_WANT_PATH = os.environ.get("E2E_WANT_PATH", "e2e_marker.txt")
+_WANT_CONTENT = os.environ.get("E2E_WANT_CONTENT", "e2e-ok\n")
+
 # Seconds to hold a response open, making concurrent requests pile up on purpose.
 # Without it "peak in-flight" depends on timing luck: five fast requests may never
 # overlap, and a broken semaphore would look identical to a working one.
@@ -161,10 +175,22 @@ _ROUNDS = max(1, int(os.environ.get("E2E_ROUNDS", "1")))
 # `exec_command`. Picking the first declared name instead (measured) selects
 # `Agent` on Claude Code, which spawns a subagent rather than running the marker
 # command, and selects a namespace note on Codex.
+#
+# [E2E-WRITE] The order must flip in write mode. Both clients declare their shell
+# tool *and* a file tool, so leaving shell first means the stub asks `Bash` to run
+# the sentence "Write the file … with exactly this content: e2e-ok" — a command
+# that fails, or writes nothing, while the run looks like it exercised writing.
+# That is the same mistake as the runner's hardcoded `--allowedTools Bash`, one
+# layer down: the client was permitted to write, and the upstream never asked it
+# to. Codex's file tool is the freeform custom tool `apply_patch` (it declares no
+# `Write` at all), hence the two names.
+_DEFAULT_PREFERENCE = (
+    "Write,apply_patch,Edit,Bash,exec_command,shell,local_shell"
+    if _WRITE else
+    "Bash,exec_command,shell,local_shell,Write,Edit"
+)
 _PREFERRED = tuple(
-    p for p in os.environ.get(
-        "E2E_PREFERRED_TOOLS", "Bash,exec_command,shell,local_shell,Write,Edit"
-    ).split(",") if p
+    p for p in os.environ.get("E2E_PREFERRED_TOOLS", _DEFAULT_PREFERENCE).split(",") if p
 )
 
 
@@ -259,7 +285,7 @@ def _schema_for(prompt: str, name: str) -> dict | None:
         return None
 
 
-def _args_for(schema: dict) -> dict:
+def _args_for(schema: dict, name: str = "") -> dict:
     props = schema.get("properties") or {}
     required = list(schema.get("required") or [])
     if not required:
@@ -269,15 +295,34 @@ def _args_for(schema: dict) -> dict:
                 break
     args = {}
     for key in required:
-        if key in ("cmd", "command", "input"):
+        if key in ("cmd", "command"):
             args[key] = _WANT
+        elif key == "input":
+            # [E2E-WRITE] A freeform tool's `input` is raw text, not a shell
+            # command. Codex's `apply_patch` is the ONE way Codex writes a file
+            # (it declares no `Write`), so driving it with a `touch` command
+            # tests the transport and proves nothing about editing code.
+            args[key] = _patch_text() if _WRITE else _WANT
         elif key in ("file_path", "path"):
-            args[key] = os.environ.get("E2E_WANT_PATH", "e2e_marker.txt")
+            args[key] = _WANT_PATH
         elif key in ("content", "file_text"):
-            args[key] = "e2e-ok"
+            args[key] = _WANT_CONTENT
         else:
             args[key] = "e2e"
     return args
+
+
+def _patch_text() -> str:
+    """A minimal `apply_patch` body that CREATES the marker file.
+
+    Delta-only on purpose: a patch that edits a file the harness pre-created
+    would pass even if the client never sent our content anywhere, because the
+    file already existed. `*** Add File:` can only succeed if the patch really
+    arrived, character for character.
+    """
+    rel = os.path.basename(_WANT_PATH)
+    body = "".join(f"+{line}\n" for line in _WANT_CONTENT.splitlines() or [""])
+    return f"*** Begin Patch\n*** Add File: {rel}\n{body}*** End Patch\n"
 
 
 def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
@@ -293,7 +338,7 @@ def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
         schema = _schema_for(prompt, name)
         if schema is None:
             continue
-        args = _args_for(schema)
+        args = _args_for(schema, name)
         if args:
             return name, args
     return "no_such_tool", {}
@@ -414,7 +459,15 @@ class LoopProvider:
             # which the client's cwd resolves to the session root instead, so a
             # healthy `--sessions 2 --rounds 1` reported "never executed a tool
             # (marker absent)" on both sessions (measured, CLAUDE.md section 68).
-            if isinstance(args, dict) and (_ROUNDS > 1 or _SAME):
+            # [E2E-WRITE] Never in write mode. `_command_for` builds a shell
+            # command, and the argument here is a `content` string or an
+            # `apply_patch` body: replacing either with `mkdir -p e2e_marks && …`
+            # would write that command as the file's content, which the content
+            # assertion then reports as "mangled arguments" — blaming the transport
+            # for the harness's own rewrite. Write mode is single-round only and
+            # uses a relative path, so each client's cwd already does the
+            # attribution this branch exists to provide.
+            if isinstance(args, dict) and (_ROUNDS > 1 or _SAME) and not _WRITE:
                 for k in ("cmd", "command", "input"):
                     if isinstance(args.get(k), str):
                         # The command is rebuilt from the round number, never by
