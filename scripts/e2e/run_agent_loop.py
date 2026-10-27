@@ -191,14 +191,24 @@ def _marker_seen(marker: Path) -> bool:
 
 # How to tell one client's upstream bodies from the other's when both share a
 # gateway: each CLI declares its own shell tool and no other.
-_OWN_TOOL = {"claude": "Bash", "codex": "exec_command"}
+#
+# [RESPONSES-LITE] Codex has TWO shapes, and both are Codex: the flat models
+# (`gpt-5.5`) declare `exec_command`, while the lite models (`gpt-5.6-sol` /
+# `-terra` / `-luna`) declare `exec` and nothing else. A single-name map was
+# measured reporting `bodies=0` — "the client never reached the gateway" — for a
+# run whose captured log held three bodies and whose loop had really closed.
+# The attribution rule had gone blind, and the verdict blamed the transport.
+_OWN_TOOLS = {"claude": ("Bash",), "codex": ("exec_command", "exec")}
 
 
 def _bodies_for(bodies: list[dict], client: str) -> list[dict]:
-    tool = _OWN_TOOL.get(client)
-    if not tool:
+    tools = _OWN_TOOLS.get(client)
+    if not tools:
         return bodies
-    return [b for b in bodies if tool in (b.get("declared_tools") or [])]
+    return [
+        b for b in bodies
+        if any(tool in (b.get("declared_tools") or []) for tool in tools)
+    ]
 
 
 def _failures_for(failures: list[str], owner: str, clients: list[str]) -> list[str]:
@@ -537,9 +547,15 @@ def _codex_argv(port: int, work: Path, log_dir: Path, marker: Path):
     # testing the gateway at all — they are testing OpenAI.
     codex_home = log_dir / "codexhome"
     codex_home.mkdir(exist_ok=True)
+    # [RESPONSES-LITE] `gpt-5.6-sol` / `-terra` / `-luna` carry
+    # `use_responses_lite: true` in Codex's own catalog: they send `tools: null`
+    # and declare every tool inside `input[0]` (`{"type":"additional_tools"}`).
+    # The default stays `gpt-5.5` (the flat-tools shape); override to exercise the
+    # lite shape, because one harness run cannot prove both.
+    codex_model = os.environ.get("UNIPIVOT_E2E_CODEX_MODEL", "gpt-5.5")
     (codex_home / "config.toml").write_text(
         f'''model_provider = "unipivot"
-model = "gpt-5.5"
+model = "{codex_model}"
 model_reasoning_effort = "low"
 disable_response_storage = true
 approval_policy = "never"
@@ -565,7 +581,7 @@ trust_level = "trusted"
     return [
         codex, "exec", "--skip-git-repo-check",
         "--dangerously-bypass-approvals-and-sandbox",
-        "-m", "gpt-5.5",
+        "-m", codex_model,
         prompt,
     ], env
 

@@ -38,7 +38,7 @@ from __future__ import annotations
 import json
 import time
 from typing import Any, Dict, List, Optional, Tuple, Union
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 
 from .anthropic_compat import (
     FREEFORM_TOOL_INPUT_KEY,
@@ -55,6 +55,61 @@ from .base import (
     _id,
     error_response,
 )
+
+
+# [RESPONSES-LITE] 部分 Codex 模型（目录里 `use_responses_lite: true` 的那几个）把工具
+# 声明放进 `input` 的第 0 项，而不是顶层 `tools`：顶层 `tools` 是 `None`、
+# `instructions` 是空串，真实声明形如
+#
+#     {"type": "additional_tools", "role": "developer",
+#      "tools": [{"type": "custom", "name": "exec", ...}, ...]}
+#
+# 搬运到顶层是本模块**唯一**的正确位置：下游有四处独立读取 `req.tools`
+# （提示词、解析白名单、freeform 出口分派、namespace 映射），只修其中一处会让
+# 另外三处继续按「没有任何工具」行事。
+_ADDITIONAL_TOOLS_TYPE = "additional_tools"
+
+
+def hoist_additional_tools(
+    input_items: Any, tools: Optional[List[dict]]
+) -> Tuple[Any, Optional[List[dict]]]:
+    """把 `additional_tools` 条目里的声明搬进顶层 `tools`，并移除已消费的条目。
+
+    返回 `(新的 input, 新的 tools)`。没有这种条目时**原样返回同一个对象**，调用方
+    据此判断是否需要重新展平（零回归：普通请求走的仍是原来的路径）。
+
+    合并规则：顶层 `tools` 是客户端的显式通道，同名声明以它为准；其余按客户端声明
+    顺序追加，同名只保留第一次出现——同一个工具在提示词里出现两次会让模型看到两套
+    参数契约（§70 的「描述也是契约」）。
+    """
+    if not isinstance(input_items, list):
+        return input_items, tools
+
+    declared: List[dict] = []
+    remaining: List[Any] = []
+    for item in input_items:
+        if isinstance(item, dict) and item.get("type") == _ADDITIONAL_TOOLS_TYPE:
+            for sub in item.get("tools") or []:
+                if isinstance(sub, dict):
+                    declared.append(sub)
+            continue
+        remaining.append(item)
+
+    if not declared:
+        return input_items, tools
+
+    merged: List[dict] = []
+    seen: set = set()
+    for tool in list(tools or []) + declared:
+        if not isinstance(tool, dict):
+            continue
+        name = tool.get("name")
+        if isinstance(name, str) and name:
+            if name in seen:
+                continue
+            seen.add(name)
+        merged.append(tool)
+    return remaining, merged
 
 
 class ResponsesRequest(BaseModel):
@@ -117,6 +172,29 @@ class ResponsesRequest(BaseModel):
         功能开关），网关绝不硬编码。
         """
         return flatten_declared_tools(tools)
+
+    @model_validator(mode="after")
+    def _hoist_lite_tool_declarations(self):
+        """[RESPONSES-LITE] 把 `input` 里的 `additional_tools` 声明搬进 `self.tools`。
+
+        实测（真实 `codex exec -m gpt-5.6-sol` + 脚本化上游）：顶层 `tools: null`，
+        声明全在 `input[0]`。此前这条条目落进转换器的 `elif "role" in item` 分支，
+        变成一条 `content: ""` 的 `developer` 消息，声明整段消失——上游提示词里
+        `has_tools_section: False`、`declared_tools: []`，客户端退出码 0，一个工具
+        都没执行，没有任何错误可看。
+
+        放在模型层而不是转换器里，是因为 `req.tools` 的下游读者有四处（提示词、
+        `resolve_allowed_tools`、`freeform_tool_names`、`namespace_of_tools`），
+        分布在流式与非流式两条路径上；在入口归一化一次，四处自动一致。
+        """
+        remaining, merged = hoist_additional_tools(self.input, self.tools)
+        if merged is self.tools:
+            return self
+        self.input = remaining
+        # 展平只发生在这一处定义里（`flatten_namespace_tools`）：搬运进来的
+        # `collaboration` 这样的 namespace 容器必须与顶层声明走同一条路。
+        self.tools = flatten_declared_tools(merged)
+        return self
 
 
 def responses_text_format(req: "ResponsesRequest") -> Optional[dict]:

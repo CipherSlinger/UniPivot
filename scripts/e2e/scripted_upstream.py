@@ -112,10 +112,17 @@ _SAME = os.environ.get("E2E_SAME") == "1"
 
 
 def _client_tag(tool_name: str) -> str:
-    """Which agent CLI declared this tool. Only used to separate markers."""
+    """Which agent CLI declared this tool. Only used to separate markers.
+
+    `exec` is Codex's lite-model tool (the JS orchestrator); it is the same
+    client as `exec_command`, so it must land in the same marker directory or a
+    `--parallel` lite run would write its markers somewhere the runner never
+    looks (measured: `bodies=0` for a run that had really executed the tool,
+    because the *attribution* rule, not the transport, had gone blind).
+    """
     if tool_name == "Bash":
         return "claude"
-    if tool_name == "exec_command":
+    if tool_name in ("exec_command", "exec"):
         return "codex"
     return tool_name or "unknown"
 
@@ -184,10 +191,20 @@ _ROUNDS = max(1, int(os.environ.get("E2E_ROUNDS", "1")))
 # layer down: the client was permitted to write, and the upstream never asked it
 # to. Codex's file tool is the freeform custom tool `apply_patch` (it declares no
 # `Write` at all), hence the two names.
+# [RESPONSES-LITE] Codex's lite models (`gpt-5.6-sol` / `-terra` / `-luna`, the
+# catalog entries flagged `use_responses_lite: true`) declare NO shell tool: the
+# only way they run a command is `exec`, a freeform (custom) tool carrying a
+# JavaScript orchestrator whose contract is `await tools.exec_command({cmd})`.
+# The other declared names (`wait`, `request_user_input`, the `collaboration`
+# sub-tools) cannot execute anything, so without `exec` in this list a lite run
+# would fall through to declaration order and ask a non-executing tool to touch
+# the marker — "the client never ran the tool" reported for a harness reason.
+# It sits last among the shell tools so a client that declares a real shell tool
+# still drives that one.
 _DEFAULT_PREFERENCE = (
     "Write,apply_patch,Edit,Bash,exec_command,shell,local_shell"
     if _WRITE else
-    "Bash,exec_command,shell,local_shell,Write,Edit"
+    "Bash,exec_command,shell,local_shell,exec,Write,Edit"
 )
 _PREFERRED = tuple(
     p for p in os.environ.get("E2E_PREFERRED_TOOLS", _DEFAULT_PREFERENCE).split(",") if p
@@ -285,7 +302,61 @@ def _schema_for(prompt: str, name: str) -> dict | None:
         return None
 
 
-def _args_for(schema: dict, name: str = "") -> dict:
+def _exec_input(command: str) -> str:
+    """Wrap a shell command in lite `exec`'s JavaScript orchestrator call.
+
+    [RESPONSES-LITE] `exec` is freeform, so its argument is raw text — but not a
+    shell command: its description (10,495 chars, captured verbatim in
+    `tests/fixtures/codex_responses_lite_additional_tools.json`) declares
+    `declare const tools: { exec_command(args: {cmd: string, …}) }`, called as
+    `await tools.exec_command(...)`. Handing it `echo e2e-ok` verbatim — what
+    `_args_for` did for every freeform `input` — is a JavaScript syntax error:
+    the tool IS called, fails inside the client, and the marker never appears,
+    which reads exactly like "the gateway dropped the tool call" (§60/§68's
+    trap).
+
+    No `return`, deliberately and measured: Codex evaluates `input` as a
+    **script body**, so a top-level `return` is a parse error — the first
+    version of this wrote `return await …` and the client answered
+    `Script error:\nSyntaxError: Illegal return statement`, i.e. the tool ran,
+    the command did not. A trailing expression is the script's value.
+
+    The argument is an **object**, also measured: `exec`'s description says
+    "Nested tool methods take either a string or an object", but the real
+    `exec_command` implementation rejects the string form with
+    `Script error:\ntool \`exec_command\` expects a JSON object for arguments`
+    — the script ran, the command never did, and the marker stayed absent,
+    which reads exactly like "the gateway dropped the call". `{"cmd": …}` is
+    the shape the flat models' own `exec_command` declaration uses.
+    """
+    return "await tools.exec_command(" + json.dumps({"cmd": command}) + ")"
+
+
+def _with_command(name: str, args: dict, command: str) -> dict:
+    """Return `args` with the tool's command-carrying field replaced.
+
+    One place, because the two callers below (per-round markers, second-call
+    markers) must produce the *same* wire shape as the first call. Re-deriving
+    it at each site is how a lite run ends up sending a bare shell command to a
+    JavaScript tool on round two only.
+    """
+    for key in ("cmd", "command", "input"):
+        if isinstance(args.get(key), str):
+            value = _exec_input(command) if (key == "input" and name == "exec") else command
+            return {**args, key: value}
+    return args
+
+
+def _args_for(schema: dict, name: str = "") -> tuple[dict, str]:
+    """Return (wire arguments, the shell command they carry or "").
+
+    The command is returned rather than re-derived by the caller. The first
+    version of this read it back out of `args` (`args["input"] == _WANT`), which
+    is exactly wrong for lite `exec`: its `input` is the JavaScript wrapper, not
+    the command, so the marker rewrite silently stopped happening and every
+    multi-round lite run would have reported "round 1 only" for a harness
+    reason (measured). One producer, one value.
+    """
     props = schema.get("properties") or {}
     required = list(schema.get("required") or [])
     if not required:
@@ -294,22 +365,30 @@ def _args_for(schema: dict, name: str = "") -> dict:
                 required = [cand]
                 break
     args = {}
+    command = ""
     for key in required:
         if key in ("cmd", "command"):
             args[key] = _WANT
+            command = _WANT
         elif key == "input":
             # [E2E-WRITE] A freeform tool's `input` is raw text, not a shell
-            # command. Codex's `apply_patch` is the ONE way Codex writes a file
-            # (it declares no `Write`), so driving it with a `touch` command
-            # tests the transport and proves nothing about editing code.
-            args[key] = _patch_text() if _WRITE else _WANT
+            # command. Codex's `apply_patch` is the ONE way Codex (non-lite)
+            # writes a file (it declares no `Write`), so driving it with a
+            # `touch` command tests the transport and proves nothing about
+            # editing code.
+            if name == "exec":
+                args[key] = _exec_input(_WANT)
+                command = _WANT
+            else:
+                args[key] = _patch_text() if _WRITE else _WANT
+                command = "" if _WRITE else _WANT
         elif key in ("file_path", "path"):
             args[key] = _WANT_PATH
         elif key in ("content", "file_text"):
             args[key] = _WANT_CONTENT
         else:
             args[key] = "e2e"
-    return args
+    return args, command
 
 
 def _patch_text() -> str:
@@ -325,12 +404,18 @@ def _patch_text() -> str:
     return f"*** Begin Patch\n*** Add File: {rel}\n{body}*** End Patch\n"
 
 
-def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
-    """Return (name, args) for a tool the CLIENT actually declared.
+def _pick_declared_tool(prompt: str) -> tuple[str, dict, str]:
+    """Return (name, args, command) for a tool the CLIENT actually declared.
 
     Preference order matters: it decides *which declared tool executes
     observably*, never whether a name may be called. Falls back to
-    ("no_such_tool", {}) so a missing contract is loud rather than silent.
+    ("no_such_tool", {}, "") so a missing contract is loud rather than silent.
+
+    `command` is the shell command the chosen tool will run, carried alongside
+    the wire arguments because the per-round and second-call markers replace it:
+    they must go through `_with_command` rather than patching `args` directly,
+    or a lite `exec` call would receive a bare command on rounds 2+ (see
+    `_exec_input`). It is `""` when the tool runs no command (`apply_patch`).
     """
     declared = _declared_tools(prompt)
     ordered = [n for n in _PREFERRED if n in declared] + [n for n in declared if n not in _PREFERRED]
@@ -338,10 +423,10 @@ def _pick_declared_tool(prompt: str) -> tuple[str, dict]:
         schema = _schema_for(prompt, name)
         if schema is None:
             continue
-        args = _args_for(schema, name)
+        args, command = _args_for(schema, name)
         if args:
-            return name, args
-    return "no_such_tool", {}
+            return name, args, command
+    return "no_such_tool", {}, ""
 
 
 # Distinct ids for distinct conversations. `itertools.count` is safe here: the
@@ -449,7 +534,7 @@ class LoopProvider:
         calls_per_round = 2 if _TWO_CALLS else 1
         done = results // calls_per_round
         if done < _ROUNDS:
-            name, args = chosen
+            name, args, command = chosen
             # The marker differs per round so the runner can prove THAT round ran,
             # not merely that some round did.
             n = done + 1
@@ -467,30 +552,28 @@ class LoopProvider:
             # for the harness's own rewrite. Write mode is single-round only and
             # uses a relative path, so each client's cwd already does the
             # attribution this branch exists to provide.
-            if isinstance(args, dict) and (_ROUNDS > 1 or _SAME) and not _WRITE:
-                for k in ("cmd", "command", "input"):
-                    if isinstance(args.get(k), str):
-                        # The command is rebuilt from the round number, never by
-                        # rewriting the base one: the base marker proves the tool
-                        # really ran at all, the per-round marker proves *which*
-                        # round. An earlier version replaced the base command
-                        # (measured) and every multi-round run reported "the
-                        # client never executed the tool" while all five round
-                        # markers sat on disk.
-                        args = {**args, k: _command_for(name, n)}
-                        break
+            if (_ROUNDS > 1 or _SAME) and not _WRITE and command:
+                # The command is rebuilt from the round number, never by
+                # rewriting the base one: the base marker proves the tool
+                # really ran at all, the per-round marker proves *which*
+                # round. An earlier version replaced the base command
+                # (measured) and every multi-round run reported "the
+                # client never executed the tool" while all five round
+                # markers sat on disk.
+                command = _command_for(name, n)
+                args = _with_command(name, args, command)
             calls = [(name, args)]
-            if _TWO_CALLS:
+            if _TWO_CALLS and command:
                 # The second call must be *distinguishable* in the marker
                 # directory, otherwise "both ran" and "one ran twice" look the
-                # same on disk.
-                many = dict(args)
+                # same on disk. Built through `_with_command` so a lite `exec`
+                # call keeps its JavaScript wrapper instead of receiving a bare
+                # shell command (which the client would report as a JS syntax
+                # error).
                 second_marker = _second_call_marker(name)
-                for k in ("cmd", "command", "input"):
-                    if isinstance(many.get(k), str):
-                        many[k] = many[k] + f" && touch {second_marker}"
-                        break
-                calls.append((name, many))
+                calls.append(
+                    (name, _with_command(name, args, f"{command} && touch {second_marker}"))
+                )
             yield "I'll check.\n", {}
             for cname, cargs in calls:
                 yield (
