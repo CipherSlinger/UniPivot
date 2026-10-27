@@ -525,6 +525,83 @@ def test_the_dedup_key_distinguishes_absent_from_declared_default():
     print("test_the_dedup_key_distinguishes_absent_from_declared_default: PASSED")
 
 
+class _RecordingProvider(_Provider):
+    """记录网关交给 provider 的 `max_tokens`，其余行为与 `_Provider` 一致。"""
+
+    seen: list = []
+
+    async def chat(self, messages, model, **kw):
+        _RecordingProvider.seen.append(kw.get("max_tokens"))
+        async for item in _Provider.chat(self, messages, model, **kw):
+            yield item
+
+
+def _record_provider_budget(fn) -> list:
+    _Provider.script = [("ok ", {})] + [("", {"conversation_id": "rec-conv"})]
+    _RecordingProvider.seen = []
+    srv._make_provider = lambda *a, **kw: _RecordingProvider()
+    try:
+        fn()
+    finally:
+        srv._make_provider = _guarded_factory
+    return list(_RecordingProvider.seen)
+
+
+def test_the_provider_is_told_the_declared_budget_not_a_fabricated_one():
+    """[PROTOCOL] 上游请求记录里不许出现客户端从未说过的数字。
+
+    实测（真实 `codex exec` 0.145.0，抓包 6/6 个 `/v1/responses` 请求体）：
+    请求的键是 `client_metadata / include / input / instructions / model /
+    parallel_tool_calls / prompt_cache_key / reasoning / store / stream / text /
+    tool_choice / tools` —— **既没有 `max_output_tokens`，也没有 `max_tokens`**。
+    Codex 从不声明输出预算。
+
+    可是 e2e 的结论行在真实运行里打印了 `codex: PASS (… budget=4096)`。那个 4096
+    来自 `max_tokens = req.max_output_tokens or req.max_tokens or 4096`：网关自己
+    编了一个数字塞进 provider 的调用参数，而度量跑到的正是这条调用参数。于是
+    「客户端声明了 4096」这句话从头到尾没有人测量过——§67/§69 那一类「仪器报告了
+    它没有测量到的数字」，只不过这次的仪器是 e2e 结论行，被报告的数字进了 §96 的
+    证据链。
+
+    同一条请求里本来就有三个「客户端预算」的读者：执行（`TokenBudget(_declared_
+    token_budget(req))`）、去重键（同上）、以及喂给 provider 的兼容参数。前两者
+    用声明判据，第三者是编的——一个事实两份定义，而编出来的那份是唯一会被记录、
+    被读取、被当成证据的那份。现在三者都只认声明：客户端没写，就传 `None`（这五个
+    上游都忽略该参数，实测无任何 provider 读它，因此行为不变）。
+    """
+    from fastapi.testclient import TestClient
+
+    def one(path: str, body: dict) -> list:
+        return _record_provider_budget(
+            lambda: TestClient(srv.app).post(path, json=body))
+
+    cases = [
+        ("chat/未声明", "/v1/chat/completions",
+         {"model": "gpt-4o", "messages": [{"role": "user", "content": "go"}]}, None),
+        ("chat/声明 512", "/v1/chat/completions",
+         {"model": "gpt-4o", "messages": [{"role": "user", "content": "go"}],
+          "max_tokens": 512}, 512),
+        ("messages/未声明", "/v1/messages",
+         {"model": "claude-3-5-sonnet",
+          "messages": [{"role": "user", "content": "go"}]}, None),
+        ("messages/声明 512", "/v1/messages",
+         {"model": "claude-3-5-sonnet",
+          "messages": [{"role": "user", "content": "go"}], "max_tokens": 512}, 512),
+        ("responses/未声明", "/v1/responses",
+         {"model": "gpt-4o", "input": [{"role": "user", "content": "go"}]}, None),
+        ("responses/声明 512", "/v1/responses",
+         {"model": "gpt-4o", "input": [{"role": "user", "content": "go"}],
+          "max_output_tokens": 512}, 512),
+    ]
+    for label, path, body, want in cases:
+        seen = one(path, body)
+        assert seen == [want], (
+            f"{label}: 网关交给上游的 max_tokens 是 {seen}，应当是 {want!r}"
+            f"（编造的数字与声明在请求记录里无法区分，而下游把这份记录当证据）"
+        )
+    print("test_the_provider_is_told_the_declared_budget_not_a_fabricated_one: PASSED")
+
+
 def run_all():
     test_chat_non_streaming_honours_max_tokens_and_reports_length()
     test_chat_streaming_honours_max_tokens_and_reports_length()
@@ -537,8 +614,9 @@ def run_all():
     test_a_tool_call_beyond_the_cut_is_never_delivered()
     test_the_token_budget_has_exactly_one_definition()
     test_the_dedup_key_distinguishes_absent_from_declared_default()
+    test_the_provider_is_told_the_declared_budget_not_a_fabricated_one()
     assert not _GUARD_HITS, f"有请求绕过了脚本化 provider: {_GUARD_HITS}"
-    print("\n✅ All max_tokens budget tests passed! (11 cases)")
+    print("\n✅ All max_tokens budget tests passed! (12 cases)")
 
 
 if __name__ == "__main__":

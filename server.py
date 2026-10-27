@@ -2659,9 +2659,16 @@ async def chat_completions(req: ChatCompletionRequest):
             messages.insert(0, {"role": "system", "content": block})
 
     temperature = req.temperature if req.temperature is not None else 0.7
-    max_tokens = req.max_tokens if req.max_tokens is not None else 2048
+    max_tokens = _declared_token_budget(req)
     # [PROTOCOL] 客户端声明的输出上界在网关侧执行（见 providers/stop_sequences.py）。
-    # 上面那个 2048 只是喂给上游的提示，**不是**客户端的契约：没有声明就不截断。
+    # 喂给 provider 的这个参数**就是**同一个声明：这里原先写的是
+    # `req.max_tokens if ... else 2048`，即客户端没写也要编一个数字进请求记录。
+    # 五个上游都不读它（实测：`chat()` 只把它当兼容参数收下，没有任何一处使用），
+    # 所以编造不会改变上游行为——它唯一的后果是让**读这份记录的人**分不清
+    # 「客户端声明了 2048」和「客户端什么都没说」。e2e 结论行正是这样的读者：
+    # 它对从不声明预算的 Codex 打印了 `budget=4096`（§96 的 `or 4096`），而那句话
+    # 从头到尾没有人测量过（§67/§69：仪器报告了它没有测量到的数字）。
+    # 一个事实一份定义——执行、去重键、请求记录三处都只认 `_declared_token_budget`。
     token_budget = TokenBudget(_declared_token_budget(req))
 
     # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
@@ -3598,9 +3605,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     input_text = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(input_text)
     temperature = req.temperature if req.temperature is not None else 0.7
-    max_tokens = req.max_tokens or 4096
+    max_tokens = _declared_token_budget(req)
     # [PROTOCOL] `max_tokens` 在这里是**必填**字段，所以每一次 Claude Code 请求都带着它；
     # 网关侧必须真的执行，且只在客户端写过这个键时执行（见 _declared_token_budget）。
+    # 传给 provider 的也是这同一个判据，而不是字段值：`max_tokens: int = 4096` 的
+    # 默认值会让「省略」与「声明 4096」在请求记录里长得一模一样（同 chat 侧的注释）。
     token_budget = TokenBudget(_declared_token_budget(req))
 
     # 判定 thinking 意图
@@ -4441,7 +4450,13 @@ async def responses_endpoint(req: ResponsesRequest):
     input_text = flatten_messages(gateway_messages)
     input_tokens = _est_tokens(input_text)
     temperature = req.temperature if req.temperature is not None else 0.7
-    max_tokens = req.max_output_tokens or req.max_tokens or 4096
+    # [PROTOCOL] 这里原先写的是 `req.max_output_tokens or req.max_tokens or 4096`：
+    # 编造一个预算塞进 provider 的调用参数。它不改变上游行为（五个上游都不读这个
+    # 参数），唯一后果是让请求记录说谎——实测真实 `codex exec` 0.145.0 的 6/6 个
+    # `/v1/responses` 请求体里**既没有** `max_output_tokens` **也没有** `max_tokens`，
+    # 而 e2e 结论行照样打印了 `codex: PASS (… budget=4096)`，因为它的读数正是这个
+    # 参数。执行（`TokenBudget`）、去重键与请求记录现在共用同一个判据。
+    max_tokens = _declared_token_budget(req)
     token_budget = TokenBudget(_declared_token_budget(req))
 
     # 判定 thinking 意图

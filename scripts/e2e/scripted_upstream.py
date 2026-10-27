@@ -520,6 +520,21 @@ class LoopProvider:
                 # this straight to `chat_mode: think|quick`, i.e. it is the
                 # difference between a reasoning model and a plain one.
                 "thinking": bool(kw.get("thinking")),
+                # [PROTOCOL] The output budget the client declared, as the gateway
+                # forwards it. §96 made the gateway ENFORCE it at the cut, so a
+                # real client's number decides whether a normal agent turn is
+                # truncated: if Claude Code declared a small budget and the esti-
+                # mator over-counted, every tool loop would die at round two with
+                # `finish_reason: "length"`. `kw_keys` shows the key exists; only
+                # the value can say whether the enforcement is safe on real traffic.
+                #
+                # This field is only readable *because* the gateway stopped
+                # fabricating a value here (`... or 4096` / `... or 2048`): the
+                # first version of this instrument reported `budget=4096` for a
+                # client that declares nothing at all, i.e. it measured the
+                # gateway's own fallback and printed it as the client's words.
+                # `None` now means exactly "the client declared no budget".
+                "max_tokens": kw.get("max_tokens"),
                 "prompt_len": len(prompt),
                 "has_tools_section": "## Tools Available" in prompt,
                 "declared_tools": _declared_tools(prompt),

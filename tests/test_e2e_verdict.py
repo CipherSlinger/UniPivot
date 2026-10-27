@@ -140,6 +140,43 @@ def test_sessions_mode_reports_the_shared_total_honestly():
     print("test_sessions_mode_reports_the_shared_total_honestly: PASSED")
 
 
+def test_the_declared_output_budget_is_reported_by_every_mode():
+    """[PROTOCOL] §96 made the gateway cut at the client's declared budget, so the
+    budget is now part of what an e2e run has to state.
+
+    Measured with the real binaries: Claude Code declares `max_tokens=32000` on every
+    request, which the estimator turns into ~112 000 characters — no agent turn
+    comes close, so the enforcement never truncates real traffic. Codex declares
+    **nothing** (captured 6/6 `codex exec` 0.145.0 bodies carry neither
+    `max_output_tokens` nor `max_tokens`), so its verdict line carries no `budget=`
+    at all. That asymmetry is the point: the field is only worth printing because
+    the gateway forwards the client's declaration verbatim instead of a fallback
+    of its own — the first version of this field printed `budget=4096` for Codex,
+    which is a number the client never said (measured, then fixed in `server.py`).
+
+    The field is produced in `_collect`, the one builder all three modes share, and
+    formatted in `_verdict_line`, the one formatter — the §82 rule applied to the
+    new field instead of to a new field list.
+    """
+    declared = _line(_result(declared_budget=[32000]))
+    assert "budget=32000" in declared, (
+        f"客户端声明了输出上限，结论行却没有报告它: {declared!r}"
+    )
+    undeclared = _line(_result(declared_budget=[]))
+    assert "budget=" not in undeclared, (
+        f"没有声明上限的客户端被报告成一个预算读数: {undeclared!r}"
+    )
+
+    src = (REPO / "scripts" / "e2e" / "run_agent_loop.py").read_text(encoding="utf-8")
+    collector = src[src.index("def _collect("):]
+    collector = collector[:collector.index("\ndef ", 10)]
+    assert '"declared_budget"' in collector, (
+        "结论行有 budget 字段，但三个模式共用的 _collect() 没有产生它——"
+        "那就只有我测到的那个模式会报告，其余两个继续隐去"
+    )
+    print("test_the_declared_output_budget_is_reported_by_every_mode: PASSED")
+
+
 def test_every_verdict_block_uses_the_one_definition():
     """Structural: three verdict blocks, one formatter, no hand-built copies.
 
@@ -190,8 +227,9 @@ def run_all():
     test_single_round_marker_mode_reports_n_a()
     test_multi_round_marker_mode_reports_the_real_count()
     test_sessions_mode_reports_the_shared_total_honestly()
+    test_the_declared_output_budget_is_reported_by_every_mode()
     test_every_verdict_block_uses_the_one_definition()
-    print("\n✅ All e2e verdict tests passed! (5 cases)")
+    print("\n✅ All e2e verdict tests passed! (6 cases)")
 
 
 if __name__ == "__main__":

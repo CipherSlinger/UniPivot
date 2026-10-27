@@ -371,6 +371,21 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
         # judges separately. Declaring a value here would be asserting Codex's
         # knob against a client that never used it.
         "effort": (_codex_effort() or None) if client == "codex" else None,
+        # [PROTOCOL] The output budget the client declared, as it reached the
+        # provider. Section 96 made the gateway CUT at this number, so it decides
+        # whether a normal agent turn can be truncated at all — measured: Claude
+        # Code declares 32000, which the estimator turns into ~112 000 characters,
+        # and no tool turn comes close. Reporting it puts that margin on every run
+        # instead of leaving it a one-off measurement, and the same field makes a
+        # client that starts declaring a *small* budget visible before the tool
+        # loop dies at `finish_reason: "length"` with nothing pointing at the cause.
+        #
+        # Empty for Codex, and that is the measurement: real `codex exec` 0.145.0
+        # sends neither `max_output_tokens` nor `max_tokens` in `/v1/responses`
+        # (captured 6/6 bodies), so the verdict line carries no `budget=` for it.
+        # The first version of this field printed `budget=4096` there — the
+        # gateway's own `or 4096` fallback read back as if the client had said it.
+        "declared_budget": sorted({b.get("max_tokens") for b in bodies if b.get("max_tokens")}),
         "stdout": stdout[-2000:],
     }
 
@@ -467,6 +482,11 @@ def _verdict_line(res: dict, ok: bool) -> str:
     # every other field: a non-reasoning turn is a perfectly green-looking run.
     if res.get("thinking") is not None:
         parts.append(f"effort={res.get('effort') or '-'},thinking={res.get('thinking')}")
+    # [PROTOCOL] The declared output budget, when the client declared one. Silent
+    # when it did not: `budget=-` on a client that never sent the field would read
+    # as a missing measurement rather than an absent declaration.
+    if res.get("declared_budget"):
+        parts.append("budget=" + "/".join(str(b) for b in res["declared_budget"]))
     return f"{res['client']}: {'PASS' if ok else 'FAIL'} ({', '.join(parts)})"
 
 
