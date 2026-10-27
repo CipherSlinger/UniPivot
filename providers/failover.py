@@ -339,8 +339,16 @@ def classify_capability_ring(provider_key: str, wire_model: str) -> CapabilityRi
 def is_risk_interception(exc_or_text: Any) -> Tuple[bool, str]:
     """识别错误或异常文本是否属于平台级风控/WAF/滑块验证拦截/Token失效。
     返回: (is_risk: bool, reason_detail: str)
+
+    [RISK-TEXT] 传入 `ProviderError` 时，先看 `err_type`：网关自己的零上游拒绝
+    （`is_local_refusal`）一律返回 False。这些报文的措辞里必然带着平台侧的词与节点
+    清单——那是写给运维的成因与处置——若按文案判定，一次没有触碰任何上游的拒绝会被
+    记成一次真实的平台拦截，进而延长冷却、污染账本、并把运维引向一次没发生过的
+    人机验证。调用方必须传异常本身（`f(e)`，不是 `f(e.message)`），标记才可见。
     """
     if exc_or_text is None:
+        return False, ""
+    if getattr(exc_or_text, "is_local_refusal", False):
         return False, ""
     msg = str(exc_or_text).lower()
 

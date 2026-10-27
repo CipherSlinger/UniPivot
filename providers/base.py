@@ -50,6 +50,27 @@ async def ensure_async_client(
         yield shared
 
 
+# [RISK-TEXT] 网关**自己**在本地判定、且**零上游调用**的拒绝类型。
+#
+# 这一类错误的文案是写给运维看的：它必须说明成因与处置，于是必然引用平台侧的词
+# （`ring_exhausted` 写着「需完成人机验证」）并列出节点清单（`qwen(waf，剩余3.0h)`）。
+# 而 `is_risk_interception` 的判据是**文案**，两句话一凑就同时命中「阿里 WAF」规则，
+# 于是一次连 `provider.chat()` 都没发生的拒绝被记成了一次真实的拦截：冷却翻倍、
+# 风控账本新增条目、档案从此让运维去完成一个没发生过的滑块验证。
+#
+# 判据必须是 `err_type`——抛出点唯一知道的事实。用文案反推来源，等于把「我们的结论」
+# 读成「上游的答复」，这是本项目反复修正的同一类错误（OPT-026/029/031/035）。
+LOCAL_REFUSAL_ERR_TYPES = frozenset(
+    {
+        "credential_outage",  # OPT-025 整环凭证失效快速失败
+        "disabled",  # OPT-033 运维禁用硬阻断
+        "quarantined",  # OPT-021 租约硬阻断
+        "ring_exhausted",  # OPT-031 整环长效避让硬阻断
+        "unconfigured",  # [READINESS] 无凭证硬阻断
+    }
+)
+
+
 class ProviderError(Exception):
     """上游（网页端）调用失败，携带给客户端看的错误信息。"""
 
@@ -70,6 +91,20 @@ class ProviderError(Exception):
         # 与「服务端暂时故障」的转述都属于误导。为 None 表示「本次失败是上游
         # 抖动」，那种情况**必须**保持无退避头，让客户端立刻重试下一个候选。
         self.retry_after = retry_after
+
+    @property
+    def is_local_refusal(self) -> bool:
+        """本次失败是否是网关**在本地**判定、且**零上游调用**的拒绝。
+
+        判据是「事实」，不看文案：五道闸口用 `err_type` 声明它（见
+        `LOCAL_REFUSAL_ERR_TYPES`），其余类型若自己带了 `zero_upstream` 标记
+        （例如 [`BudgetExhaustedRefusal`]，它与真实超时共用 `upstream_timeout`
+        这个 err_type，因此只能靠自己的类标记区分）同样算——两者的共同点正是
+        「我们一次 `chat()` 都没有发生」，而这才是分类需要的那个事实。
+        """
+        return self.err_type in LOCAL_REFUSAL_ERR_TYPES or bool(
+            getattr(self, "zero_upstream", False)
+        )
 
 
 class StopSequenceHit(Exception):

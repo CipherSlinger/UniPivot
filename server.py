@@ -2599,7 +2599,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     )
                 )
             except ProviderError as e:
-                is_risk, _ = is_risk_interception(e.message)
+                is_risk, _ = is_risk_interception(e)
                 if is_risk:
                     await failover_router.cooldown_tracker.record_failure(
                         dispatched_provider, e.status, e.message
@@ -2799,7 +2799,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 except ProviderError as e:
                     is_rate_limit = (e.status == 429)
                     error_msg = e.message
-                    is_risk, _ = is_risk_interception(e.message)
+                    is_risk, _ = is_risk_interception(e)
                     if is_risk:
                         await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                     yield sse_frame(error_response(e.message, e.status, e.err_type))
@@ -3074,7 +3074,7 @@ async def chat_completions(req: ChatCompletionRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
-                is_risk, _ = is_risk_interception(e.message)
+                is_risk, _ = is_risk_interception(e)
                 if is_risk:
                     await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                 yield sse_frame(error_response(e.message, e.status, e.err_type))
@@ -3170,7 +3170,7 @@ async def chat_completions(req: ChatCompletionRequest):
     except ProviderError as e:
         is_rate_limit = (e.status == 429)
         error_msg = e.message
-        is_risk, _ = is_risk_interception(e.message)
+        is_risk, _ = is_risk_interception(e)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         if flight_decision and flight_decision.is_leader:
@@ -3478,7 +3478,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 )
             )
         except ProviderError as e:
-            is_risk, _ = is_risk_interception(e.message)
+            is_risk, _ = is_risk_interception(e)
             if is_risk:
                 await failover_router.cooldown_tracker.record_failure(
                     dispatched_provider, e.status, e.message
@@ -3829,7 +3829,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
-                is_risk, _ = is_risk_interception(e.message)
+                is_risk, _ = is_risk_interception(e)
                 if is_risk:
                     await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                 yield anthropic_sse_event(
@@ -3929,7 +3929,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     except ProviderError as e:
         is_rate_limit = (e.status == 429)
         error_msg = e.message
-        is_risk, _ = is_risk_interception(e.message)
+        is_risk, _ = is_risk_interception(e)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         if flight_decision and flight_decision.is_leader:
@@ -4361,7 +4361,7 @@ async def responses_endpoint(req: ResponsesRequest):
         # 配额所有权移交下游流式/聚合分支，由其负责释放
         lb_handed_off = True
     except ProviderError as e:
-        is_risk, _ = is_risk_interception(e.message)
+        is_risk, _ = is_risk_interception(e)
         if is_risk:
             await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
         is_rate_limit = (e.status == 429)
@@ -4691,7 +4691,7 @@ async def responses_endpoint(req: ResponsesRequest):
             except ProviderError as e:
                 is_rate_limit = (e.status == 429)
                 error_msg = e.message
-                is_risk, _ = is_risk_interception(e.message)
+                is_risk, _ = is_risk_interception(e)
                 if is_risk:
                     await failover_router.cooldown_tracker.record_failure(dispatched_provider, e.status, e.message)
                 yield ev.error(e.message, e.status, e.err_type)
