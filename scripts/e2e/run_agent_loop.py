@@ -397,6 +397,54 @@ def _write_target(work: Path) -> Path:
     return work / _WRITE_NAME
 
 
+def _verdict_line(res: dict, ok: bool) -> str:
+    """[E2E-VERDICT] The one place a per-client verdict body is formatted.
+
+    The runner has three verdict blocks (single client, two clients in parallel,
+    N sessions of one binary) and each used to build its own field list. So each
+    rule below had been learned in one block and not in the others:
+
+    * **At one round no per-round marker exists by construction.** That block
+      printed `tool_markers=0/1` on a run that was entirely green — a
+      failure-shaped number next to `PASS` (measured: a `--write` run, where the
+      per-round marker is never written at all). Print `n/a`, or the count when
+      there really are rounds to count.
+    * **`--write`'s evidence is the file's CONTENT, not the marker count.** `touch`
+      and a real `Write` are indistinguishable by existence alone, and a tool call
+      with mangled arguments still creates a file at the right path. Two arms
+      printed `tool_markers=0/1` while their per-client data read
+      `"written": "e2e-ok", "content_ok": true` — the strongest evidence the run
+      established, absent from the only line most runs are ever read through.
+    * **N sessions of one binary share one upstream log**, so a per-session
+      `bodies=` cannot be reported at all; `shared_bodies=` is the honest form
+      (see the `attributable_by` note in the sessions block).
+    * `exit` and `conversation_reused` (the §66/67 session-reuse proof) belong in
+      every mode, not only in the sequential one.
+
+    One definition means the next mode inherits all four; a divergence turns
+    `tests/test_e2e_verdict.py` red instead of printing a convincing line.
+    """
+    want_rounds = res.get("rounds_expected", 1)
+    markers = len(res.get("markers") or [])
+    parts = [f"exit={res.get('exit')}"]
+    if res.get("shared_bodies") is not None:
+        parts.append(f"shared_bodies={res['shared_bodies']}")
+    else:
+        parts.append(f"bodies={res.get('bodies')}")
+    parts.append(f"tool_ran={res.get('marker')}")
+    parts.append(f"tool={(res.get('chosen') or [None])[0]}")
+    if _WRITE_MODE():
+        parts.append(f"written={res.get('written')!r}")
+        parts.append(f"content_ok={res.get('content_ok')}")
+    elif want_rounds > 1:
+        parts.append(f"tool_markers={markers}/{want_rounds}")
+    else:
+        parts.append("tool_markers=n/a")
+    if res.get("session_reused") is not None:
+        parts.append(f"conversation_reused={res.get('session_reused')}")
+    return f"{res['client']}: {'PASS' if ok else 'FAIL'} ({', '.join(parts)})"
+
+
 def _write_failure(res: dict, name: str) -> str | None:
     """The write-mode content verdict, shared by all three run modes.
 
@@ -702,8 +750,7 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
             print(f"  {r['client']}: SKIPPED")
             continue
         ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
-        print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
-              f"(rounds={len(r['markers'])}/{r['rounds_expected']})")
+        print(f"  {_verdict_line(r, ok)}")
     print(f"  {len(bodies_all)} upstream bodies from {len(names)} sessions of one binary, "
           f"{len(set(served))} distinct upstream conversation(s)")
     if peaks:
@@ -878,9 +925,7 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
             print(f"  {r['client']}: SKIPPED")
             continue
         ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
-        print(f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
-              f"(bodies={r['bodies']}, tool_markers={len(r['markers'])}/{r['rounds_expected']}, "
-              f"tool={r['chosen'][0] if r['chosen'] else None})")
+        print(f"  {_verdict_line(r, ok)}")
     seq, switches = _alternation(bodies_all)
     print(f"  concurrent window: {overlap} ms of genuine overlap "
           f"({len(bodies_all)} upstream bodies total)")
@@ -1049,22 +1094,11 @@ def main() -> int:
         if "skipped" in r:
             print(f"  {r['client']}: SKIPPED")
         else:
-            want_rounds = r.get("rounds_expected", 1)
-            markers = len(r.get("markers") or [])
             # PASS is derived from the failure list, never recomputed beside it:
             # a verdict written from a hand-picked subset printed PASS on the
             # line above a fired failure (see `_failures_for`).
             ok = not _failures_for(failures, r["client"], [x["client"] for x in results])
-            # At one round no per-round marker exists by construction, so printing
-            # `tool_markers=0/1` reads as a failure on a run that is entirely green.
-            markers_txt = f"{markers}/{want_rounds}" if want_rounds > 1 else "n/a"
-            print(
-                f"  {r['client']}: {'PASS' if ok else 'FAIL'} "
-                f"(exit={r['exit']}, bodies={r['bodies']}, tool_ran={r['marker']}, "
-                f"tool={r['chosen'][0] if r['chosen'] else None}, "
-                f"tool_markers={markers_txt}, "
-                f"conversation_reused={r.get('session_reused')})"
-            )
+            print(f"  {_verdict_line(r, ok)}")
     for f in failures:
         print(f"  !! {f}")
     if not args.keep:
