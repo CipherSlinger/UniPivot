@@ -819,7 +819,15 @@ def test_metadata_session_id_keys_the_conversation():
     }
     try:
         client = _TC(srv.app)
+        # [SESSION-IDENTITY] 对话线的身份包含「线的起手用户轮」（同一父会话顺序派生
+        # 的两个同级子 agent 只有任务不同，起手轮是唯一能把它们分开的事实，见
+        # `tests/test_subagent_affinity_isolation.py`）。因此每轮重发**全量历史**、
+        # 起手轮不变，才是真实 Anthropic 客户端的形状——协议没有服务端历史，客户端
+        # 每轮自己带。以前这里每轮只发一句 `turn {i}`，等于每轮开一条新线，续聊
+        # 永远不会发生，测的其实是「新会话」而不是本用例声称的「会话身份生效」。
+        history: list[dict] = []
         for i in range(3):
+            history.append({"role": "user", "content": f"turn {i}"})
             r = client.post(
                 "/v1/messages",
                 json={
@@ -827,10 +835,11 @@ def test_metadata_session_id_keys_the_conversation():
                     "max_tokens": 64,
                     "stream": False,
                     "metadata": meta,
-                    "messages": [{"role": "user", "content": f"turn {i}"}],
+                    "messages": list(history),
                 },
             )
             assert r.status_code == 200, r.text
+            history.append({"role": "assistant", "content": "ok"})
     finally:
         srv._make_provider = default_factory
         srv.session_affinity_manager.clear()

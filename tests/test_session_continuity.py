@@ -124,7 +124,13 @@ def test_failover_does_not_hand_a_foreign_upstream_id_to_another_vendor():
         assert r1.status_code == 200, r1.text
         assert r1.headers.get("x-session-affinity") == "fresh"
         assert srv.session_affinity_manager.has_upstream_session(
-            "sess-1", requested_model=srv.resolve_model("glm-4-plus")[1])
+            "sess-1",
+            requested_model=srv.resolve_model("glm-4-plus")[1],
+            # [SESSION-IDENTITY] 起手用户轮是对话线身份的一部分，问「这条线有没有
+            # 上游会话」必须用请求路径算出的同一组身份（见
+            # `tests/test_subagent_affinity_isolation.py`）。
+            line_opening=srv.line_opening_key(HISTORY[:1]),
+        )
         SEEN.clear()
 
         # 第 2 轮：glm 429 → 透明故障转移。同一个会话，全量历史。
@@ -154,15 +160,22 @@ def test_failover_does_not_hand_a_foreign_upstream_id_to_another_vendor():
 
 
 def _line(session_id: str, model_alias: str):
-    """对话线的注册表键：会话 id + 工具契约 + **解析后**的上游模型。
+    """对话线的注册表键：会话 id + 工具契约 + **解析后**的上游模型 + 起手用户轮。
 
     注册表按这条线的完整身份寻址（`providers/session_affinity._line_key`），
-    这里用同一个函数、同一个解析结果（`resolve_model`），而不是手拼键——
-    两份定义会在加入身份组成部分的那一天悄悄分叉。
+    这里用同一个函数、同一个解析结果（`resolve_model`）和同一个起手轮算法
+    （`line_opening_key`），而不是手拼键——两份定义会在加入身份组成部分的那一天
+    悄悄分叉。`HISTORY[:1]` 与 `HISTORY` 的起手轮相同（同一条线继续增长），所以
+    两个调用点共用一个值。
     """
     from providers.session_affinity import _line_key
 
-    return _line_key(session_id, "", srv.resolve_model(model_alias)[1])
+    return _line_key(
+        session_id,
+        "",
+        srv.resolve_model(model_alias)[1],
+        srv.line_opening_key(HISTORY[:1]),
+    )
 
 
 def test_failover_does_not_poison_the_session_binding():

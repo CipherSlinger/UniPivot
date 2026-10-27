@@ -128,6 +128,7 @@ from providers.http_client import close_http_client, get_default_limits, get_htt
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
 from providers.session_affinity import (
     AffinityDecision,
+    line_opening_key,
     session_affinity_manager,
     tool_contract_key,
 )
@@ -2772,12 +2773,17 @@ async def chat_completions(req: ChatCompletionRequest):
     # 最后一句提问，注入的系统提示与工具契约整段丢失——「模型无视我的 tools」。
     # [SESSION-IDENTITY] 会话 id 命名会话，不命名对话线：同一会话里声明的工具集
     # 不同的请求（Claude Code 自动模式分类器声明 0 个工具，父会话 47 个）是两条
-    # 线。身份只在这里算一次，四处调用点共用同一个值。
+    # 线；起始用户轮不同的请求（同一父会话派生的两个同级子 agent，工具集完全相同）
+    # 也是两条线。身份只在这里算一次，解析 / 记录 / `has_upstream_session` 共用。
     tool_contract = tool_contract_key(req.tools)
+    line_opening = line_opening_key(messages)
     prompt_text = (
         continuation_content(messages)
         if session_affinity_manager.has_upstream_session(
-            req.conversation_id, tool_contract, requested_model=wire_model
+            req.conversation_id,
+            tool_contract,
+            requested_model=wire_model,
+            line_opening=line_opening,
         )
         else flatten_messages(messages)
     )
@@ -2810,6 +2816,7 @@ async def chat_completions(req: ChatCompletionRequest):
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
         requested_model=wire_model,
+        line_opening=line_opening,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -3136,6 +3143,7 @@ async def chat_completions(req: ChatCompletionRequest):
                             _conv,
                             tool_contract=affinity_decision.tool_contract,
                             requested_model=affinity_decision.requested_model,
+                            line_opening=affinity_decision.line_opening,
                         )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3416,6 +3424,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         _conv,
                         tool_contract=affinity_decision.tool_contract,
                         requested_model=affinity_decision.requested_model,
+                        line_opening=affinity_decision.line_opening,
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3565,6 +3574,7 @@ async def chat_completions(req: ChatCompletionRequest):
             _conv,
             tool_contract=affinity_decision.tool_contract,
             requested_model=affinity_decision.requested_model,
+            line_opening=affinity_decision.line_opening,
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3749,10 +3759,15 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     # 2.1 智能会话粘滞解析与跨模型状态迁移
     # [SESSION-IDENTITY] 同一次会话里声明的工具集不同的请求是两条对话线（Claude
     # Code 的自动模式分类器 `tools: []` 与父会话 47 个工具共用同一个
-    # `metadata.user_id.session_id`）。判据只有一份（`tool_contract_key`），
-    # 解析、记录、`has_upstream_session` 三处读的都是它。见
+    # `metadata.user_id.session_id`）；起始用户轮不同的请求也是两条线（同一父会话
+    # 顺序派生的两个同级子 agent —— 同一个 session_id、同一套 45 个工具、同一个
+    # 模型，只有任务不同。实测第二个子 agent 拿到的 `conversation_id` 正是第一个
+    # 子 agent 那次调用铸出的上游会话，两条独立的对话在上游被合并，且没有任何报错）。
+    # 判据只有一份（`tool_contract_key` / `line_opening_key`），解析、记录、
+    # `has_upstream_session` 三处读的都是它。见
     # `providers/session_affinity.py` 的模块 docstring（实测与诚实的残留）。
     tool_contract = tool_contract_key(req.tools)
+    line_opening = line_opening_key(gateway_messages)
     affinity_decision = session_affinity_manager.resolve_affinity(
         session_id=client_session_id,
         primary_provider=dispatched_provider,
@@ -3761,6 +3776,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
         requested_model=wire_model,
+        line_opening=line_opening,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -4030,6 +4046,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             _up,
                             tool_contract=affinity_decision.tool_contract,
                             requested_model=affinity_decision.requested_model,
+                            line_opening=affinity_decision.line_opening,
                         )
 
                     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4217,6 +4234,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         _up,
                         tool_contract=affinity_decision.tool_contract,
                         requested_model=affinity_decision.requested_model,
+                        line_opening=affinity_decision.line_opening,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4372,6 +4390,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             _up,
             tool_contract=affinity_decision.tool_contract,
             requested_model=affinity_decision.requested_model,
+            line_opening=affinity_decision.line_opening,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4641,10 +4660,15 @@ async def responses_endpoint(req: ResponsesRequest):
     # 2.1 智能会话粘滞解析与跨模型状态迁移
     # [SESSION-IDENTITY] 同一次会话里声明的工具集不同的请求是两条对话线（Claude
     # Code 的自动模式分类器 `tools: []` 与父会话 47 个工具共用同一个
-    # `metadata.user_id.session_id`）。判据只有一份（`tool_contract_key`），
-    # 解析、记录、`has_upstream_session` 三处读的都是它。见
+    # `metadata.user_id.session_id`）；起始用户轮不同的请求也是两条线（同一父会话
+    # 顺序派生的两个同级子 agent —— 同一个 session_id、同一套 45 个工具、同一个
+    # 模型，只有任务不同。实测第二个子 agent 拿到的 `conversation_id` 正是第一个
+    # 子 agent 那次调用铸出的上游会话，两条独立的对话在上游被合并，且没有任何报错）。
+    # 判据只有一份（`tool_contract_key` / `line_opening_key`），解析、记录、
+    # `has_upstream_session` 三处读的都是它。见
     # `providers/session_affinity.py` 的模块 docstring（实测与诚实的残留）。
     tool_contract = tool_contract_key(req.tools)
+    line_opening = line_opening_key(gateway_messages)
     affinity_decision = session_affinity_manager.resolve_affinity(
         session_id=client_session_id,
         primary_provider=dispatched_provider,
@@ -4653,6 +4677,7 @@ async def responses_endpoint(req: ResponsesRequest):
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
         requested_model=wire_model,
+        line_opening=line_opening,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -5126,6 +5151,7 @@ async def responses_endpoint(req: ResponsesRequest):
                         _up,
                         tool_contract=affinity_decision.tool_contract,
                         requested_model=affinity_decision.requested_model,
+                        line_opening=affinity_decision.line_opening,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -5234,6 +5260,7 @@ async def responses_endpoint(req: ResponsesRequest):
             _up,
             tool_contract=affinity_decision.tool_contract,
             requested_model=affinity_decision.requested_model,
+            line_opening=affinity_decision.line_opening,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):

@@ -230,7 +230,10 @@ def test_bound_session_turn_two_carries_system_and_tools():
         # 的同一个解析结果（`resolve_model`），否则这里问的是另一条线。
         assert srv.session_affinity_manager.has_upstream_session(
             "sess-1", srv.tool_contract_key([BASH_TOOL]),
-            requested_model=srv.resolve_model("qwen")[1])
+            requested_model=srv.resolve_model("qwen")[1],
+            # [SESSION-IDENTITY] 起手用户轮也是线身份的一部分，这里要用请求路径的
+            # 同一个算法算（见 `tests/test_subagent_affinity_isolation.py`）。
+            line_opening=srv.line_opening_key(first["messages"]))
         SEEN.clear()
 
         r2 = _post({"model": "qwen", "conversation_id": "sess-1", "stream": False,
@@ -270,11 +273,13 @@ def test_a_mid_session_tool_change_starts_a_new_line_but_still_ships_the_contrac
     """
     _install()
     try:
-        _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
-               "messages": [{"role": "system", "content": SYSTEM},
-                            {"role": "user", "content": "q1"}]})
+        first = {"model": "qwen", "conversation_id": "sess-4", "stream": False,
+                 "messages": [{"role": "system", "content": SYSTEM},
+                              {"role": "user", "content": "q1"}]}
+        _post(first)
         assert srv.session_affinity_manager.has_upstream_session(
-            "sess-4", requested_model=srv.resolve_model("qwen")[1])
+            "sess-4", requested_model=srv.resolve_model("qwen")[1],
+            line_opening=srv.line_opening_key(first["messages"]))
         SEEN.clear()
         r2 = _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
                     "tools": [BASH_TOOL],

@@ -248,12 +248,23 @@ def test_endpoint_reports_degraded_and_keeps_binding():
         assert srv.session_affinity_manager.get_diagnostics()["affinity_handoffs"] == 0
 
         # 对照：真正禁用时仍必须迁移
+        #
+        # [SESSION-IDENTITY] 这里必须延续同一条对话线：起手用户轮是线的身份的一部分
+        # （同一父会话派生的两个同级子 agent 只能靠它区分，见
+        # `tests/test_subagent_affinity_isolation.py`），所以「只发一句新的用户消息」
+        # 已经不是真实客户端会发出的形状，它会被判定为新的一条线，从而绕开 handoff。
         srv.failover_router.cooldown_tracker.disabled_providers.add("qwen")
         r4 = client.post(
             "/v1/chat/completions",
             json={
                 "model": "qwen",
-                "messages": [{"role": "user", "content": "换节点"}],
+                "messages": [
+                    {"role": "user", "content": "你好"},
+                    {"role": "assistant", "content": "收到"},
+                    {"role": "user", "content": "再继续"},
+                    {"role": "assistant", "content": "好的"},
+                    {"role": "user", "content": "换节点"},
+                ],
                 "conversation_id": session_id,
             },
         )

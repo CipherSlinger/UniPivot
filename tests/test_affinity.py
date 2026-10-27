@@ -201,13 +201,29 @@ def test_chat_completions_affinity_headers():
         assert r2.headers.get("x-session-affinity") == "bound"
 
         # Turn 3: 模拟原 provider 被风控禁用，应返回 handoff 与 x-session-handoff-from
+        #
+        # [SESSION-IDENTITY] 第三轮必须带着与前两轮**相同的起始用户轮**。对话线的
+        # 身份是「会话 id + 工具契约 + 声明的上游模型 + 线的起手用户轮」——同一父
+        # 会话顺序派生的两个同级子 agent 拥有完全相同的 session_id / 工具集 / 模型，
+        # 只有任务不同，起手轮是唯一能把它们分开的事实（见
+        # `tests/test_subagent_affinity_isolation.py`）。所以「只发一句新的用户消息」
+        # 这种请求形状已经不描述任何真实 Anthropic / OpenAI 客户端（协议本身没有
+        # 服务端历史，真实客户端每轮重发全量历史），把它当作同一会话的第三轮会得到
+        # `fresh` 而不是 `handoff`。这里让历史继续增长，本用例的靶点（禁用节点 →
+        # 迁移）才是唯一被测量的东西。
         os.environ["DISABLED_PROVIDERS"] = "qwen"
         try:
             r3 = client.post(
                 "/v1/chat/completions",
                 json={
                     "model": "qwen",
-                    "messages": [{"role": "user", "content": "换节点测试"}],
+                    "messages": [
+                        {"role": "user", "content": "你好"},
+                        {"role": "assistant", "content": "收到消息"},
+                        {"role": "user", "content": "再见"},
+                        {"role": "assistant", "content": "再见"},
+                        {"role": "user", "content": "换节点测试"},
+                    ],
                     "conversation_id": session_id,
                 },
             )
@@ -266,13 +282,23 @@ def test_anthropic_messages_affinity_headers():
         assert r2.headers.get("x-session-affinity") == "bound"
 
         # 流式 Turn 3
+        #
+        # [SESSION-IDENTITY] 起手用户轮是对话线身份的一部分（同一父会话派生的两个
+        # 同级子 agent 只能靠它区分，见 `tests/test_subagent_affinity_isolation.py`），
+        # 所以这里必须继续带着 `你好 Claude`，否则这是另一条线，`bound` 无从谈起。
         r3 = client.post(
             "/v1/messages",
             headers={"anthropic-version": "2023-06-01"},
             json={
                 "model": "claude-3-7-sonnet",
                 "max_tokens": 1024,
-                "messages": [{"role": "user", "content": "流式测试"}],
+                "messages": [
+                    {"role": "user", "content": "你好 Claude"},
+                    {"role": "assistant", "content": "收到消息"},
+                    {"role": "user", "content": "第二轮提问"},
+                    {"role": "assistant", "content": "回答"},
+                    {"role": "user", "content": "流式测试"},
+                ],
                 "conversation_id": session_id,
                 "stream": True,
             },
@@ -308,11 +334,23 @@ def test_responses_endpoint_affinity_headers():
         assert r1.headers.get("x-session-affinity") == "fresh"
 
         # Turn 2
+        #
+        # [SESSION-IDENTITY] Responses 的 `input` 是**增量**，但服务端并不保存历史
+        # （`previous_response_id` 一律拒绝，见 tests/test_responses_previous_id.py），
+        # 所以真实客户端每轮重发全量条目。以前这里只发一句 `Optimize it`，那正好是
+        # 第 73 节实测的那个「模型拿到一个没有前因的问题」的形状；同时起手用户轮是
+        # 对话线身份的一部分（`tests/test_subagent_affinity_isolation.py`），只发一句
+        # 新消息会开一条新线，`bound` 也就无从谈起。全量重发才是被测试的真实形状。
         r2 = client.post(
             "/v1/responses",
             json={
                 "model": "gpt-4o",
-                "input": "Optimize it",
+                "input": [
+                    {"type": "message", "role": "user",
+                     "content": "Write a python script"},
+                    {"type": "message", "role": "assistant", "content": "ok"},
+                    {"type": "message", "role": "user", "content": "Optimize it"},
+                ],
                 "conversation_id": session_id,
             },
         )
@@ -383,12 +421,22 @@ def test_responses_honours_codex_client_metadata_thread_identity():
     child_thread = "01a16c7e-c23b-7aa3-aaf9-d7a19a2e146b"
     session_id = parent_thread  # Codex: session_id == parent thread id
 
+    # [SESSION-IDENTITY] 每一轮都重发**全量条目**：Responses 协议没有服务端历史
+    # （`previous_response_id` 一律拒绝），真实 Codex 每轮自己带上完整历史。同时
+    # 起手用户轮是对话线身份的一部分（同一父会话派生的同级子 agent 只能靠它区分，
+    # 见 `tests/test_subagent_affinity_isolation.py`），所以历史只能增长、起手轮
+    # 不能变——以前这里每轮只发一句新 `input`，那已是任何真实客户端都不会发出的
+    # 形状，第二轮会被判定为另一条线。
+    _history: dict[str, list] = {}
+
     def _post(thread_id: str, text: str, headers=None):
-        return client.post(
+        items = _history.setdefault(thread_id, [])
+        items.append({"type": "message", "role": "user", "content": text})
+        resp = client.post(
             "/v1/responses",
             json={
                 "model": "gpt-4o",
-                "input": text,
+                "input": list(items),
                 # 真实 Codex 的字段名与形状（注意：没有 conversation_id）
                 "client_metadata": {
                     "session_id": session_id,
@@ -400,6 +448,8 @@ def test_responses_honours_codex_client_metadata_thread_identity():
             },
             headers=headers or {},
         )
+        items.append({"type": "message", "role": "assistant", "content": "ok"})
+        return resp
 
     try:
         client = TestClient(srv.app)
