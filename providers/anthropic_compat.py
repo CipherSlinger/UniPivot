@@ -1068,6 +1068,75 @@ def extract_balanced_json_objects(text: str) -> List[Tuple[int, int, str]]:
     return results
 
 
+# 惰性：只吃掉收尾所需的三个反引号。贪心版本在「正文含围栏 + 两个块背靠背」时会把
+# 下一个块的开头一起吃掉——正是第 68 节那个「吞掉相邻块」的缺陷换了个位置复发。
+_TRAILING_FENCE = re.compile(r"\s*`{3,}?")
+
+
+def _balanced_json_at(text: str, start: int) -> Optional[int]:
+    """返回从 `start` 起（跳过空白）开始的平衡 JSON 对象的**结束下标**；没有则 None。
+
+    `extract_balanced_json_objects` 按出现顺序返回对象，所以第一个结果的起点不是
+    0 就意味着这里根本没有对象开始。
+    """
+    objs = extract_balanced_json_objects(text[start:])
+    if objs and objs[0][0] == 0:
+        return start + objs[0][1]
+    return None
+
+
+def iter_tool_blocks(text: str):
+    """逐个产出代码块工具调用：`(start, end, body, closed)`。
+
+    **块边界必须由 JSON 结构决定，而不是由字节形状决定。** `_BLOCK_TOOL_PATTERN`
+    的收尾是「任意一个不被语言标记跟随的三反引号」，它对正文一无所知；当模型写出
+
+        ```tool_call
+        {"name": "Write", "arguments": {"content": "```python\\nprint(1)\\n```"}}
+        ```
+
+    时，收尾匹配到的正是 JSON **字符串字面量内部**那对反引号：参数在第一个代码围栏
+    处被截断，剩下的 `..."}}` 加上真正的块收尾被当成正文丢掉。`write` 一个 README、
+    一份配置、任何内含代码围栏的文件都会触发，而且是静默的（自愈解析器甚至把截断后
+    的 JSON 修好，报告「已修复」）。
+
+    因此：正文若以 `{` 开头，则用括号平衡扫描求出对象的真实终点；当它比正则匹配到的
+    收尾更靠后时，说明那个收尾落在字符串里，把正文延长到对象结束，并吃掉紧随其后
+    的围栏。`closed=False` 用于「正文是 JSON 但对象还没闭合」——通常是缓冲区停在
+    半个对象上；流式锁存据此**不得**把裸 JSON 当正文放出去。
+    """
+    pos = 0
+    n = len(text)
+    while pos < n:
+        # 模块级名字在调用时查找：既有用例通过替换 `_BLOCK_TOOL_PATTERN` 来验证
+        # 「解析行为只由这一份定义决定」，这里必须继续走那一个名字。
+        match = _BLOCK_TOOL_PATTERN.search(text, pos)
+        if not match:
+            return
+        body_start, body_end = match.span(1)
+        body = match.group(1)
+        obj_end = _balanced_json_at(text, body_start)
+
+        if obj_end is not None and obj_end > body_end:
+            # 收尾落在 JSON 字符串内部（正文里有代码围栏），延长到对象真实终点。
+            fence = _TRAILING_FENCE.match(text, obj_end)
+            end = fence.end() if fence else obj_end
+            yield match.start(), end, text[body_start:obj_end], True
+            pos = end
+            continue
+
+        if obj_end is None and body.lstrip().startswith("{"):
+            # 以 JSON 对象开头却还没闭合：半个对象（流式边界），或模型自己截断了。
+            # 解析器仍按原样交给自愈引擎处理，只把 `closed` 标成 False。
+            yield match.start(), match.end(), body, False
+            pos = match.end()
+            continue
+
+        closed = match.end() < n or bool(re.search(r"`{3,}\s*$", match.group(0)))
+        yield match.start(), match.end(), body, closed
+        pos = match.end()
+
+
 def _clean_trailing_commas(s: str) -> str:
     """循环剥离 JSON 对象与数组中尾部多余的逗号：{"a": 1,} -> {"a": 1}。"""
     pattern = re.compile(r",\s*([\]}])")
@@ -1256,8 +1325,8 @@ def parse_tool_calls(text: str) -> Optional[Tuple[str, List[Tuple[str, dict]]]]:
     # 1. 优先匹配代码块 ```tool_call / ```json ...
     first_block_start: Optional[int] = None
     all_tools: List[Tuple[str, dict]] = []
-    for match in _BLOCK_TOOL_PATTERN.finditer(text):
-        content = match.group(1).strip()
+    for start, _end, content, _closed in iter_tool_blocks(text):
+        content = content.strip()
         if not content:
             continue
         parsed = _safe_json_loads(content)
@@ -1265,7 +1334,7 @@ def parse_tool_calls(text: str) -> Optional[Tuple[str, List[Tuple[str, dict]]]]:
             tools = _extract_tools_from_data(parsed)
             if tools:
                 if first_block_start is None:
-                    first_block_start = match.start()
+                    first_block_start = start
                 all_tools.extend(tools)
     if all_tools and first_block_start is not None:
         return text[:first_block_start].strip(), all_tools

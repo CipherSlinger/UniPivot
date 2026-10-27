@@ -12,8 +12,8 @@ from .json_repair import safe_loads_with_repair, strip_markdown_fence
 from .stop_sequences import truncate_final
 from .anthropic_compat import (
     extract_balanced_json_objects,
+    iter_tool_blocks,
     _extract_tools_from_data,
-    _BLOCK_TOOL_PATTERN,
     _XML_TOOL_PATTERN,
 )
 
@@ -209,8 +209,8 @@ def parse_tool_calls_with_healing(
     # 1. 优先匹配代码块 ```tool_call / ```json ...
     first_block_start: Optional[int] = None
     all_tools: List[Tuple[str, dict]] = []
-    for match in _BLOCK_TOOL_PATTERN.finditer(text):
-        content = match.group(1).strip()
+    for start, _end, content, _closed in iter_tool_blocks(text):
+        content = content.strip()
         if not content:
             continue
         parsed, healed = safe_loads_with_repair(content)
@@ -220,7 +220,7 @@ def parse_tool_calls_with_healing(
                 if healed:
                     was_healed_any = True
                 if first_block_start is None:
-                    first_block_start = match.start()
+                    first_block_start = start
                 all_tools.extend(tools)
     if all_tools and first_block_start is not None:
         return (text[:first_block_start].strip(), all_tools), was_healed_any
@@ -283,9 +283,13 @@ class SpeculativeToolStreamer:
     """
 
     LOOKAHEAD_WINDOW = 32  # 滑动推测窗口大小
-    # [TOOL-LOOP] 工具缓冲的硬上限：超过它仍未闭合，说明这不是工具调用，
-    # 必须放弃锁存、把内容当普通文本放出去，而不是继续吞掉整段回答。
+    # [TOOL-FENCE] 缓冲上限只对「看起来不像工具调用」的内容成立。对**正在写入的
+    # 工具调用**按字节数放行，等于把一份大文件的内容当成正文吐给客户端：实测
+    # 80 KB 的 Write 参数被原样当文本发出（80 056 字符的裸 JSON），随后 finalize
+    # 又把同一个调用交了一次——客户端同时收到一段 JSON 散文和一个调用。
     MAX_TOOL_BUFFER = 65536
+    # 真正未闭合的工具调用只受内存上限约束（累积正文本来就有同等体量）。
+    MAX_TOOL_BUFFER_HARD = 4 * 1024 * 1024
 
     def __init__(self, tools_enabled: bool = True, allowed: Optional[set] = None):
         self.tools_enabled = tools_enabled
@@ -321,15 +325,39 @@ class SpeculativeToolStreamer:
         return [StreamAction("text_delta", content=text)]
 
     def _should_unlatch(self) -> bool:
-        """判断锁存的工具缓冲是否已被证伪：闭合了却不是工具调用，或已经太大。"""
+        """判断锁存的工具缓冲是否已被证伪：闭合了却不是工具调用，或已经太大。
+
+        「是否闭合」必须问 `iter_tool_blocks` 而不是看末尾是不是反引号：正文是
+        JSON 对象时，串内的代码围栏看起来和真正的块收尾一模一样，按字节判断会把
+        半个工具调用当成正文吐给客户端（[TOOL-FENCE]）。
+        """
         buf = "".join(self.accumulated_tool_buffer)
-        if len(buf) > self.MAX_TOOL_BUFFER:
-            return True
-        closed = buf.rstrip().endswith("```") or re.search(r"</(?:tool_call|function_call)>\s*$", buf)
-        if not closed:
-            return False
-        parsed, _ = parse_tool_calls_with_healing(buf, self.allowed)
-        return not parsed
+        tail = buf.rstrip()
+        # 廉价闸门：结构扫描是 O(len)，而它会在**每一个** chunk 上被问到。只有
+        # 「看起来收尾了」（末尾是反引号/尖括号）时才值得付这个成本——一个正在
+        # 写入的大文件若每块都全量扫描就是 O(n²)，实测 3 MB 参数会把一次流式解析
+        # 拖到分钟级。
+        if not (tail.endswith("`") or tail.endswith(">")):
+            return len(buf) > self._latch_size_limit(buf)
+        blocks = list(iter_tool_blocks(buf))
+        xml_closed = bool(re.search(r"</(?:tool_call|function_call)>\s*$", buf))
+        if any(closed for (_s, _e, _b, closed) in blocks) or xml_closed:
+            parsed, _ = parse_tool_calls_with_healing(buf, self.allowed)
+            return not parsed
+        # 末尾是反引号但正文的 JSON 还没闭合：那是字符串里的代码围栏，不是块收尾。
+        return len(buf) > self._latch_size_limit(buf)
+
+    def _latch_size_limit(self, buf: str) -> int:
+        """锁存缓冲的放行阈值：正在写入的 JSON 工具调用只受内存上限约束。
+
+        按字节数放行一份**正在写入的**工具调用，等于把大文件的内容当正文吐给
+        客户端（实测 80 KB 的 Write 参数被原样发出 80 056 字符裸 JSON，随后
+        finalize 又交了一次调用）。判定只看头部 256 字符，保持 O(1)。
+        """
+        probe = next(iter_tool_blocks(buf[:256]), None)
+        if probe is not None and probe[2].lstrip().startswith("{"):
+            return self.MAX_TOOL_BUFFER_HARD
+        return self.MAX_TOOL_BUFFER
 
     def _matches_any_trigger(self, s: str) -> bool:
         """检查字符串是否包含确定的工具调用起始标记。"""
