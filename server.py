@@ -134,6 +134,7 @@ from providers.session_affinity import (
 from providers.singleflight import (
     SingleFlightDecision,
     broadcast_stream_wrapper,
+    follower_open_timeout,
     singleflight_manager,
     stream_follower_gen,
     terminate_aborted_group,
@@ -1505,6 +1506,71 @@ def _refusal_headers(exc: ProviderError) -> dict:
     return {"Retry-After": str(seconds), "x-should-retry": "false"}
 
 
+def _follower_error_frames(protocol: str):
+    """[SINGLEFLIGHT] 把跟随者的终局失败渲染成该协议的**终止失败帧**。
+
+    状态行在跟随者这里已经发出去了（`GATEWAY_FOLLOWER_OPEN_TIMEOUT=0`，或 Leader
+    在我们等待期间死了而回收还没发生），此后唯一还能告诉客户端「这不是正常说完」
+    的东西就是协议自己的终止事件。三个协议各有一条，谁都不能省：
+
+    * OpenAI：`data: {"error": ...}`，且**绝不**再补 `[DONE]`——发 `[DONE]` 等于
+      把失败的流伪装成正常结束（§45）。
+    * Anthropic：`event: error`，不补 `event: message_stop`。
+    * Responses：`ResponsesEventStream.error(...)` 会同时发 `error` 和
+      `response.failed`；后者才是 Codex 0.145.0 真会读的那条（§57，它把裸
+      `event: error` 整条丢弃）。
+    """
+
+    def render(exc: BaseException) -> list:
+        message = getattr(exc, "message", None) or f"上游服务异常: {exc}"
+        status = getattr(exc, "status", None) or 502
+        err_type = getattr(exc, "err_type", None) or "upstream_error"
+        if protocol == "openai_chat":
+            return [sse_frame(error_response(message, status, err_type))]
+        if protocol == "anthropic":
+            return [
+                anthropic_sse_event(
+                    "error", anthropic_error_response(message, status, err_type)
+                )
+            ]
+        return [ResponsesEventStream(_id("resp", "_"), "").error(message, status, err_type)]
+
+    return render
+
+
+async def _follower_opening_response(group, sf_headers: dict, make_body):
+    """[SINGLEFLIGHT] 跟随者开流前等 Leader 的结局；零帧失败就变成同一条状态行。
+
+    为什么必须等：跟随者此前是**先**返回 `StreamingResponse`（状态行 200 已发出）
+    再拉第一帧，而 Leader 在派发前拒绝时一帧都不会广播。于是同一个确定性结论——
+    凭证整环失效 / 运维禁用 / 封禁租约 / 长效避让 / 尚未配置凭证——在 Leader 上是
+    一条带退避头的 503，在跟随者上却是「200 + 响应体一个字节都没有」，客户端既
+    读不到原因，也读不到该不该重试（§54 的 `x-should-retry` 到不了它手上）。实测
+    （真实 uvicorn + TCP，唯一变量是 Leader/Follower 身份）：Leader 429 + JSON
+    错误体，Follower 200 + 空 body。
+
+    返回 `None` 表示应当照常开流（已有帧，或等待超时的 fail-open 分支）。
+
+    这里只对**零帧**失败改状态行：Leader 发过帧之后，客户端已经读到内容，任何
+    状态行都不再诚实，那条路径由 `stream_follower_gen` 的行内终局失败帧接管。
+    """
+    opened, terminal = await group.wait_for_opening(follower_open_timeout())
+    if opened or terminal is None:
+        return None
+    if isinstance(terminal, ProviderError):
+        pe = terminal
+        return JSONResponse(
+            make_body(pe.message, pe.status, pe.err_type),
+            status_code=pe.status,
+            headers={**sf_headers, **_refusal_headers(pe)},
+        )
+    return JSONResponse(
+        make_body(f"上游服务异常: {terminal}", 502, "upstream_error"),
+        status_code=502,
+        headers=dict(sf_headers),
+    )
+
+
 @app.middleware("http")
 async def unified_exception_middleware(request: Request, call_next):
     """全局统一异常处理中间件：捕获所有未预期的异常并按请求协议输出对应的标准 JSON。"""
@@ -2833,8 +2899,19 @@ async def chat_completions(req: ChatCompletionRequest):
         stream_headers.update(_make_disconnect_headers())
 
         if flight_decision and not flight_decision.is_leader:
+            # [SINGLEFLIGHT] 先等 Leader 的结局：零帧拒绝要在状态行上体现，与 Leader
+            # 完全一致（见 `_follower_opening_response`）。
+            refusal = await _follower_opening_response(
+                flight_decision.group, sf_headers, error_response
+            )
+            if refusal is not None:
+                return refusal
             return StreamingResponse(
-                sse_keepalive(stream_follower_gen(flight_decision.group)),
+                sse_keepalive(
+                    stream_follower_gen(
+                        flight_decision.group, _follower_error_frames("openai_chat")
+                    )
+                ),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -3752,8 +3829,18 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         stream_headers.update(_make_disconnect_headers())
 
         if flight_decision and not flight_decision.is_leader:
+            # [SINGLEFLIGHT] 与 chat 侧同一个判据，只有错误体的协议形状不同。
+            refusal = await _follower_opening_response(
+                flight_decision.group, sf_headers, anthropic_error_response
+            )
+            if refusal is not None:
+                return refusal
             return StreamingResponse(
-                sse_keepalive(stream_follower_gen(flight_decision.group)),
+                sse_keepalive(
+                    stream_follower_gen(
+                        flight_decision.group, _follower_error_frames("anthropic")
+                    )
+                ),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -4638,8 +4725,18 @@ async def responses_endpoint(req: ResponsesRequest):
         stream_headers.update(base_headers)
 
         if flight_decision and not flight_decision.is_leader:
+            # [SINGLEFLIGHT] 与另外两条流式路径同一个判据。
+            refusal = await _follower_opening_response(
+                flight_decision.group, sf_headers, error_response
+            )
+            if refusal is not None:
+                return refusal
             return StreamingResponse(
-                sse_keepalive(stream_follower_gen(flight_decision.group)),
+                sse_keepalive(
+                    stream_follower_gen(
+                        flight_decision.group, _follower_error_frames("responses")
+                    )
+                ),
                 media_type="text/event-stream",
                 headers=stream_headers,
             )
@@ -4652,8 +4749,14 @@ async def responses_endpoint(req: ResponsesRequest):
             if flight_decision.group.error:
                 if isinstance(flight_decision.group.error, ProviderError):
                     pe = flight_decision.group.error
-                    return JSONResponse(error_response(pe.message, pe.status, pe.err_type), status_code=pe.status)
-                return JSONResponse(error_response(f"上游服务异常: {flight_decision.group.error}", 502, "upstream_error"), status_code=502)
+                    # [SINGLEFLIGHT] 与流式路径同一条拒绝语义：确定性拒绝必须带退避头，
+                    # 否则客户端会对着一个需要人工处置的环原地重试（§54）。
+                    return JSONResponse(
+                        error_response(pe.message, pe.status, pe.err_type),
+                        status_code=pe.status,
+                        headers={**sf_headers, **_refusal_headers(pe)},
+                    )
+                return JSONResponse(error_response(f"上游服务异常: {flight_decision.group.error}", 502, "upstream_error"), status_code=502, headers=dict(sf_headers))
 
             follower_headers = dict(flight_decision.group.completed_headers or {})
             follower_headers.update(sf_headers)

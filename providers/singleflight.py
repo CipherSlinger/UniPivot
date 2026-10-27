@@ -26,7 +26,7 @@ import logging
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, AsyncGenerator, Dict, List, Optional, Tuple
+from typing import Any, AsyncGenerator, Callable, Dict, Iterable, List, Optional, Tuple
 
 logger = logging.getLogger("gateway.singleflight")
 
@@ -52,6 +52,26 @@ def follower_backlog_limit() -> int:
         return max(1, int(os.getenv("GATEWAY_SINGLEFLIGHT_BACKLOG", "256")))
     except ValueError:
         return 256
+
+
+def follower_open_timeout() -> float:
+    """[SINGLEFLIGHT] 跟随者愿意为「结局」等多久才开流（默认 = 握手总预算）。
+
+    这个默认值不是随手挑的：`GATEWAY_HANDSHAKE_BUDGET` 是 Leader 对自己派发阶段的
+    承诺——超过它的 `execute_chat` 一定会以确定性的结论收尾（超时、环内耗尽、
+    零上游拒绝）。跟随者最多只需要等到那一刻，再久就只能是 Leader 已经死了而回收
+    还没发生，此时继续等会把一个本可以 fail-open 的请求拖成客户端超时。
+
+    `GATEWAY_FOLLOWER_OPEN_TIMEOUT=0` 恢复旧行为（立刻以 200 开流，靠行内终局
+    失败帧兜底）。
+    """
+    raw = os.getenv("GATEWAY_FOLLOWER_OPEN_TIMEOUT")
+    if raw is None or not raw.strip():
+        raw = os.getenv("GATEWAY_HANDSHAKE_BUDGET", "180")
+    try:
+        return max(0.0, float(raw))
+    except ValueError:
+        return 180.0
 
 
 @dataclass
@@ -81,6 +101,11 @@ class FlightGroup:
         self.subscribers: List[asyncio.Queue] = []
         self._lock = asyncio.Lock()
         self.done_event = asyncio.Event()
+        # [SINGLEFLIGHT] 「这个飞行组有没有开流」是跟随者能否照常转发的唯一判据。
+        # 它与 `done_event` 是**两件事**：Leader 在派发前被拒绝时（凭证缺失 / 运维
+        # 禁用 / 封禁租约 / 长效避让）会以零帧终局，此时状态行还可以改；而一旦有了
+        # 第一帧，状态行就已经发出去了。见 `wait_for_opening`。
+        self.first_frame_event = asyncio.Event()
         # [M4] 跟随者背压状态。见 `broadcast_chunk` 的注释：
         # 「一帧都不消费的跟随者」必须有明确结局，否则它的队列会被无限灌满。
         self._followers_detached = 0
@@ -164,6 +189,8 @@ class FlightGroup:
                     q.put_nowait(item)
                 except Exception:  # noqa: BLE001
                     pass
+            # 在 `history.append` 之后置位：等待者醒来时看到的历史一定已包含这一帧。
+            self.first_frame_event.set()
 
     async def finish(
         self,
@@ -184,6 +211,62 @@ class FlightGroup:
                 except Exception:
                     pass
             self.done_event.set()
+
+    async def wait_for_opening(
+        self, timeout: float
+    ) -> Tuple[bool, Optional[BaseException]]:
+        """等待这个飞行组「开流」或「以零帧终局」。返回 `(opened, terminal_error)`。
+
+        这是跟随者能否把 Leader 的结局变成**状态行**的唯一判据，而它的语义必须是
+        三态，不是二态：
+
+        * `opened=True` —— 已经有帧广播出来。无论 Leader 之后成功还是中途失败，
+          状态行都已经没有意义了（内容已经发出），照常转发。
+        * `opened=False, terminal_error=<exc>` —— Leader 在**发出一帧之前**就终局且
+          失败（派发前拒绝：凭证整环失效 / 运维禁用 / 封禁租约 / 长效避让 / 尚未
+          配置凭证）。此时一个字节都还没发，调用方应当把这条错误变成与 Leader
+          **完全相同**的状态行。
+        * `opened=False, terminal_error=None` —— 等满了 `timeout` 仍无结局。这是
+          fail-open 的一半：调用方照旧以 200 开流，由行内终局失败帧兜底（见
+          `stream_follower_gen(render_error=...)`）。
+
+        **历史的判断必须排在终局之前**：一个「已经发过帧、随后失败」的组如果被当成
+        零帧终局，跟随者会收到一个 200 之前根本没发生过的 5xx，而 Leader 那边客户端
+        已经读到半截内容——那是把两种不同的客户端体验混为一谈。
+
+        `timeout<=0` 直接返回「未开流、无结局」，即旧行为，用于把开关关掉。
+        """
+        if timeout <= 0:
+            return False, None
+        if self.history:
+            return True, None
+        if self.leader_done:
+            return False, self.error
+
+        # 用 `ensure_future` + `wait` 而不是 `wait_for`：超时不得取消任何等待者
+        # （[M2] 的教训——被取消的 await 会连同它保护的协程一起收掉），而且
+        # 「超时」必须与「调用方取消」区分得开。
+        done_wait = asyncio.ensure_future(self.done_event.wait())
+        first_wait = asyncio.ensure_future(self.first_frame_event.wait())
+        try:
+            await asyncio.wait(
+                {done_wait, first_wait},
+                timeout=timeout,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            for task in (done_wait, first_wait):
+                if not task.done():
+                    task.cancel()
+            # 让被取消的等待者把 CancelledError 收干净，避免 "Task was destroyed
+            # but it is pending" 的告警掩盖真正的异常。
+            await asyncio.gather(done_wait, first_wait, return_exceptions=True)
+
+        if self.history:
+            return True, None
+        if self.leader_done:
+            return False, self.error
+        return False, None
 
     def is_stale(self, now: float) -> bool:
         """Leader 长时间未终结的飞行组视为陈旧（客户端断连泄漏），应立即作废。"""
@@ -474,8 +557,21 @@ def terminate_aborted_group(group: Optional[FlightGroup]) -> None:
     reap_orphaned_flight(group)
 
 
-async def stream_follower_gen(group: FlightGroup) -> AsyncGenerator[Any, None]:
-    """为 Follower 客户端消费回放与实时广播队列。"""
+async def stream_follower_gen(
+    group: FlightGroup,
+    render_error: Optional[Callable[[BaseException], Iterable[Any]]] = None,
+) -> AsyncGenerator[Any, None]:
+    """为 Follower 客户端消费回放与实时广播队列。
+
+    `render_error` 是**协议自己**的终局失败渲染器：输入一个异常，产出该协议规定的
+    终止失败帧（OpenAI `data: {"error": ...}` 且**不**发 `[DONE]`、Anthropic
+    `event: error`、Responses `response.failed`）。
+
+    不传它（旧行为）时异常直接抛给客户端。真实客户端看到的将是「一段内容之后干净
+    地断开」——与「正常说完」无法区分，是本仓库反复记录的 §52 那类缺陷。三条
+    生产路径都传它；保留 `None` 是为了让共享层可以被单独驱动，且不把某个协议
+    的形状写死在共享层里。
+    """
     history_snapshot, queue, is_already_done = await group.add_subscriber()
 
     # 1. 回放历史已产生的数据帧
@@ -483,8 +579,9 @@ async def stream_follower_gen(group: FlightGroup) -> AsyncGenerator[Any, None]:
         yield chunk
 
     if is_already_done:
-        if group.error:
-            raise group.error
+        if group.error is not None:
+            async for frame in _terminal_failure(group.error, render_error):
+                yield frame
         return
 
     # 2. 消费后续实时广播的数据帧
@@ -494,16 +591,35 @@ async def stream_follower_gen(group: FlightGroup) -> AsyncGenerator[Any, None]:
                 item = await asyncio.wait_for(queue.get(), timeout=group.follower_idle_timeout)
             except asyncio.TimeoutError:
                 # Leader 断连且未被及时回收时的最终兜底：绝不让 Follower 永久挂起
-                raise RuntimeError(
-                    f"Leader 流无响应超过 {group.follower_idle_timeout:.0f}s，飞行组已作废"
-                )
+                async for frame in _terminal_failure(
+                    RuntimeError(
+                        f"Leader 流无响应超过 {group.follower_idle_timeout:.0f}s，飞行组已作废"
+                    ),
+                    render_error,
+                ):
+                    yield frame
+                return
             if item is _SENTINEL:
                 break
             if isinstance(item, Exception):
                 # [M4] 这里会收到两类错误：Leader 的真实失败（上游异常），以及
-                # 「本路消费过慢、已被摘除」的背压通知。两者都必须抛给客户端——
-                # 静默结束会让客户端把半截回答当成完整回答，是比报错更糟的结局。
-                raise item
+                # 「本路消费过慢、已被摘除」的背压通知。两者都必须**让客户端看到**
+                # ——静默结束会让客户端把半截回答当成完整回答，是比报错更糟的结局。
+                # 「看到」的形态由协议决定：有渲染器就是终局失败帧，没有才是异常。
+                async for frame in _terminal_failure(item, render_error):
+                    yield frame
+                return
             yield item
     finally:
         await group.remove_subscriber(queue)
+
+
+async def _terminal_failure(
+    exc: BaseException,
+    render_error: Optional[Callable[[BaseException], Iterable[Any]]],
+) -> AsyncGenerator[Any, None]:
+    """把跟随者的终局失败交给协议渲染；无渲染器时退回抛异常。"""
+    if render_error is None:
+        raise exc
+    for frame in render_error(exc):
+        yield frame

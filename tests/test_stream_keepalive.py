@@ -135,13 +135,19 @@ def test_all_streaming_responses_are_wrapped():
     因此直接把「每个 StreamingResponse 的第一个参数都包着 sse_keepalive」钉成断言。
     """
     src = Path(srv.__file__).read_text(encoding="utf-8")
+    # 把空白折叠掉再数：断言的是**形状**（每个流式返回的第一个实参都是
+    # `sse_keepalive(...)`），不是某一天的换行排版。原版数的是
+    # `sse_keepalive(stream_follower_gen(` 这个字面子串，§102 把跟随者分支拆成
+    # 多行后它立刻误报 3/6——同 §55 那类「代理断言比它想保护的语义更窄」的错。
+    # 折叠后，这个计数比原版**更强**：它要求心跳就是返回值的第一个参数。
+    flat = " ".join(src.split())
     # 只数**返回出口**，不数类定义行（`class ReclaimingStreamingResponse(...)`）:
     # 类名本身含 "StreamingResponse(" 子串，直接数会把定义当成第八个出口。
-    total = src.count("return StreamingResponse(") + src.count(
+    total = flat.count("return StreamingResponse(") + flat.count(
         "return ReclaimingStreamingResponse("
     )
-    wrapped = src.count("sse_keepalive(stream_body)") + src.count(
-        "sse_keepalive(stream_follower_gen("
+    wrapped = flat.count("return StreamingResponse( sse_keepalive(") + flat.count(
+        "return ReclaimingStreamingResponse( sse_keepalive("
     )
     assert total == 6, f"流式出口数量变化，请确认新增出口也接上心跳（当前 {total}）"
     assert wrapped == total, f"存在未接入心跳的流式出口: {wrapped}/{total}"
