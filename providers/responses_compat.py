@@ -49,10 +49,15 @@ from .anthropic_compat import (
     format_tools_system_prompt,
 )
 from .base import (
-    FILE_PLACEHOLDER_TEMPLATE,
+    AUDIO_BLOCK_TYPES,
+    AUDIO_PLACEHOLDER,
     IMAGE_PLACEHOLDER,
+    REFUSAL_BLOCK_TYPES,
     _est_tokens,
+    _file_placeholder,
     _id,
+    _refusal_text,
+    content_omitted,
     error_response,
 )
 
@@ -281,6 +286,8 @@ _CONTENT_BLOCK_TYPES = frozenset({
     "text", "input_text", "output_text",
     "input_image", "image_url", "image",
     "input_file", "file", "document",
+    "input_audio", "audio",
+    "refusal",
     "thinking", "summary_text", "reasoning_text",
     "tool_result", "function_call_output", "tool_use", "function_call",
 })
@@ -338,6 +345,10 @@ def extract_responses_content(content: Any) -> str:
             return extract_responses_content([content])
         if "text" in content:
             return str(content["text"]) if content["text"] is not None else ""
+        # 未知类型的**单个**字典不走公告：这条路径同时是工具结构化结果的出口
+        # （`render_tool_output` 对非内容块就是 `json.dumps` 到这里），把
+        # `{"stdout": …}` 换成一条「无法渲染」会把真实结果弄丢。消息内容正常
+        # 是列表，未知类型的公告在下面的列表分支里做。
         return json.dumps(content, ensure_ascii=False)
     if not isinstance(content, list):
         return str(content)
@@ -357,8 +368,18 @@ def extract_responses_content(content: Any) -> str:
                 # 对着一个它从未看到的附件作答（详见 providers/base.py 的说明）。
                 parts.append(IMAGE_PLACEHOLDER)
             elif b_type in ("input_file", "file", "document"):
-                name = block.get("filename") or block.get("file_id") or ""
-                parts.append(FILE_PLACEHOLDER_TEMPLATE.format(name=name or "unnamed"))
+                # 与 `text_of` 共用同一个取名规则，否则同一个附件在两条协议上
+                # 会得到「a.py」与「unnamed」两种说法。
+                parts.append(_file_placeholder(block))
+            elif b_type in AUDIO_BLOCK_TYPES:
+                # 与 `text_of` 同一条规则：`input_audio` 是 Responses 真实存在的
+                # 内联类型，静默丢弃会让模型对着一段它从未收到的音频作答。
+                parts.append(AUDIO_PLACEHOLDER)
+            elif b_type in REFUSAL_BLOCK_TYPES:
+                # 助手的拒答块是它自己那一轮的正文，不是附件。
+                refusal = _refusal_text(block)
+                if refusal:
+                    parts.append(refusal)
             elif b_type == "thinking":
                 th = block.get("thinking", "")
                 if th:
@@ -394,6 +415,11 @@ def extract_responses_content(content: Any) -> str:
                 parts.append(f"```tool_call\n{json.dumps(payload, ensure_ascii=False)}\n```")
             elif "text" in block and block["text"]:
                 parts.append(str(block["text"]))
+            else:
+                # 未知块类型曾经在这里**静默消失**（§71 的判据：沉默比占位符更糟，
+                # 看不到内容的模型会断定内容不存在，然后据此作答）。这一层此前
+                # 只有 Anthropic 的提取器做对了，同一件事于是有两套默认值。
+                parts.append(content_omitted(b_type))
     return "\n".join(parts)
 
 

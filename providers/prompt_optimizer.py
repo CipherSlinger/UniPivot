@@ -18,7 +18,14 @@ import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import _est_tokens, is_contract_role, text_of
+from .base import (
+    AUDIO_BLOCK_TYPES,
+    AUDIO_PLACEHOLDER,
+    _est_tokens,
+    content_omitted,
+    is_contract_role,
+    text_of,
+)
 
 DEFAULT_MAX_TOKENS = 24000
 DEFAULT_PRESERVE_RECENT_TURNS = 4
@@ -98,6 +105,13 @@ def _extract_text_robust(content: Any) -> str:
                     parts.append(_extract_text_robust(p["content"]))
                 elif isinstance(p.get("text"), str) and p["text"]:
                     parts.append(p["text"])
+                elif p.get("type") in AUDIO_BLOCK_TYPES:
+                    parts.append(AUDIO_PLACEHOLDER)
+                elif p.get("type") is not None:
+                    # token 估算必须描述**真正发出去的那段提示词**；上游提取器
+                    # 现在会为渲染不了的块留下一条公告，这里也要计入，否则预算
+                    # 与提示词会在同一份内容上给出两个长度（§55 的判据）。
+                    parts.append(content_omitted(p.get("type")))
         return "\n".join(parts)
     return str(content)
 

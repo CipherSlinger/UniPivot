@@ -13,6 +13,7 @@ from .base import (
     FILE_PLACEHOLDER_TEMPLATE,
     IMAGE_PLACEHOLDER,
     _id,
+    content_omitted,
 )
 
 CLAUDE_MODELS_METADATA = [
@@ -231,8 +232,7 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
                 # 客户端明明发了内容，模型却完全不知道它存在，于是把「没看到」
                 # 当成「没有」，据此作答。与 Responses 侧同一类缺陷（原始 JSON
                 # 灌进用户通道），这里的诚实做法是留下一条带类型的占位说明。
-                b_unknown = str(b_type or "unknown")
-                parts.append(f"[Content omitted: {b_unknown} — this gateway cannot render it]")
+                parts.append(content_omitted(b_type))
     return "\n".join(parts)
 
 

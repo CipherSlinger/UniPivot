@@ -132,6 +132,30 @@ class StopSequenceHit(Exception):
 # 显式占位符让模型知道自己缺了什么，可以回答「我无法查看图片」而不是编造内容。
 IMAGE_PLACEHOLDER = "[Image omitted: this gateway's upstream providers accept text only]"
 FILE_PLACEHOLDER_TEMPLATE = "[File omitted: {name}]"
+AUDIO_PLACEHOLDER = "[Audio omitted: this gateway's upstream providers accept text only]"
+
+#: `input_audio` 是 OpenAI **两条**协议都真实存在的内联内容类型（Chat Completions
+#: 与 Responses 都是 `{"type":"input_audio","input_audio":{…}}`），不是我们猜的。
+#: `audio` 是同一件事在别处的拼法。Anthropic Messages 没有音频块类型，所以那条
+#: 提取器**不**认它——为它凭空加一个分支才是虚构能力（§58）。
+AUDIO_BLOCK_TYPES = frozenset({"input_audio", "audio"})
+
+#: 助手的拒答块。它的 `refusal` 字段**就是**那一轮的正文，不是附件、不是元数据。
+REFUSAL_BLOCK_TYPES = frozenset({"refusal"})
+
+#: 【公告措辞的唯一定义】§71 为 Responses 的**条目**层与 Anthropic 的**块**层
+#: 确立过规则：「沉默比占位符更糟，因为看不到内容的模型会断定内容不存在，然后
+#: 据此作答」。OpenAI 的两条提取器（`text_of`、`extract_responses_content`）当时
+#: 的兜底是「丢弃」，于是同一个事实在两套代码里有两套默认值。措辞收在这里，
+#: 三处提取器（含 token 估算那一份）共用；测试断言这个字面量全仓库只出现一次
+#: ——与 §68 把围栏语言表抽成 `_TOOL_FENCE_LANG` 是同一条纪律。
+CONTENT_OMITTED_TEMPLATE = "[Content omitted: {kind} — this gateway cannot render it]"
+
+
+def content_omitted(kind: object) -> str:
+    """「这里有内容，但网关渲染不了」的唯一措辞。"""
+    return CONTENT_OMITTED_TEMPLATE.format(kind=str(kind or "unknown"))
+
 
 _TEXT_BLOCK_TYPES = frozenset({"text", "input_text", "output_text"})
 
@@ -141,18 +165,45 @@ def _image_placeholder() -> str:
 
 
 def _file_placeholder(block: dict) -> str:
-    name = block.get("filename") or block.get("file_id") or block.get("name") or ""
+    # 文件名可能在块顶层（Responses 的 `input_file`），也可能嵌在 `file` 里
+    # （Chat Completions 的 `file` 部分就是 `{"type":"file","file":{"filename":…}}`）。
+    # 只读顶层会把一个客户端**明明命名过**的附件说成 `unnamed`——而「告诉模型
+    # 该重发哪一个文件」正是这个占位符存在的理由。
+    nested = block.get("file") if isinstance(block.get("file"), dict) else {}
+    name = (
+        block.get("filename")
+        or block.get("file_id")
+        or block.get("name")
+        or nested.get("filename")
+        or nested.get("file_id")
+        or ""
+    )
     return FILE_PLACEHOLDER_TEMPLATE.format(name=name or "unnamed")
+
+
+def _refusal_text(block: dict) -> str:
+    """拒答块的正文。`refusal` 是规范字段，`text` 是部分客户端的写法。"""
+    for key in ("refusal", "text"):
+        value = block.get(key)
+        if isinstance(value, str) and value:
+            return value
+    return ""
 
 
 def text_of(content: Union[str, List[dict], None]) -> str:
     """从 OpenAI 消息 content（字符串或多部分列表）中提取纯文本。
 
-    [PROTOCOL] 两种过去会出错的内容形状在这里统一收口：
+    [PROTOCOL] 四种过去会出错的内容形状在这里统一收口：
     - `{"type": "text", "text": null}`（客户端把可选字段显式写了 null）会让
       `"\\n".join` 抛 `TypeError: sequence item 0: expected str instance`，一个
       合法的请求变成 500；
     - 图片/文件块会被静默跳过，模型对着没看到的附件作答。现在给出显式占位符。
+    - `input_audio` 块同样被跳过，于是 `[text "transcribe this", audio]` 送到上游
+      的只有那句指令本身——模型会对着它从未收到的音频作答。同理给占位符。
+    - 助手的 `refusal` 块整轮消失，历史读起来像两个连续的 user 轮，模型不知道
+      自己拒绝过。它的文本**就是**那一轮的正文，原样回放。
+    - 任何未知类型曾经退化成空字符串，连「有东西没渲染」都不说（§71 的判据）。
+      现在先保留它自带的 `text`（若真带），否则留下带类型的公告。
     """
     if content is None:
         return ""
@@ -174,6 +225,18 @@ def text_of(content: Union[str, List[dict], None]) -> str:
                 parts.append(_image_placeholder())
             elif p_type in ("input_file", "file", "document"):
                 parts.append(_file_placeholder(p))
+            elif p_type in AUDIO_BLOCK_TYPES:
+                parts.append(AUDIO_PLACEHOLDER)
+            elif p_type in REFUSAL_BLOCK_TYPES:
+                refusal = _refusal_text(p)
+                if refusal:
+                    parts.append(refusal)
+            elif isinstance(text, str) and text:
+                # 未知类型但确实带正文：正文是真内容，比一条公告更有用
+                # （与 Anthropic 提取器的 `"text" in block` 兜底同一条规则）。
+                parts.append(text)
+            elif p_type is not None:
+                parts.append(content_omitted(p_type))
     return "\n".join(parts)
 
 
