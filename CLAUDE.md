@@ -1070,3 +1070,17 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
       claude: PASS (exit=0, bodies=3, tool_ran=True, tool=Bash,         tool_markers=2/2, conversation_reused=True)
       codex:  PASS (exit=0, bodies=3, tool_ran=True, tool=exec_command, tool_markers=2/2, conversation_reused=True)
       ```
+
+90. **`search` Changes the Upstream Request, So It Belongs in the Dedup Key (`providers/singleflight.py:compute_key`)**:
+    - **[SINGLEFLIGHT] The same one-line rule as §53 and §75, for the third time, on a field nobody had counted as an output.** A dedup key's only correctness criterion is *identical fingerprint ⇒ the two requests' correct answers are interchangeable*. `compute_key` had grown to cover provider / model / messages / tools / temperature / thinking / stream / constraints / `session_key` / `upstream_conv_id` — and not `search`, which four of the five providers write straight into their outbound body: qwen `"deep_search": "normal" if search else None`, deepseek `"search_enabled": search`, glm `"is_networking": search`, kimi `"use_search": search`. Whether the gateway asks upstream to run a web search plainly changes the answer to the same question.
+    - **Measured on the real ASGI path** (scripted provider, `TESTING=1`, zero upstream calls), two requests identical except `search`, issued concurrently:
+      ```
+      statuses: 200 200
+      upstream calls: 1 [{'search': True}]
+      A search=True  -> SEARCH-ON-ANSWER | sf: leader
+      B search=False -> SEARCH-ON-ANSWER | sf: follower
+      ```
+      The client that explicitly declined search was handed the search answer, and its declaration never reached any upstream. A wrong answer with no error anywhere — the same shape as [S3]'s `tool_choice` and §75's session identity, and found by sweeping for fields that change the wire but are absent from the key rather than by a bug report.
+    - **Adding the field is the only safe direction, and the opposite error is pinned too.** `search=False` (the default) reproduces the previous payload value-for-value, so the Anthropic and Responses call sites — neither of which has this field — are untouched, and genuinely identical requests still collapse: asserted by a case that drives two byte-identical `search=True` requests and requires **one** upstream call with `leader` / `follower` roles, because a key so specific that nothing ever dedups is the worse regression (§53's rule, applied a third time).
+    - **The call site is asserted structurally, not just the signature.** Widening `compute_key` while leaving `server.py` alone is a fix that passes every direct-call unit test and changes nothing on the real request path — the trap §53 recorded for `constraints` and §75 for `session_key`. The suite reads `server.py` and requires **exactly one** `search=req.search,` argument, which is correct because only the OpenAI chat protocol carries the field; requiring it at all three sites would pin the other two to a field they do not have.
+    - Pinned by `tests/test_singleflight_search.py` (4 cases, the 93rd file in the glob), verified **per case**: case 1 red structurally on the pre-fix tree (`compute_key() got an unexpected keyword argument 'search'`), case 2 red behaviourally with the measured line above (`两条只差 \`search\` 的请求被合并成了一次上游调用（实测 1 次，上游收到 [{'search': True}]）`), case 3 green by design on both trees (the zero-regression guard), case 4 red structurally (the parameter does not exist). Full glob sweep `failures: 0 / 93`.

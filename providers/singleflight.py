@@ -237,6 +237,7 @@ class SingleFlightManager:
         constraints: Optional[Dict[str, Any]] = None,
         session_key: Optional[str] = None,
         upstream_conv_id: Optional[str] = None,
+        search: bool = False,
     ) -> str:
         """计算请求特征指纹 (SHA-256)。
 
@@ -267,6 +268,15 @@ class SingleFlightManager:
 
         没有会话身份的请求（匿名一次性调用）两者都是 `None`，逐值不变——它们
         之间确实可以互换，仍然合并。
+
+        [SINGLEFLIGHT] `search` 是同一条判据的第三次应用（前两次：约束字段
+        [S3]、会话身份 [SINGLEFLIGHT]）。它**改变上游请求体**——qwen 写
+        `deep_search`、deepseek 写 `search_enabled`、glm 写 `is_networking`、
+        kimi 写 `use_search`——开不开联网检索，同一条问题的正确答案当然不同。
+        实测（真实 ASGI 路径）：两条只差 `search` 的并发请求被合并成**一次**
+        上游调用，声明 `search=False` 的那条领到了检索答案，而它自己的声明从未
+        到达任何上游。加字段仍只会让键更具体，不传 `search` 的调用点（Anthropic
+        / Responses 两个协议没有这个字段）逐值保持不变。
         """
         payload = {
             "protocol": protocol,
@@ -283,6 +293,9 @@ class SingleFlightManager:
             # 匿名请求两者都是 None，与修复前逐值等价。
             "session_key": session_key or "",
             "upstream_conv_id": upstream_conv_id or "",
+            # `search` 会进上游请求体，因此改变正确答案。缺省 False 与修复前
+            # 逐值等价（三个协议里只有 chat 有这个字段）。
+            "search": bool(search),
         }
         raw_str = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()

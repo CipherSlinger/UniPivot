@@ -2584,6 +2584,12 @@ async def chat_completions(req: ChatCompletionRequest):
                 "response_format": req.response_format,
                 "max_tokens": req.max_tokens,
             },
+            # [SINGLEFLIGHT] `search` 会进四个 provider 的上游请求体
+            # （qwen `deep_search` / deepseek `search_enabled` / glm
+            # `is_networking` / kimi `use_search`），因此改变正确答案。实测：
+            # 只差这一个字段的两条并发请求被合并成一次上游调用，声明
+            # `search=False` 的那条领到了检索答案。
+            search=req.search,
             # [SINGLEFLIGHT] 会话身份同样会改变正确答案：已绑定的会话走续聊、
             # 只发增量，全新会话展平全量历史。两者 messages 可以逐字相同
             # （父 agent 与它派生的子 agent 就是如此），合并即错答案。
