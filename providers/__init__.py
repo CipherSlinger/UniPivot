@@ -30,6 +30,7 @@ from .responses_compat import (
     ResponsesRequest,
     convert_responses_to_gateway_messages,
     extract_responses_content,
+    responses_text_format,
     format_responses_completion,
     custom_tool_call_item,
     custom_tool_input_text,
@@ -146,6 +147,12 @@ from .stop_sequences import (
     normalize_stop,
     truncate_final,
 )
+from .response_format import (
+    enforce_json_output,
+    extract_json_payload,
+    invalid_output_message,
+    response_format_mode,
+)
 from .tool_streamer import (
     SpeculativeToolStreamer,
     StreamAction,
@@ -241,6 +248,7 @@ __all__ = [
     "sse_done",
     "convert_responses_to_gateway_messages",
     "extract_responses_content",
+    "responses_text_format",
     "format_responses_completion",
     "sse_response_created",
     "sse_response_output_item_added",
@@ -276,6 +284,10 @@ __all__ = [
     "all_stops",
     "normalize_stop",
     "truncate_final",
+    "enforce_json_output",
+    "extract_json_payload",
+    "invalid_output_message",
+    "response_format_mode",
     "tool_names_of",
     "SessionAffinityManager",
     "AffinityDecision",

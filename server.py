@@ -72,6 +72,10 @@ from providers import (
     flatten_messages,
     format_anthropic_models,
     format_response_format_prompt,
+    # [PROTOCOL] 结构化输出的解析端兑现（见 providers/response_format.py）
+    enforce_json_output,
+    response_format_mode,
+    responses_text_format,
     format_tools_system_prompt,
     flatten_declared_tools,
     last_user_content,
@@ -2621,6 +2625,10 @@ async def chat_completions(req: ChatCompletionRequest):
 
                     # [PROTOCOL] 正文的停用词截断：命中后不再发送、也不再读上游
                     stop_scan = StopSequenceScanner(stop_seq)
+                    # [PROTOCOL] 要求结构化输出时**不能**边吐边发：客户端会把先到的
+                    # 半句当成完整答案去 `JSON.parse`。正文整体缓存，结尾一次判定后
+                    # 交付（思考流不受影响，它不是 content）。
+                    json_mode = response_format_mode(req.response_format)
 
                     async for delta, meta in stream:
                         if not ttft_recorded and delta:
@@ -2652,24 +2660,50 @@ async def chat_completions(req: ChatCompletionRequest):
                                 }],
                             })
                         else:
-                            safe = stop_scan.feed(delta)
                             accumulated_chunks.append(delta)
-                            if not safe:
-                                continue
-                            yield sse_frame({
-                                "id": cid,
-                                "object": "chat.completion.chunk",
-                                "created": created,
-                                "model": req.model,
-                                "choices": [{
-                                    "index": 0,
-                                    "delta": {"content": safe},
-                                    "finish_reason": None,
-                                }],
-                            })
+                            # 结构化输出：不逐字下发，整体缓存到结尾统一判定
+                            safe = "" if json_mode is not None else stop_scan.feed(delta)
+                            if safe:
+                                yield sse_frame({
+                                    "id": cid,
+                                    "object": "chat.completion.chunk",
+                                    "created": created,
+                                    "model": req.model,
+                                    "choices": [{
+                                        "index": 0,
+                                        "delta": {"content": safe},
+                                        "finish_reason": None,
+                                    }],
+                                })
 
                         if meta and meta.get("conversation_id"):
                             conversation_id = meta["conversation_id"]
+
+                    if json_mode is not None:
+                        # 停止词先截断，再判定 JSON：截断点之后的内容对客户端不存在。
+                        _buffered, _ = truncate_final("".join(accumulated_chunks), stop_seq)
+                        _payload, _json_err = enforce_json_output(
+                            _buffered, req.response_format
+                        )
+                        if _payload is None:
+                            error_msg = _json_err
+                            yield sse_frame(
+                                error_response(_json_err, 502, "invalid_output")
+                            )
+                            # 绝不再发 [DONE]：没有兑现契约的输出不能冒充正常结束
+                            return
+                        accumulated_chunks[:] = [_payload]
+                        yield sse_frame({
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": _payload},
+                                "finish_reason": None,
+                            }],
+                        })
 
                     tail = stop_scan.flush()
                     if tail:
@@ -2765,6 +2799,8 @@ async def chat_completions(req: ChatCompletionRequest):
                 # [PROTOCOL] 工具模式同样受停用词约束（三条协议共用同一条纪律）
                 stop_scan = StopSequenceScanner(stop_seq)
                 first_frame_emitted = False
+                # [PROTOCOL] 结构化输出：正文不逐字下发，结尾一次判定（同无 tools 分支）
+                json_mode = response_format_mode(req.response_format)
 
                 async for delta, meta in stream:
                     if not ttft_recorded and delta:
@@ -2805,6 +2841,9 @@ async def chat_completions(req: ChatCompletionRequest):
                             yield sse_frame(chunk)
                             first_frame_emitted = True
                         elif act.action_type == "text_delta":
+                            if json_mode is not None:
+                                # 结构化输出：缓存到结尾统一交付，不逐字下发
+                                continue
                             safe_act = stop_scan.feed(act.content)
                             if not safe_act:
                                 continue
@@ -2844,6 +2883,9 @@ async def chat_completions(req: ChatCompletionRequest):
                     )
                 # [PROTOCOL] 终局剩余正文同样要过停用词判定，并把扣住的尾巴放行
                 rem_text = stop_scan.feed(rem_text) + stop_scan.flush()
+                if json_mode is not None:
+                    # 正文整体缓存（见本分支开头），残余前缀不单独下发
+                    rem_text = ""
                 if rem_text:
                     chunk = {
                         "id": cid,
@@ -2906,7 +2948,38 @@ async def chat_completions(req: ChatCompletionRequest):
                         "choices": [{"index": 0, "delta": {}, "finish_reason": "tool_calls"}],
                     })
                 else:
-                    if not first_frame_emitted:
+                    if json_mode is not None:
+                        # [PROTOCOL] 结构化输出的兑现判定：拿不到合法 JSON 就如实报错，
+                        # 绝不把大白话当 content 递给一个准备 `JSON.parse` 的客户端。
+                        _payload, _json_err = enforce_json_output(
+                            full_text, req.response_format
+                        )
+                        if _payload is None:
+                            error_msg = _json_err
+                            yield sse_frame(
+                                error_response(_json_err, 502, "invalid_output")
+                            )
+                            # 绝不再发 [DONE]：没有兑现契约的输出不能冒充正常结束
+                            return
+                        full_text = _payload
+                        _json_chunk = {
+                            "id": cid,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": req.model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": full_text},
+                                "finish_reason": None,
+                            }],
+                        }
+                        if failover_event and not first_frame_emitted:
+                            _json_chunk["failover"] = failover_event.to_dict()
+                        if conversation_id:
+                            _json_chunk["conversation_id"] = conversation_id
+                        yield sse_frame(_json_chunk)
+                        first_frame_emitted = True
+                    elif not first_frame_emitted:
                         init_chunk = {
                             "id": cid,
                             "object": "chat.completion.chunk",
@@ -3192,6 +3265,23 @@ async def chat_completions(req: ChatCompletionRequest):
             if flight_decision and flight_decision.is_leader:
                 await flight_decision.group.finish(result=resp_data, headers=resp_headers)
             return JSONResponse(resp_data, headers=resp_headers if resp_headers else None)
+
+    # [PROTOCOL] `response_format` 是硬契约：客户端拿到 content 会直接 `JSON.parse`。
+    # 第 35 节只把它翻译成一条提示词——解析端什么也没做，实测（脚本化 provider 返回
+    # 寒暄+围栏 JSON）content 原样就是那段大白话，客户端一行之后崩掉。与 `tool_choice`
+    # / `stop` 同一条纪律：提示词降低发生率，解析端保证结果。
+    full_output, _json_err = enforce_json_output(full_output, req.response_format)
+    if full_output is None:
+        # 完全取不出合法 JSON：不把大白话伪装成结构化输出，如实报错并附模型原文。
+        # 这不是「已确定重试无用」的拒绝（模型质量事件，重试可能有用），因此不带
+        # `x-should-retry: false` / `Retry-After`。
+        if flight_decision and flight_decision.is_leader:
+            await flight_decision.group.finish(
+                error=ProviderError(_json_err, 502, "invalid_output")
+            )
+        return JSONResponse(
+            error_response(_json_err, 502, "invalid_output"), status_code=502
+        )
 
     resp_data = completion_response(
         req.model, full_output, prompt, conversation_id, thinking_content=full_reasoning,
@@ -4271,6 +4361,9 @@ async def responses_endpoint(req: ResponsesRequest):
             nonlocal ttft_recorded, success, is_rate_limit, error_msg
             conv_id: Optional[str] = None
             ev = ResponsesEventStream(resp_id, req.model)
+            # [PROTOCOL] 结构化输出必须整体交付：客户端会立刻 `JSON.parse` content，
+            # 先到的半句等于一次必然失败的解析。正文缓存到结尾统一判定。
+            json_mode = response_format_mode(responses_text_format(req))
             try:
                 # [TOOL-LOOP] 两个分支现在共用同一套事件构造器与同一套流处理逻辑。
                 # 原先「有 tools」与「无 tools」是两份几乎相同的 200 行循环，差异只在
@@ -4379,6 +4472,9 @@ async def responses_endpoint(req: ResponsesRequest):
                             emitted_reasoning.append(act.content)
                             yield ev.reasoning_summary_delta(reasoning_id, act.content, out_idx)
                         elif act.action_type == "text_delta":
+                            if json_mode is not None:
+                                # 结构化输出：正文缓存到结尾统一交付（见 gen() 开头）
+                                continue
                             if in_reasoning:
                                 async for frame in _close_reasoning():
                                     yield frame
@@ -4416,6 +4512,9 @@ async def responses_endpoint(req: ResponsesRequest):
                     )
                 # [PROTOCOL] 终局剩余正文同样过停用词判定，并把扣住的尾巴放行
                 rem_text = stop_scan.feed(rem_text) + stop_scan.flush()
+                if json_mode is not None:
+                    # 结构化输出：正文整体缓存（见 gen() 开头），残余前缀不单独下发
+                    rem_text = ""
                 if rem_text:
                     if in_reasoning:
                         async for frame in _close_reasoning():
@@ -4428,6 +4527,31 @@ async def responses_endpoint(req: ResponsesRequest):
                         in_text_part = True
                     emitted_parts.append(rem_text)
                     yield ev.output_text_delta(text_item_id, rem_text, out_idx, 0)
+
+                if json_mode is not None and not tool_list:
+                    # [PROTOCOL] 结构化输出的兑现判定（同非流式路径）。取不到合法 JSON
+                    # 时用 `response.failed` 收尾——Codex 只认 `response.*` 事件，
+                    # 裸 `event: error` 会被整条丢弃（第 57 节），客户端最后只能报
+                    # "stream closed before response.completed"，真实成因全部丢失。
+                    _payload, _json_err = enforce_json_output(
+                        "".join(streamer.accumulated_text), responses_text_format(req)
+                    )
+                    if _payload is None:
+                        error_msg = _json_err
+                        yield ev.failed(_json_err, 502, "invalid_output")
+                        # 失败流不得再发 response.completed / [DONE]
+                        return
+                    if in_reasoning:
+                        async for frame in _close_reasoning():
+                            yield frame
+                    if not in_text_part:
+                        yield ev.output_item_added(
+                            out_idx, message_item(text_item_id, "", status="in_progress")
+                        )
+                        yield ev.content_part_added(text_item_id, out_idx, 0)
+                        in_text_part = True
+                    emitted_parts.append(_payload)
+                    yield ev.output_text_delta(text_item_id, _payload, out_idx, 0)
 
                 full_reasoning = "".join(streamer.accumulated_reasoning)
                 async for frame in _close_reasoning():
@@ -4676,6 +4800,21 @@ async def responses_endpoint(req: ResponsesRequest):
             for tool_name, args in tool_list
         ]
         full_output = prefix
+
+    if not tool_calls_list:
+        # [PROTOCOL] `text.format` 是 Responses 的 `response_format`，同样是硬契约。
+        # `responses_text_format` 是提示词那侧同一个归一化函数（一份定义，两处读取）。
+        full_output, _json_err = enforce_json_output(
+            full_output, responses_text_format(req)
+        )
+        if full_output is None:
+            if flight_decision and flight_decision.is_leader:
+                await flight_decision.group.finish(
+                    error=ProviderError(_json_err, 502, "invalid_output")
+                )
+            return JSONResponse(
+                error_response(_json_err, 502, "invalid_output"), status_code=502
+            )
 
     resp_data = format_responses_completion(
         resp_id=resp_id,

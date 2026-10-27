@@ -153,10 +153,15 @@ def escape_raw_newlines_in_strings(s: str) -> str:
     return "".join(out)
 
 
-def repair_json_string(raw: str) -> Tuple[str, bool]:
+def repair_json_string(raw: str, *, allow_truncation_repair: bool = True) -> Tuple[str, bool]:
     """对非标准或破损的 JSON 字符串执行渐进式管道修复。
 
     返回 (修复后的字符串, 是否触发了修复)。
+
+    `allow_truncation_repair=False` 关掉最后一步「截断补全」。工具调用需要它
+    （参数被 token 上限截断时，补全比整轮丢掉更有用）；**结构化输出不能要它**：
+    补全会给缺失的字段填上 `null`，那是替模型编数据，而客户端会把一个看起来
+    完整的对象当成模型真的给出的答案（见 providers/response_format.py）。
     """
     if not raw or not isinstance(raw, str):
         return "", False
@@ -191,7 +196,8 @@ def repair_json_string(raw: str) -> Tuple[str, bool]:
     modified = quote_unquoted_keys(modified)
 
     # 截断补全
-    modified = repair_truncated_json(modified)
+    if allow_truncation_repair:
+        modified = repair_truncated_json(modified)
 
     # 再次清理可能补全后残留的逗号
     modified = clean_trailing_commas(modified)
@@ -199,10 +205,13 @@ def repair_json_string(raw: str) -> Tuple[str, bool]:
     return modified, True
 
 
-def safe_loads_with_repair(raw: Any) -> Tuple[Optional[Any], bool]:
+def safe_loads_with_repair(
+    raw: Any, *, allow_truncation_repair: bool = True
+) -> Tuple[Optional[Any], bool]:
     """鲁棒的 JSON 解析与自愈。
 
-    返回 (解析后的 Python 对象, 是否经历过修复自愈)。
+    返回 (解析后的 Python 对象, 是否经历过修复自愈)。`allow_truncation_repair`
+    透传给 `repair_json_string`：结构化输出必须关掉它（理由见该函数 docstring）。
     """
     if raw is None:
         return None, False
@@ -222,7 +231,7 @@ def safe_loads_with_repair(raw: Any) -> Tuple[Optional[Any], bool]:
         pass
 
     # 尝试管道修复
-    repaired_str, _ = repair_json_string(s)
+    repaired_str, _ = repair_json_string(s, allow_truncation_repair=allow_truncation_repair)
     try:
         return json.loads(repaired_str, strict=False), True
     except Exception:

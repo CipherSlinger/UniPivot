@@ -119,7 +119,7 @@ class ResponsesRequest(BaseModel):
         return flatten_declared_tools(tools)
 
 
-def _responses_text_format(req: "ResponsesRequest") -> Optional[dict]:
+def responses_text_format(req: "ResponsesRequest") -> Optional[dict]:
     """从 Responses 请求里取出结构化输出约束（`text.format` 优先，兼容 `response_format`）。
 
     Responses 把 OpenAI 的 `response_format` 搬到了 `text.format`：
@@ -344,7 +344,7 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
         if tools_prompt:
             system_parts.append(tools_prompt)
     # [PROTOCOL] `text.format` 是 Responses 的 response_format，同样是必须被模型看见的约束
-    fmt_prompt = format_response_format_prompt(_responses_text_format(req))
+    fmt_prompt = format_response_format_prompt(responses_text_format(req))
     if fmt_prompt:
         system_parts.append(fmt_prompt)
 

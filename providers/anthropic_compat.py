@@ -909,6 +909,42 @@ def format_tools_system_prompt(
     return "\n".join(lines)
 
 
+#: JSON Schema 顶层类型里能写成自然语言的那几种。
+_JSON_SCHEMA_TYPES = frozenset(
+    {"object", "array", "string", "number", "integer", "boolean", "null"}
+)
+
+#: 顶层类型 -> 提示词里的名词。`json_schema` 声明的是 array 时，提示词若仍然说
+#: "a single valid JSON object"，模型读到的就是一份与紧跟在后面的 `Schema:` 相矛盾
+#: 的契约（实测：`{"type":"array"}` 的请求，提示词让模型输出 object）。提示词是这些
+#: 网页端上游**唯一**能看到的契约，说错形状等于让它必然违约。
+_TOP_LEVEL_PHRASES = {
+    "object": "JSON object",
+    "array": "JSON array",
+    "string": "JSON string",
+    "number": "JSON number",
+    "integer": "JSON integer",
+    "boolean": "JSON true/false value",
+    "null": "JSON null",
+}
+
+
+def response_format_top_level_type(response_format: Any) -> Optional[str]:
+    """客户端在 `json_schema.schema.type` 里声明的顶层类型（没声明/不认识时 `None`）。
+
+    提示词与解析端校验读的是同一处定义：两边各写一份「顶层该是什么」，第一处改动
+    就会让它们悄悄对不上（本仓库反复记录的形态）。
+    """
+    if not isinstance(response_format, dict):
+        return None
+    schema = response_format.get("json_schema")
+    inner = schema.get("schema") if isinstance(schema, dict) else None
+    if not isinstance(inner, dict):
+        return None
+    declared = inner.get("type")
+    return declared if isinstance(declared, str) and declared in _JSON_SCHEMA_TYPES else None
+
+
 def format_response_format_prompt(response_format: Any) -> str:
     """[PROTOCOL] 把客户端的 `response_format` 翻译成一条上游能看懂的输出约束。
 
@@ -940,13 +976,16 @@ def format_response_format_prompt(response_format: Any) -> str:
                 "Do not wrap it in a markdown code fence, and do not add prose before or after it."
             )
         label = f" matching the \"{name}\" schema" if isinstance(name, str) and name else ""
+        noun = _TOP_LEVEL_PHRASES.get(
+            response_format_top_level_type(response_format) or "", "JSON object"
+        )
         try:
             body = json.dumps(inner, ensure_ascii=False, separators=(",", ":"))
         except (TypeError, ValueError):
             return ""
         return (
             "## Output Format\n"
-            f"Respond with a single valid JSON object{label} and nothing else. "
+            f"Respond with a single valid {noun}{label} and nothing else. "
             "Do not wrap it in a markdown code fence, and do not add prose before or after it.\n"
             f"Schema: {body}"
         )
