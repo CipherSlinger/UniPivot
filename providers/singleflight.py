@@ -238,6 +238,7 @@ class SingleFlightManager:
         session_key: Optional[str] = None,
         upstream_conv_id: Optional[str] = None,
         search: bool = False,
+        stream_options: Optional[Dict[str, Any]] = None,
     ) -> str:
         """计算请求特征指纹 (SHA-256)。
 
@@ -277,6 +278,15 @@ class SingleFlightManager:
         上游调用，声明 `search=False` 的那条领到了检索答案，而它自己的声明从未
         到达任何上游。加字段仍只会让键更具体，不传 `search` 的调用点（Anthropic
         / Responses 两个协议没有这个字段）逐值保持不变。
+
+        [SINGLEFLIGHT] `stream_options` 是同一条判据的第四次应用，也是**最直观**
+        的一次：`include_usage` 声明的是「这条请求要不要那一帧 `usage`」，而
+        `usage` 由 Leader 的生成器按 **`req.` 自己的声明**合成
+        （`server.py:2807` / `3079`），Follower 只是逐字转发 Leader 的帧。于是
+        「要不要 usage」被当成了飞行组的属性，而它其实是请求的属性。实测两个
+        方向都错：Leader 要、Follower 不要 → Follower 收到一帧它没要求的
+        `usage`；Leader 不要、Follower 要 → Follower 的计数器永远是 0，且没有
+        任何错误可看。加字段仍只会让键更具体，另外两个协议不传，逐值不变。
         """
         payload = {
             "protocol": protocol,
@@ -296,6 +306,9 @@ class SingleFlightManager:
             # `search` 会进上游请求体，因此改变正确答案。缺省 False 与修复前
             # 逐值等价（三个协议里只有 chat 有这个字段）。
             "search": bool(search),
+            # `usage` 帧是每条请求自己的声明，不是飞行组的产物。缺省 `{}` 与
+            # 修复前逐值等价（Anthropic / Responses 两个协议没有这个字段）。
+            "stream_options": stream_options or {},
         }
         raw_str = json.dumps(payload, sort_keys=True, ensure_ascii=False)
         return hashlib.sha256(raw_str.encode("utf-8")).hexdigest()

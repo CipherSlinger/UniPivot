@@ -2590,6 +2590,12 @@ async def chat_completions(req: ChatCompletionRequest):
             # 只差这一个字段的两条并发请求被合并成一次上游调用，声明
             # `search=False` 的那条领到了检索答案。
             search=req.search,
+            # [SINGLEFLIGHT] `usage` 帧是**这条请求**的声明，不是飞行组的产物：
+            # `include_usage` 只被 Leader 的生成器读取（`req.` 自己的），而
+            # Follower 只是逐字转发 Leader 的帧。实测两个方向都错——Leader 要、
+            # Follower 不要时 Follower 收到一帧它没要求的 usage；Leader 不要、
+            # Follower 要时它的计数器永远是 0 且没有任何错误。
+            stream_options=req.stream_options,
             # [SINGLEFLIGHT] 会话身份同样会改变正确答案：已绑定的会话走续聊、
             # 只发增量，全新会话展平全量历史。两者 messages 可以逐字相同
             # （父 agent 与它派生的子 agent 就是如此），合并即错答案。
