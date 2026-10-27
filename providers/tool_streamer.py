@@ -10,6 +10,7 @@ import re
 from typing import Any, List, Optional, Tuple, NamedTuple
 from .json_repair import safe_loads_with_repair, strip_markdown_fence
 from .stop_sequences import truncate_final
+from .tool_choice import interpret_tool_choice, tool_names_of
 from .anthropic_compat import (
     extract_balanced_json_objects,
     iter_tool_blocks,
@@ -45,30 +46,6 @@ _PARTIAL_TRIGGER_PREFIXES = [
 ]
 
 
-def tool_names_of(tools: Any) -> Optional[set]:
-    """从客户端声明的 `tools` 里取出所有工具名（兼容 OpenAI / Anthropic / Responses 形状）。
-
-    返回 None 表示「调用方没有声明工具」——此时不做白名单裁剪，保持既有解析行为。
-
-    [TOOL-LOOP] Responses 的 custom（freeform）工具声明是
-    `{"type": "custom", "name": "apply_patch"}`：没有 `function` 包装，但顶层有
-    `name`，旧实现靠 `t.get("name")` 恰好覆盖到它。这里显式写出来，是因为白名单
-    决定了「模型写出的调用能不能被回传」——漏掉一个声明过的名字，等于该工具永远
-    不可调用，而症状是客户端侧的「工具没跑起来」，很难追到这一行。
-    """
-    if not tools:
-        return None
-    names = set()
-    for t in tools:
-        if not isinstance(t, dict):
-            continue
-        fn = t.get("function") if isinstance(t.get("function"), dict) else None
-        name = fn.get("name") if fn else t.get("name")
-        if isinstance(name, str) and name.strip():
-            names.add(name.strip())
-    return names or None
-
-
 def resolve_allowed_tools(tools: Any, tool_choice: Any = None) -> Optional[set]:
     """结合 `tool_choice` 计算本回合**允许回传**的工具名集合。
 
@@ -84,43 +61,12 @@ def resolve_allowed_tools(tools: Any, tool_choice: Any = None) -> Optional[set]:
       - `None`：不做裁剪（未声明工具，或 tool_choice 形状无法识别——失败开放）
       - 空集合：本回合不允许任何工具调用（`tool_choice: "none"`）
       - 非空集合：只接受集合内的名字（点名某个工具时即为该工具）
+
+    判定本身在 `providers/tool_choice.py:interpret_tool_choice`——提示词里的那句
+    约束读的是**同一个**判定，两处不可能再判得不一样（实测过 `{"type":"none"}`
+    与点名未声明工具两种形状，见 `tests/test_tool_choice_agreement.py`）。
     """
-    names = tool_names_of(tools)
-    if names is None:
-        return None
-
-    if tool_choice is None:
-        return names
-
-    if isinstance(tool_choice, str):
-        # "auto" / "required" / "any" / 未知字符串：维持全部声明工具
-        return set() if tool_choice.strip().lower() == "none" else names
-
-    if isinstance(tool_choice, dict):
-        c_type = tool_choice.get("type")
-        if c_type == "none":
-            return set()
-        chosen = None
-        if c_type == "tool":
-            chosen = tool_choice.get("name")
-        elif isinstance(tool_choice.get("function"), dict):
-            # OpenAI: {"type": "function", "function": {"name": ...}}
-            chosen = tool_choice["function"].get("name")
-        else:
-            # [TOOL-LOOP] Responses 的**扁平**形状：`{"type": "function", "name": ...}`
-            # 与 custom 工具的 `{"type": "custom", "name": ...}`——名字在顶层，没有
-            # function 包装。这正是 Responses 原生写法（也是它声明工具的形状），
-            # 漏掉它等于对 Codex 这类客户端**完全没有** tool_choice 约束：实测
-            # 收窄前是 `{'read_file','write_file'}`，客户端点名了 `read_file` 却
-            # 仍能收到 `write_file` 的调用，而客户端按契约不会执行它，回合报废。
-            chosen = tool_choice.get("name")
-        if isinstance(chosen, str) and chosen.strip():
-            # 点名的工具若根本没声明（客户端自相矛盾），按无法识别处理：
-            # 收紧白名单只会把一个可用的回合变成空回合，失败开放更安全。
-            chosen = chosen.strip()
-            return {chosen} if chosen in names else names
-
-    return names
+    return interpret_tool_choice(tools, tool_choice)[0]
 
 
 def parallel_calls_disallowed(

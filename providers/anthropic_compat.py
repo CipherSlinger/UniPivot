@@ -15,6 +15,7 @@ from .base import (
     _id,
     content_omitted,
 )
+from .tool_choice import interpret_tool_choice
 
 CLAUDE_MODELS_METADATA = [
     {"id": "claude-3-7-sonnet-20250219", "display_name": "Claude 3.7 Sonnet", "created_at": "2025-02-19T00:00:00Z"},
@@ -500,34 +501,15 @@ def _compact_args_summary(schema: Any) -> str:
     return ", ".join(args_str_list) if args_str_list else "None"
 
 
-def _tool_choice_directive(tool_choice: Any) -> str:
-    """把客户端的 tool_choice 约束翻译为一句简短指令；无法识别时返回空串（失败开放）。"""
-    if tool_choice is None:
-        return ""
-    if isinstance(tool_choice, str):
-        choice = tool_choice.strip().lower()
-        if choice == "none":
-            return "Do not call any tool in this turn; answer in plain text."
-        if choice in ("required", "any"):
-            return "You MUST call at least one tool in this turn."
-        # "auto" 及未知字符串：默认行为，不追加指令
-        return ""
-    if isinstance(tool_choice, dict):
-        c_type = tool_choice.get("type")
-        if c_type == "any":
-            return "You MUST call at least one tool in this turn."
-        name = None
-        if c_type == "tool":
-            name = tool_choice.get("name")
-        elif isinstance(tool_choice.get("function"), dict):
-            name = tool_choice["function"].get("name")
-        else:
-            # Responses 扁平形状（`{"type":"function","name":...}` / custom 的
-            # `{"type":"custom","name":...}`）；与 `resolve_allowed_tools` 同一判定。
-            name = tool_choice.get("name")
-        if isinstance(name, str) and name.strip():
-            return f"You MUST call the tool `{name.strip()}` in this turn, with arguments matching its schema."
-    return ""
+def _tool_choice_directive(tools: Any, tool_choice: Any) -> str:
+    """把客户端的 tool_choice 约束翻译为一句简短指令；无法识别时返回空串（失败开放）。
+
+    [TOOL-LOOP] 这里曾经自己实现了一遍形状判断，与解析端的白名单各自演进，于是
+    在 `{"type":"none"}`（白名单禁止一切、提示词什么都不说）和「点名一个未声明
+    的工具」（提示词要求调用、白名单一定挡掉）两种形状上互相矛盾。现在两个消费者
+    都读 `providers/tool_choice.py:interpret_tool_choice` 的**同一次**判定。
+    """
+    return interpret_tool_choice(tools, tool_choice)[1]
 
 
 # [TOOL-LOOP] Responses 的 **custom / freeform** 工具（Codex CLI 的 `apply_patch`
@@ -892,7 +874,7 @@ def format_tools_system_prompt(
     )
     lines.append(rules)
 
-    directive = _tool_choice_directive(tool_choice)
+    directive = _tool_choice_directive(tools, tool_choice)
     if directive:
         lines.append(f"\n## Tool Choice Constraint\n{directive}")
 
