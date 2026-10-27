@@ -501,8 +501,17 @@ def test_count_tokens_sees_the_same_tools_prompt_as_messages():
         "count_tokens 与 /v1/messages 对同一份报文生成了不同的提示词"
         f"（{len(count_serial)} vs {len(msg_serial)} 字符）——估算的是另一个请求"
     )
-    assert len(count_serial) > len(count_named), (
+    # 这里原本比较的是 `len(count_serial) > len(count_named)`（禁止并行的那份更长）。
+    # 长度只是「约束段在不在」的代理：§101 让**允许**并行的那一份也变长了（规则 2
+    # 多了一句「多个独立调用可以背靠背写出来」），一个正当的措辞改进就把这个代理
+    # 推翻了，而它想断言的事实没有变。直接断言那一段文字本身，既不受措辞长度影响，
+    # 也比长度更贴近用例名字里的主张。
+    serial_marker = "Do NOT emit more than one tool call in a turn"
+    assert serial_marker in count_serial, (
         "`disable_parallel_tool_use` 的约束段没有进入估算路径的提示词"
+    )
+    assert serial_marker not in count_named, (
+        "客户端没有禁止并行，估算路径的提示词却带着禁止段"
     )
     print("test_count_tokens_sees_the_same_tools_prompt_as_messages: PASSED")
 

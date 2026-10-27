@@ -858,16 +858,43 @@ def format_tools_system_prompt(
         )
         lines.extend(nameless_notes)
 
+    # [TOOL-LOOP] 契约必须说出**解析端真正会做的事**。§68 让背靠背的两个
+    # ```tool_call 块真正被解析、被回传，§34b 又定下「只有客户端明确禁止并行时
+    # 才裁到一个，默认允许」；而这段契约此前一直写着「一次只调一个、调完就停」。
+    # 五家网页端上游没有原生工具调用，这份提示词是模型唯一能读到的契约，于是它把
+    # 一个本可并行完成的回合拆成 N 个，每个回合重新付一遍完整历史的 token；更糟的
+    # 是解析端对模型一次写出的两个块照收不误（`cap_parallel_tool_calls(TWO, False)
+    # -> 2`），提示词与网关的实际行为对客户端不可见地互相矛盾。
+    #
+    # 措辞由**同一个判断**（`parallel_allowed is not False`，与 `cap_parallel_tool_calls`
+    # 的输入同源）一次产出：「禁止」因此在整个契约里只有一个定义，就是下面那个
+    # 条件分支，不会出现「规则里说可以、小节里又说不行」的第二种说法。
+    if parallel_allowed is False:
+        parallel_clause = ""
+        wait_rule = (
+            "4. After outputting your tool call, stop and wait for the tool "
+            "execution result.\n"
+        )
+    else:
+        parallel_clause = (
+            " If you need several independent tools in the same turn, emit their "
+            "fenced blocks back to back rather than splitting the work across turns."
+        )
+        wait_rule = (
+            "4. After outputting your tool calls, stop and wait for their execution "
+            "results before continuing.\n"
+        )
+
     rules = (
         "\n## Tool Calling Rules\n"
         "1. When you need to read files, write files, run commands, or use any tool, you MUST output a tool call block formatted EXACTLY as:\n"
         "```tool_call\n"
         '{"name": "tool_name", "arguments": {"param1": "value1"}}\n'
         "```\n"
-        "2. Only call ONE tool at a time (one tool per fenced block).\n"
+        "2. Put exactly ONE tool call in each fenced block." + parallel_clause + "\n"
         "3. Arguments MUST match the declared schema for that tool (`Args:` JSON above) — "
         "use the exact field names, types, nesting and enum values it declares.\n"
-        "4. After outputting a tool call, stop and wait for the tool execution result.\n"
+        + wait_rule +
         "5. When you receive a `[Tool Result for <id>]` block, continue the task using that result.\n"
         "6. Never invent tool names that are not listed above; the available tools are exactly those declared in this prompt.\n"
         "7. Do NOT refuse or claim you lack tools/permissions: the tools above are real and callable."
