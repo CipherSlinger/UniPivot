@@ -1034,3 +1034,21 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
       ```
       两次都是 `bodies=3`、`tool_markers=2/2`、`conversation_reused=True`——即「回路闭合、工具真的执行」在两种情况下都成立，唯一的差别是模型的推理模式，这也正是该缺陷为什么从其他任何指标上都看不出来。
     - 逐例在 pristine `HEAD` 工作树上验证：第 1 例 RED（`['xhigh','max','ultra']` 全为 False）、第 3 例 RED（`'low'` 处两协议不一致）、第 4 例 RED（`'turbo'` 被静默关闭）、第 5 例 RED（HEAD 的 `run_agent_loop.py` 里 `_codex_effort` / `_effort_failure` 都不存在，`"thinking"` 在上游记录里出现 0 次）；第 2 例按设计 GREEN——它是明确关闭取值的零回归守卫，必须在新旧两棵树上都绿。全量 glob `failures: 0 / 90`。
+88. **工具结果的两种历史形状必须渲染成一份文本 (`providers/responses_compat.py:render_tool_output`)**:
+    - **[PROTOCOL] §43 只统一了「调用」一侧，把「结果」一侧留成了两条渲染路径。** Responses 客户端回传工具执行结果有两种合法形状，§43 已经确认过它们指**同一件事**：`{"type":"function_call_output","call_id":"c1","output":…}` 与 `{"type":"message","role":"tool","tool_call_id":"c1","content":…}`。两条都渲染成 `[Tool Result for c1]:` 开头的一段用户消息——但**内容**走了两个不同的转换：`role:"tool"` 分支调用 `extract_responses_content`（认得 `input_text` / `input_image` / `input_file` 块，附件变成 §41 的 `[Image omitted: …]` / `[File omitted: …]` 占位符），而 `function_call_output` / `custom_tool_call_output` / `local_shell_call_output` 三条分支对 dict/list 一律 `json.dumps`，把结构**原样倒进提示词**。
+    - **实测（真实转换函数，`TESTING=1`，同一份逻辑结果：一段文本 + 一个 20 KB base64 的 `input_image`）**:
+      ```
+      role:"tool"            101 字符  'exit code 0\n[Image omitted: this gateway's upstream providers accept text only]'
+      function_call_output 20133 字符  '[{"type": "input_text", "text": "exit code 0"}, {"type": "input_image",
+                                        "image_url": "data:image/png;base64,AAAA…"}]'
+      ```
+      两个后果，都是本项目反复修正的缺陷形状。(a) **成本**：整张附件的 base64 进了提示词，而这段历史在后续**每一轮**都会被重新发送（§66 的 continuation 只省掉答案侧），模型为一个它根本看不到的附件持续付费——一次 `view_image` 就是 20 KB × 剩余轮次。(b) **可读性**：模型收到的是一段它无法解释的 JSON，而不是一句「附件已省略」。§41 已经论证过这个区别：占位符让模型能说「我看不到图片」，原始 JSON 只会让它对着一个从未收到的东西自信作答。
+    - **判据是 §43 / §62 的同一条纪律：一个事实，一份渲染。** 新增 `render_tool_output(output)` 是工具结果的**唯一**渲染入口，三条 `*_call_output` 分支和 `extract_responses_content` 内部的 `tool_result` 块全部改为问它。
+    - **「不要倒 JSON」不能做成「不要任何结构」，这是本修复最容易犯的错。** 一个返回 `{"stdout": "on branch main", "exit": 0}` 的工具，它的字段**就是**结果本身，模型要读的就是这些键——序列化它是对的。真正的分界线是 Responses 的**内容块词表**（`_CONTENT_BLOCK_TYPES`：`input_text` / `input_image` / `input_file` / `thinking` / …）：带这些 `type` 的是内容，必须走附件策略；不带的是一份普通数据，原样序列化。`test_plain_and_structural_outputs_survive_verbatim` 把这条守则的两侧都钉住了（字符串结果、普通 dict 结果、多段 `input_text`）。
+    - **第二个同源缺陷藏在 `extract_responses_content` 自己的 dict 分支里。** 它对单个 dict 的处理是「有 `type` 且是 text 家族 → 取 text；否则 `json.dumps`」——所以一个**单独的** `{"type":"input_image","image_url":"data:…"}` 仍然会被原样倒出去，与列表形状 `[…, {...}]` 得到两个不同答案。现在单个内容块被当作长度为 1 的内容数组，走同一条列表渲染，所以「一个块」和「一个块放进数组」不可能再分叉。
+    - **验证**：`tests/test_responses_tool_output_rendering.py`（3 例）。在 pristine `c042d1a` worktree（`git worktree add /tmp/rto_base HEAD`）上逐例验证：case 1 以 `工具结果里的 base64 附件被逐字写进了提示词…实测 20133 字符` 变红，case 2 以 `同一个工具结果由两条分支渲染成了两份不同的文本` 变红，case 3（零回归守则）**按设计为绿**——它守的是「不该改变的行为」，必须在修复前的树上也成立。全量 glob 扫描 `failures: 0 / 91`。
+    - **真实二进制验收**（这是本项目唯一能回答「智能体到底能不能用」的仪器）：`--rounds 2` 双臂全绿，且会话复用未被破坏：
+      ```
+      claude: PASS (exit=0, bodies=3, tool_ran=True, tool=Bash,         tool_markers=2/2, conversation_reused=True, effort=-,thinking=False)
+      codex:  PASS (exit=0, bodies=3, tool_ran=True, tool=exec_command, tool_markers=2/2, conversation_reused=True, effort=low,thinking=True)
+      ```

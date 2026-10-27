@@ -224,6 +224,53 @@ def responses_text_format(req: "ResponsesRequest") -> Optional[dict]:
     return None
 
 
+#: Responses 内容块的 `type` 词表——「这是一段内容」与「这是一份普通 JSON 数据」
+#: 的唯一分界线。工具的结构化结果（`{"stdout": …}`、`[1, 2, 3]`）不带这些标记，
+#: 必须原样序列化；`input_text` / `input_image` / `input_file` 是内容块，必须走
+#: 附件策略（见 providers/base.py 的说明）。
+_CONTENT_BLOCK_TYPES = frozenset({
+    "text", "input_text", "output_text",
+    "input_image", "image_url", "image",
+    "input_file", "file", "document",
+    "thinking", "summary_text", "reasoning_text",
+    "tool_result", "function_call_output", "tool_use", "function_call",
+})
+
+
+def _is_content_blocks(value: Any) -> bool:
+    """这份值是不是「内容块」（而非一段结构化数据）。"""
+    if isinstance(value, dict):
+        return value.get("type") in _CONTENT_BLOCK_TYPES
+    if isinstance(value, list):
+        return any(
+            isinstance(b, dict) and b.get("type") in _CONTENT_BLOCK_TYPES
+            for b in value
+        )
+    return False
+
+
+def render_tool_output(output: Any) -> str:
+    """[PROTOCOL] 工具执行结果的唯一渲染。
+
+    Responses 客户端回传结果有两种合法形状——`function_call_output` 的 `output`
+    字段，和 `message` + `role:"tool"` 的 `content`（§43 已确认二者指同一件事）。
+    两条历史都要落到这同一个函数上，否则同一份结果会有两份文本：实测同一份
+    结果走 `role:"tool"` 是 101 字符，走 `function_call_output` 是 **20133 字符**
+    （整个 base64 附件被 json.dumps 进了提示词，而这段历史在后续每一轮都会被
+    重新发送）。
+
+    结构化结果（`{"stdout": …}`、`[1, 2, 3]`）仍然原样序列化——它的字段就是结果
+    本身，模型要读的就是这些键。只有真正的**内容块**才走附件策略。
+    """
+    if isinstance(output, (dict, list)):
+        if _is_content_blocks(output):
+            return extract_responses_content(output)
+        return json.dumps(output, ensure_ascii=False)
+    if output is None:
+        return ""
+    return output if isinstance(output, str) else str(output)
+
+
 def extract_responses_content(content: Any) -> str:
     """从 Responses input content（字符串、列表或块结构）中提取文本内容。"""
     if content is None:
@@ -235,6 +282,11 @@ def extract_responses_content(content: Any) -> str:
         if b_type in ("text", "input_text", "output_text"):
             t = content.get("text")
             return t if isinstance(t, str) else ""
+        if b_type in _CONTENT_BLOCK_TYPES:
+            # 单个内容块就是长度为 1 的内容数组，走同一条渲染。否则
+            # `{"type": "input_image", …}` 会在这里被 json.dumps 成 base64 原文——
+            # 与列表形状处理成两个不同答案，正是本文件反复修正的缺陷形状。
+            return extract_responses_content([content])
         if "text" in content:
             return str(content["text"]) if content["text"] is not None else ""
         return json.dumps(content, ensure_ascii=False)
@@ -268,10 +320,7 @@ def extract_responses_content(content: Any) -> str:
                     parts.append(f"<thinking>\n{t}\n</thinking>")
             elif b_type in ("tool_result", "function_call_output"):
                 sub = block.get("output", "") or block.get("content", "")
-                if isinstance(sub, list):
-                    sub = extract_responses_content(sub)
-                elif isinstance(sub, dict):
-                    sub = json.dumps(sub, ensure_ascii=False)
+                sub = render_tool_output(sub)
                 c_id = block.get("call_id") or block.get("tool_use_id", "")
                 tag = f"[Tool Result for {c_id}]" if c_id else "[Tool Result]"
                 parts.append(f"{tag}:\n{sub or ''}")
@@ -566,16 +615,12 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
                 elif item_type in ("custom_tool_call_output", "local_shell_call_output"):
                     # freeform 调用的执行结果：`output` 同样可以是字符串或结构。
                     c_id = item.get("call_id", "")
-                    out = item.get("output", "")
-                    if isinstance(out, (dict, list)):
-                        out = json.dumps(out, ensure_ascii=False)
+                    out = render_tool_output(item.get("output", ""))
                     tag = f"[Tool Result for {c_id}]" if c_id else "[Tool Result]"
                     messages.append({"role": "user", "content": f"{tag}:\n{out}"})
                 elif item_type == "function_call_output":
                     c_id = item.get("call_id", "")
-                    out = item.get("output", "")
-                    if isinstance(out, (dict, list)):
-                        out = json.dumps(out, ensure_ascii=False)
+                    out = render_tool_output(item.get("output", ""))
                     tag = f"[Tool Result for {c_id}]" if c_id else "[Tool Result]"
                     messages.append({"role": "user", "content": f"{tag}:\n{out}"})
                 elif "role" in item:
