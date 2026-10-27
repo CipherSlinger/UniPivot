@@ -609,6 +609,16 @@ class ChatCompletionRequest(BaseModel):
     # 此前它只被 `extra="allow"` 收着、没有任何代码读过（§35 的「解析了然后没人用」）。
     reasoning_effort: Optional[str] = None
     search: bool = False
+    # [PROTOCOL] 候选数量。五个上游全是网页端聊天模型，**一次调用只产出一条回答**，
+    # 所以 `n>1` 的契约在本网关里可证明无法兑现。此前该字段连声明都没有，靠
+    # `extra="allow"` 收进 `model_extra` 后无人读取，全部 17 处 `choices` 发射点
+    # 硬编码 `index: 0`：实测 `n=3` -> 200 + 一个 choice，客户端按三个候选规划
+    # best-of-n 重排，拿到一个，没有任何地方能看出少了两个。
+    #
+    # 按 §73（`previous_response_id`）确立的纪律，可证明无法兑现的字段必须**拒绝**，
+    # 而不是补造——复制同一条回答三次是伪造采样，连发 n 次上游请求则把风控暴露面
+    # 乘 n（违反常设约束）。`n=1` 与不声明等价，因此不拒绝（零回归）。
+    n: Optional[int] = None
 
     @model_validator(mode="after")
     def _normalize_legacy_functions(self):
@@ -2553,6 +2563,32 @@ async def chat_completions(req: ChatCompletionRequest):
                 404, "model_not_found",
             ),
             status_code=404,
+        )
+
+    # [PROTOCOL] `n` 是**唯一一条网关无法兑现**的输出约束，必须拒绝而不是静默塌成 1。
+    #
+    # 实测（真实 ASGI 路径，脚本化 provider）：
+    #     n=3   -> 200, choices=1   （客户端按三候选规划重排）
+    #     n=0   -> 200, choices=1   （非法取值被当成默认值）
+    #     n=-1  -> 200, choices=1
+    #     stream=True, n=3 -> 200 + text/event-stream
+    # 五个上游一次调用只产出一条回答，所以「补造 n 个候选」只有两种做法：复制同一条
+    # 答案（伪造采样）或连发 n 次上游请求（风控暴露面乘 n，违反常设约束）。两者都是
+    # 造假，因此按 §73 的纪律拒绝，并给出 SDK 已具备恢复逻辑的
+    # `400 / invalid_request_error` + `param="n"`。
+    #
+    # 零上游（H4）：判断在这里，早于任何 provider 构造；流式请求同样在**状态行**上
+    # 拒绝，而不是先发 200 再在 SSE 里塞错误。`n=1` 与不声明逐值等价，不在此列。
+    if req.n is not None and req.n != 1:
+        return JSONResponse(
+            error_response(
+                f"`n={req.n}` 不受支持：本网关的上游一次调用只产生一条回答，"
+                "无法返回多个候选。请省略 `n`（或传 `n=1`）后自行重复请求。",
+                400,
+                "invalid_request_error",
+                param="n",
+            ),
+            status_code=400,
         )
 
     messages = [m.model_dump() for m in req.messages]
