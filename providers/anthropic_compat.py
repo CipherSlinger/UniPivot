@@ -201,7 +201,15 @@ def extract_anthropic_content(content: Union[str, List[Union[dict, str]], None])
                     sub = extract_anthropic_content(sub)
                 t_id = block.get("tool_use_id", "")
                 is_err = block.get("is_error", False)
-                tag = f"[Tool Error for {t_id}]" if is_err else f"[Tool Result for {t_id}]"
+                # 没有 id 时不能拼成 `[Tool Result for ]`——那是**残缺**而不是形状。
+                # 另两条回放路径（chat 的 `role:"tool"`、Responses 的
+                # `function_call_output`）在缺 id 时都降级成 `[Tool Result]`，
+                # 只有这里会把一个空 id 写进标记（实测 `'[Tool Result for ]:\na.py'`）。
+                # 同一个事实在三条路径上没有第三种读法。
+                if t_id:
+                    tag = f"[Tool Error for {t_id}]" if is_err else f"[Tool Result for {t_id}]"
+                else:
+                    tag = "[Tool Error]" if is_err else "[Tool Result]"
                 parts.append(f"{tag}:\n{sub or ''}")
             elif b_type == "tool_use":
                 name = block.get("name", "")
@@ -895,7 +903,28 @@ def format_tools_system_prompt(
         "3. Arguments MUST match the declared schema for that tool (`Args:` JSON above) — "
         "use the exact field names, types, nesting and enum values it declares.\n"
         + wait_rule +
-        "5. When you receive a `[Tool Result for <id>]` block, continue the task using that result.\n"
+        # [TOOL-LOOP] 契约就是模型唯一读得到的说明书，它必须点名**网关真正会写进
+        # 历史的每一种标记**，而不只是最常见的那一种。回放路径会写出三种形状：
+        # `[Tool Result for <id>]`（chat 带 id / anthropic 成功 / responses 带 id）、
+        # `[Tool Error for <id>]`（anthropic 的 `is_error`）、`[Tool Result] (name)`
+        # （chat 的 `role:"tool"` 缺 tool_call_id）。
+        #
+        # 只写第一种不是「少说了一句」：`is_error` 是**每一次失败的 Claude Code 工具
+        # 调用**的形状（非零退出码、被拒绝的 Edit、读不到的文件），而契约里唯一那句
+        # 「continue the task using that result」恰恰是拿失败当结果继续推理的动作。
+        # §38 已经为折叠标记定过这条纪律——标记是模型下一步推理的输入，把失败呈现成
+        # 成功，模型就从从未成立的结论继续往下走；而且「重发同一个调用」只会得到同一个
+        # 失败，等于把一个失败放大成两次。失败语义因此必须与成功语义分开说。
+        "5. Tool results are replayed to you as labelled blocks:\n"
+        "   - `[Tool Result for <id>]:` the call ran and succeeded; continue the task "
+        "using that result.\n"
+        "   - `[Tool Error for <id>]:` the call ran and FAILED; the text is the error it "
+        "produced. Do not repeat the identical call — it already ran and produced "
+        "exactly this. Diagnose it from the message and change the command, or report "
+        "the failure.\n"
+        "   - `[Tool Result] (tool name):` or `[Tool Error] (tool name):` a result whose "
+        "call id was not available; the tool name, when present, follows in parentheses, "
+        "and the success/failure reading is the same as above.\n"
         "6. Never invent tool names that are not listed above; the available tools are exactly those declared in this prompt.\n"
         "7. Do NOT refuse or claim you lack tools/permissions: the tools above are real and callable."
     )

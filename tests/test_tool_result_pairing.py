@@ -3,8 +3,11 @@
 三个协议各自把客户端回传的工具历史渲染成上游提示词。同一份契约——注入的工具段
 明确写着
 
-    5. When you receive a `[Tool Result for <id>]` block, continue the task
-       using that result.
+    5. Tool results are replayed to you as labelled blocks:
+       - `[Tool Result for <id>]:` the call ran and succeeded; …
+       - `[Tool Error for <id>]:` the call ran and FAILED; …
+
+（§103 之后契约点名了全部三种形状；本条只关心其中的**带 id 成功**那一种。）
 
 ——但只有两个协议兑现了它：
 
