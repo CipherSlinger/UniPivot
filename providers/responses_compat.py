@@ -224,6 +224,55 @@ def responses_text_format(req: "ResponsesRequest") -> Optional[dict]:
     return None
 
 
+#: `text.verbosity` 的词表。真实 Codex 0.145.0 每一轮都发 `"low"`（实测 2/2 条
+#: 请求，见 `tests/test_text_verbosity.py` 的模块说明）。OpenAI 的官方取值是这三档，
+#: 网关只翻译认识的值——不认识的取值当作没声明（失败开放），免得一个未来的取值
+#: 被凭空映射成一条错误的长度指令。
+_VERBOSITY_DIRECTIVES = {
+    "low": (
+        "## Output Verbosity\n"
+        "Be concise. Answer directly and stop. Do not restate the question, "
+        "do not summarise what you just said, and do not add offers of further help."
+    ),
+    "medium": (
+        "## Output Verbosity\n"
+        "Answer at moderate length: enough to be complete, without padding, "
+        "repetition, or unrequested background."
+    ),
+    "high": (
+        "## Output Verbosity\n"
+        "Be thorough. Explain your reasoning and include the detail needed to "
+        "verify the answer. Still do not repeat yourself or restate the question."
+    ),
+}
+
+
+def responses_text_verbosity(req: "ResponsesRequest") -> str:
+    """把 Responses 的 `text.verbosity` 翻译成一条上游能看懂的答复长度约束。
+
+    [PROTOCOL] `text` 是一个字典，里面有两个互相独立的键：`format`（输出**形状**）
+    和 `verbosity`（输出**长度**）。此前 `responses_text_format` 只读 `format`，
+    于是同一份字典里一个键被读、另一个被丢——`grep -rn verbosity` 在整个源里零命中。
+
+    五个上游都是网页端聊天模型，默认风格是「先总结、再展开、最后再来一段客套」，
+    正是 `"low"` 想压掉的东西。Codex 每一轮都按 `low` 规划上下文预算，声明被丢掉
+    就意味着每一轮都多付 token，而且没有任何错误可看（HTTP 200，内容正常）。
+
+    这不违反「不制造能力」：`verbosity` 本来就是一条**提示词级**指令，与已经生效
+    的 `response_format` / `thinking` 完全同类；会违反的是把它翻译成上游根本没有的
+    采样参数。
+
+    `verbosity` 只存在于 Responses 协议上，另外两个协议没有这个字段，所以本函数
+    只被 `convert_responses_to_gateway_messages` 调用。
+    """
+    if not isinstance(req.text, dict):
+        return ""
+    value = req.text.get("verbosity")
+    if not isinstance(value, str):
+        return ""
+    return _VERBOSITY_DIRECTIVES.get(value.strip().lower(), "")
+
+
 #: Responses 内容块的 `type` 词表——「这是一段内容」与「这是一份普通 JSON 数据」
 #: 的唯一分界线。工具的结构化结果（`{"stdout": …}`、`[1, 2, 3]`）不带这些标记，
 #: 必须原样序列化；`input_text` / `input_image` / `input_file` 是内容块，必须走
@@ -474,6 +523,12 @@ def convert_responses_to_gateway_messages(req: ResponsesRequest) -> List[dict]:
     fmt_prompt = format_response_format_prompt(responses_text_format(req))
     if fmt_prompt:
         system_parts.append(fmt_prompt)
+    # [PROTOCOL] `text.verbosity` 是同一个 `text` 字典里的兄弟键（输出**长度**，
+    # 与 `format` 的输出**形状**并列）。真实 Codex 每条请求都发 `"low"`；此前
+    # 只有 `format` 被读，`verbosity` 连一次注入的机会都没有。
+    verbosity_prompt = responses_text_verbosity(req)
+    if verbosity_prompt:
+        system_parts.append(verbosity_prompt)
 
     messages: list[dict] = []
     if system_parts:
