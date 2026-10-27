@@ -89,6 +89,9 @@ from providers import (
     resolve_responses_session_id,
     resolve_allowed_tools,
     StopSequenceScanner,
+    # [PROTOCOL] 输出 token 上界的网关侧执行（见 providers/stop_sequences.py）
+    TokenBudget,
+    apply_token_budget,
     truncate_final,
     SpeculativeToolStreamer,
     sse_content_block_delta,
@@ -1173,6 +1176,40 @@ def _make_disconnect_headers() -> dict[str, str]:
     return {
         "x-disconnect-guard": "disabled" if disconnect_guard.is_disabled() else "enabled",
     }
+
+
+def _declared_token_budget(req) -> Optional[int]:
+    """客户端**显式声明**的输出 token 上界；未声明返回 `None`（永不截断）。
+
+    判据必须是 `model_fields_set`，而不是字段值。Anthropic 的 `max_tokens` 有
+    4096 的默认值，所以 `req.max_tokens` 无法区分「客户端没写」和「客户端写了
+    4096」——而这两种情况的正确行为相反：前者一个字都不许动，后者必须真的把
+    输出限制在 4096。执行一个隐式默认值，等于截断一个从来没有人限定过的回答。
+    """
+    fields = getattr(req, "model_fields_set", None) or set()
+    for name in ("max_output_tokens", "max_tokens"):
+        if name in fields:
+            value = getattr(req, name, None)
+            return value if isinstance(value, int) and value > 0 else None
+    return None
+
+
+def _output_end_cause(stop_matched: Optional[str], budget: "TokenBudget") -> Optional[str]:
+    """这段输出为什么结束：客户端停用词 → 客户端 token 上界 → 自然结束（`None`）。
+
+    [PROTOCOL] 优先级只有一份定义，三个协议各自把它翻译成自己的词汇
+    （OpenAI `length` / Anthropic `max_tokens` / Responses `incomplete_details.reason`
+    = `max_output_tokens`）。停用词优先于预算，理由是可观察性：客户端拿到的正文
+    停在它自己声明的那串字符上，那么「为什么停在这里」的答案就是那串字符；
+    只有在正文是被预算从中间切掉时，说 `max_tokens` 才是真话。
+
+    三个协议的终止枚举互不相同（§35），所以映射留在各自的调用点，判据留在这里。
+    """
+    if stop_matched:
+        return "stop"
+    if budget is not None and budget.hit:
+        return "length"
+    return None
 
 
 def _stream_reclaimer(stream) -> Optional[Callable[[], None]]:
@@ -2623,6 +2660,9 @@ async def chat_completions(req: ChatCompletionRequest):
 
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_tokens if req.max_tokens is not None else 2048
+    # [PROTOCOL] 客户端声明的输出上界在网关侧执行（见 providers/stop_sequences.py）。
+    # 上面那个 2048 只是喂给上游的提示，**不是**客户端的契约：没有声明就不截断。
+    token_budget = TokenBudget(_declared_token_budget(req))
 
     # 0. 自适应提示词折叠优化：在估算 tokens 与路由调度前折叠超长历史轮次
     messages, fold_meta = prompt_optimizer.optimize_chat_messages(messages)
@@ -2710,7 +2750,11 @@ async def chat_completions(req: ChatCompletionRequest):
                 "parallel_tool_calls": req.parallel_tool_calls,
                 "stop": req.stop,
                 "response_format": req.response_format,
-                "max_tokens": req.max_tokens,
+                # [PROTOCOL] 上界必须用**显式声明**的判据（`_declared_token_budget`），
+                # 而不是字段值：Anthropic 的 `max_tokens` 有 4096 默认值，「省略」与
+                # 「写了 4096」在这一处行为相反（一个不截断、一个截断），用字段值
+                # 会让这两条请求指纹相同而正确答案不同（§53 的判据）。
+                "max_tokens": _declared_token_budget(req),
             },
             # [SINGLEFLIGHT] `search` 会进四个 provider 的上游请求体
             # （qwen `deep_search` / deepseek `search_enabled` / glm
@@ -2814,6 +2858,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 try:
                     # [H4] 流已在返回响应之前打开（见 preopened_stream），这里只接管。
                     stream = preopened_stream
+                    budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行（原始流仍由回收路径关闭，见 §47）
                     failover_event = preopened_event
                     active_provider = preopened_provider
 
@@ -2836,7 +2881,7 @@ async def chat_completions(req: ChatCompletionRequest):
                     # 交付（思考流不受影响，它不是 content）。
                     json_mode = response_format_mode(req.response_format)
 
-                    async for delta, meta in stream:
+                    async for delta, meta in budgeted_stream:
                         if not ttft_recorded and delta:
                             load_balancer.record_ttft(
                                 dispatched_provider, (time.time() - start_time) * 1000.0
@@ -2930,7 +2975,10 @@ async def chat_completions(req: ChatCompletionRequest):
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        # [PROTOCOL] 被客户端预算截断时如实报告 `length`：`stop` 说
+                        # 「模型说完了」，而真实情况是客户端自己划的那条线到了。
+                        "choices": [{"index": 0, "delta": {},
+                                     "finish_reason": "length" if _output_end_cause(stop_scan.hit, token_budget) == "length" else "stop"}],
                     }
                     if conversation_id:
                         final["conversation_id"] = conversation_id
@@ -2995,6 +3043,7 @@ async def chat_completions(req: ChatCompletionRequest):
             try:
                 # [H4] 同上：流已在返回响应之前打开。
                 stream = preopened_stream
+                budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行（原始流仍由回收路径关闭，见 §47）
                 failover_event = preopened_event
                 active_provider = preopened_provider
 
@@ -3008,7 +3057,7 @@ async def chat_completions(req: ChatCompletionRequest):
                 # [PROTOCOL] 结构化输出：正文不逐字下发，结尾一次判定（同无 tools 分支）
                 json_mode = response_format_mode(req.response_format)
 
-                async for delta, meta in stream:
+                async for delta, meta in budgeted_stream:
                     if not ttft_recorded and delta:
                         load_balancer.record_ttft(
                             dispatched_provider, (time.time() - start_time) * 1000.0
@@ -3207,7 +3256,9 @@ async def chat_completions(req: ChatCompletionRequest):
                         "object": "chat.completion.chunk",
                         "created": created,
                         "model": req.model,
-                        "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}],
+                        # [PROTOCOL] 预算截断（见无 tools 分支同处注释）
+                        "choices": [{"index": 0, "delta": {},
+                                     "finish_reason": "length" if _output_end_cause(stop_scan.hit, token_budget) == "length" else "stop"}],
                     })
 
                 if req.stream_options and req.stream_options.get("include_usage"):
@@ -3323,7 +3374,8 @@ async def chat_completions(req: ChatCompletionRequest):
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
-        async for delta, meta in stream:
+        budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行
+        async for delta, meta in budgeted_stream:
             if not ttft_recorded and delta:
                 load_balancer.record_ttft(
                     dispatched_provider, (time.time() - start_time) * 1000.0
@@ -3493,7 +3545,9 @@ async def chat_completions(req: ChatCompletionRequest):
         req.model, full_output, prompt, conversation_id, thinking_content=full_reasoning,
         # [PROTOCOL] OpenAI 的 finish_reason 枚举里没有 stop_sequence（那是 Anthropic 的），
         # 停用词命中与自然结束在 OpenAI 语义下**都是** "stop"，不能自造枚举值。
-        finish_reason="stop",
+        # 但客户端声明的 token 上界有它自己的值 `length`：说 "stop" 等于宣称模型
+        # 说完了，而真实情况是客户端划的那条线到了。
+        finish_reason="length" if _output_end_cause(_stop_matched, token_budget) == "length" else "stop",
     )
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
@@ -3545,6 +3599,9 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     input_tokens = _est_tokens(input_text)
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_tokens or 4096
+    # [PROTOCOL] `max_tokens` 在这里是**必填**字段，所以每一次 Claude Code 请求都带着它；
+    # 网关侧必须真的执行，且只在客户端写过这个键时执行（见 _declared_token_budget）。
+    token_budget = TokenBudget(_declared_token_budget(req))
 
     # 判定 thinking 意图
     enable_thinking = _wants_thinking(req.thinking)
@@ -3610,7 +3667,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             constraints={
                 "tool_choice": req.tool_choice,
                 "stop_sequences": req.stop_sequences,
-                "max_tokens": req.max_tokens,
+                # [PROTOCOL] 同 chat 侧：判据是「客户端真的写过这个键」，不是字段值。
+                "max_tokens": _declared_token_budget(req),
             },
             # [SINGLEFLIGHT] 会话身份决定前文在上游还是在本轮提示词里（见 chat 同处注释）。
             session_key=client_session_id,
@@ -3689,6 +3747,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 if not req.tools:
                     # [H4] 流已在返回响应之前打开（见 preopened_stream），这里只接管。
                     stream = preopened_stream
+                    budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行（原始流仍由回收路径关闭，见 §47）
                     failover_event = preopened_event
                     active_provider = preopened_provider
 
@@ -3701,7 +3760,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     # [PROTOCOL] 停用词只作用于正文，思考流不受影响
                     stop_scan = StopSequenceScanner(stop_seq)
 
-                    async for delta, _meta in stream:
+                    async for delta, _meta in budgeted_stream:
                         if not ttft_recorded and delta:
                             load_balancer.record_ttft(
                                 dispatched_provider, (time.time() - start_time) * 1000.0
@@ -3797,8 +3856,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     output_tokens = max(
                         1, _est_tokens("".join(accumulated_chunks) + "".join(accumulated_thinking))
                     )
+                    # [PROTOCOL] 终止原因由 `_output_end_cause` 统一判定（停用词 →
+                    # 客户端 token 上界 → 自然结束），这里只翻译成 Anthropic 的枚举。
+                    # `max_tokens` 是 Anthropic 自己的值：客户端划的那条线到了，
+                    # 说 `end_turn` 等于宣称模型说完了。
                     yield sse_message_delta(
-                        "stop_sequence" if stop_scan.hit else "end_turn",
+                        {"stop": "stop_sequence", "length": "max_tokens"}.get(
+                            _output_end_cause(stop_scan.hit, token_budget), "end_turn"
+                        ),
                         output_tokens,
                         stop_sequence=stop_scan.hit.matched if stop_scan.hit else None,
                     )
@@ -3825,6 +3890,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 # 2. Agent / 工具模式：推测式流式分发与容错解析
                 # [H4] 同上：流已在返回响应之前打开。
                 stream = preopened_stream
+                budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行（原始流仍由回收路径关闭，见 §47）
                 failover_event = preopened_event
                 active_provider = preopened_provider
 
@@ -3840,7 +3906,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 in_thinking_block = False
                 in_text_block = False
 
-                async for delta, _meta in stream:
+                async for delta, _meta in budgeted_stream:
                     if not ttft_recorded and delta:
                         load_balancer.record_ttft(
                             dispatched_provider, (time.time() - start_time) * 1000.0
@@ -3976,9 +4042,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         yield sse_content_block_start(0, {"type": "text", "text": ""})
                         yield sse_content_block_stop(0)
                     # [PROTOCOL] Anthropic 有真正的 stop_sequence 终止原因，如实报告；
-                    # OpenAI 没有这个枚举值，那边只能是 "stop"。
+                    # OpenAI 没有这个枚举值，那边只能是 "stop"。判据同无 tools 分支。
                     yield sse_message_delta(
-                        "stop_sequence" if hit_stop else "end_turn",
+                        {"stop": "stop_sequence", "length": "max_tokens"}.get(
+                            _output_end_cause(hit_stop, token_budget), "end_turn"
+                        ),
                         output_tokens,
                         stop_sequence=hit_stop.matched if hit_stop else None,
                     )
@@ -4082,7 +4150,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             provider_factory=lambda pkey: _make_provider(pkey),
             chat_args=chat_args,
         )
-        async for delta, _meta in stream:
+        budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行
+        async for delta, _meta in budgeted_stream:
             if not ttft_recorded and delta:
                 load_balancer.record_ttft(
                     dispatched_provider, (time.time() - start_time) * 1000.0
@@ -4250,8 +4319,11 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         content=blocks,
         input_tokens=input_tokens,
         output_tokens=output_tokens,
-        # [PROTOCOL] Anthropic 的枚举里有 stop_sequence，如实报告截断原因
-        stop_reason="stop_sequence" if _stop_matched else "end_turn",
+        # [PROTOCOL] Anthropic 的枚举里有 stop_sequence，如实报告截断原因；
+        # `max_tokens` 同理（客户端声明的 token 上界是它自己的终止条件）。
+        stop_reason={"stop": "stop_sequence", "length": "max_tokens"}.get(
+            _output_end_cause(_stop_matched, token_budget), "end_turn"
+        ),
         conversation_id=client_session_id or conv_id,
         stop_sequence=_stop_matched or None,
     )
@@ -4370,6 +4442,7 @@ async def responses_endpoint(req: ResponsesRequest):
     input_tokens = _est_tokens(input_text)
     temperature = req.temperature if req.temperature is not None else 0.7
     max_tokens = req.max_output_tokens or req.max_tokens or 4096
+    token_budget = TokenBudget(_declared_token_budget(req))
 
     # 判定 thinking 意图
     #
@@ -4455,7 +4528,8 @@ async def responses_endpoint(req: ResponsesRequest):
                 "parallel_tool_calls": req.parallel_tool_calls,
                 "stop": getattr(req, "stop", None),
                 "text": req.text,
-                "max_output_tokens": req.max_output_tokens,
+                # [PROTOCOL] 同 chat 侧：判据是「客户端真的写过这个键」，不是字段值。
+                "max_output_tokens": _declared_token_budget(req),
             },
             # [SINGLEFLIGHT] 会话身份决定前文在上游还是在本轮提示词里（见 chat 同处注释）。
             session_key=client_session_id,
@@ -4535,6 +4609,7 @@ async def responses_endpoint(req: ResponsesRequest):
         )
         # 配额所有权移交下游流式/聚合分支，由其负责释放
         lb_handed_off = True
+        budgeted_stream = apply_token_budget(stream, token_budget)  # [PROTOCOL] 输出 token 上界在网关侧执行
     except ProviderError as e:
         is_risk, _ = is_risk_interception(e)
         if is_risk:
@@ -4661,7 +4736,7 @@ async def responses_endpoint(req: ResponsesRequest):
                     text_item_id = _id("msg", "_")
                     out_idx += 1
 
-                async for delta, _meta in stream:
+                async for delta, _meta in budgeted_stream:
                     if not ttft_recorded and delta:
                         load_balancer.record_ttft(
                             dispatched_provider, (time.time() - start_time) * 1000.0
@@ -4842,8 +4917,12 @@ async def responses_endpoint(req: ResponsesRequest):
                     reasoning_tokens=reasoning_tokens,
                     failover=failover_event.to_dict() if failover_event else None,
                     conversation_id=client_session_id or conv_id,
-                    # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete
-                    incomplete_reason="stop" if stop_scan.hit else None,
+                    # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete；客户端的
+                    # 输出 token 上界同理（Responses 的枚举值是 `max_output_tokens`）。
+                    incomplete_reason={
+                        "stop": "stop",
+                        "length": "max_output_tokens",
+                    }.get(_output_end_cause(stop_scan.hit, token_budget)),
                 )
                 yield sse_done()
 
@@ -4909,7 +4988,7 @@ async def responses_endpoint(req: ResponsesRequest):
     thinking_start_time: Optional[float] = None
     thinking_end_time: Optional[float] = None
     try:
-        async for delta, meta in stream:
+        async for delta, meta in budgeted_stream:
             if not ttft_recorded and delta:
                 load_balancer.record_ttft(
                     dispatched_provider, (time.time() - start_time) * 1000.0
@@ -5056,10 +5135,15 @@ async def responses_endpoint(req: ResponsesRequest):
         # [TOOL-LOOP] namespace 子工具的调用项必须带回 namespace（同流式路径）
         tool_namespaces=namespace_of_tools(req.tools),
     )
-    # [PROTOCOL] 被客户端 stop 截断时如实标明 incomplete（与流式路径同一语义）
-    if _stop_matched:
+    # [PROTOCOL] 被客户端 stop 或客户端声明的 token 上界截断时如实标明 incomplete
+    # （与流式路径同一语义、同一判据）。
+    _incomplete_reason = {
+        "stop": "stop",
+        "length": "max_output_tokens",
+    }.get(_output_end_cause(_stop_matched, token_budget))
+    if _incomplete_reason:
         resp_data["status"] = "incomplete"
-        resp_data["incomplete_details"] = {"reason": "stop"}
+        resp_data["incomplete_details"] = {"reason": _incomplete_reason}
     if failover_event:
         resp_data["failover"] = failover_event.to_dict()
     if flight_decision and flight_decision.is_leader:

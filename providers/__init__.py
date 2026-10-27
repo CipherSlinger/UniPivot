@@ -144,7 +144,9 @@ from .risk_ledger import (
 )
 from .stop_sequences import (
     StopSequenceScanner,
+    TokenBudget,
     all_stops,
+    apply_token_budget,
     normalize_stop,
     truncate_final,
 )
@@ -283,6 +285,8 @@ __all__ = [
     "cap_parallel_tool_calls",
     "recover_tools_from_reasoning",
     "StopSequenceScanner",
+    "TokenBudget",
+    "apply_token_budget",
     "all_stops",
     "normalize_stop",
     "truncate_final",

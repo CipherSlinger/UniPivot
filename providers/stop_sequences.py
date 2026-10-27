@@ -19,9 +19,9 @@ OpenAI 的 `stop`（字符串或列表）与 Anthropic 的 `stop_sequences` 都�
 
 from __future__ import annotations
 
-from typing import Any, List, Optional, Tuple
+from typing import Any, AsyncIterator, List, Optional, Tuple
 
-from .base import StopSequenceHit
+from .base import StopSequenceHit, _est_tokens
 
 
 def normalize_stop(stop: Any) -> Optional[str]:
@@ -147,3 +147,98 @@ def truncate_final(text: str, stop: Any) -> Tuple[str, Optional[str]]:
     if best_idx == -1:
         return text, None
     return text[:best_idx], best
+
+
+# --------------------------------------------------------------- 输出 token 上界
+
+
+def _largest_prefix_within(text: str, limit: int) -> int:
+    """返回最长的 n，使 `_est_tokens(text[:n]) <= limit`。
+
+    `_est_tokens` 对前缀是单调不减的（它只是把字符分成 CJK 与其它两类再相加），
+    所以二分成立。`_est_tokens("")` 返回 1，因此 n=0 在 `limit >= 1` 时总是合法，
+    二分不会落在无效区间上。
+    """
+    lo, hi = 0, len(text)
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if _est_tokens(text[:mid]) <= limit:
+            lo = mid
+        else:
+            hi = mid - 1
+    return lo
+
+
+class TokenBudget:
+    """客户端声明的输出 token 上界（`max_tokens` / `max_output_tokens`）。
+
+    与停用词同源：两者都是**客户端划定的输出终点**，都必须在网关侧执行，因为
+    提示词只能降低概率、不能兑现契约，而这五个上游数不清 token。区别在于停用词
+    命中是一个字符串，token 上界是一个数——所以它需要按估算值反推截断点。
+
+    只在 `limit` 显式给出时生效。Anthropic 的 `max_tokens` 有 4096 默认值，
+    「没声明」与「声明了 4096」在字段值上无法区分，判据必须由调用方用
+    `model_fields_set` 提供；执行一个隐式默认值等于截断一个从来没人限定过的回答。
+
+    只统计**可见正文**：思考通道不进预算（它不占客户端的输出配额，而且第 58 节
+    的规则要求思考仍然参与 `output_tokens` 统计与工具救援）。
+    """
+
+    def __init__(self, limit: Optional[int]) -> None:
+        # 非正数视为未声明：客户端不会用 0 表达「别说话」，而 0 会让二分退化。
+        self.limit = limit if isinstance(limit, int) and limit > 0 else None
+        self._text = ""
+        self.hit = False
+
+    @property
+    def active(self) -> bool:
+        return self.limit is not None
+
+    @property
+    def text(self) -> str:
+        """已经被放行的可见正文（截断之后不再增长）。"""
+        return self._text
+
+    def feed(self, delta: str) -> str:
+        """喂入一块可见正文，返回真正可以继续下发的部分。"""
+        if not self.active or not delta:
+            return delta
+        if self.hit:
+            return ""
+        candidate = self._text + delta
+        if _est_tokens(candidate) <= self.limit:
+            self._text = candidate
+            return delta
+        before = len(self._text)
+        cut = _largest_prefix_within(candidate, self.limit)
+        self._text = candidate[:cut]
+        self.hit = True
+        return candidate[before:cut]
+
+
+async def apply_token_budget(stream: AsyncIterator, budget: TokenBudget) -> AsyncIterator:
+    """把上游流包一层：只放行预算之内的可见正文，其余原样透传。
+
+    三条义务，每一条漏掉都会造成一个不同的、无声的故障：
+
+    1. **元数据帧原样放行**（`delta == ""` 且带 `{"conversation_id": …}`）。
+       五家上游的会话 id 都在尾帧里，吞掉它等于让 affinity 与匿名会话回收全部失效。
+    2. **思考通道不受预算约束**（`meta["reasoning"]`）。思考不占客户端的输出配额；
+       把它计进预算会让一个正常的长思考被误判成超限，而第 58 节的工具救援与
+       `output_tokens` 统计都依赖思考仍然完整到达。
+    3. **截断之后继续把上游抽干**。上游流的 `finally` 里是并发信号量与连接的归还，
+       提前 `break` 会把它们留在原地；而且客户端需要的尾帧（会话 id）还没到。
+       所以 `hit` 之后仍然逐帧拉取，只是不再下发任何内容。
+    """
+    async for delta, meta in stream:
+        if meta and meta.get("reasoning"):
+            yield delta, meta
+            continue
+        if not delta:
+            yield delta, meta
+            continue
+        kept = budget.feed(delta)
+        if kept:
+            yield kept, meta
+        # kept 为空时这一帧被整块丢弃——但循环继续，见义务 3。
+
