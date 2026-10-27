@@ -219,6 +219,20 @@ def _make_lb_headers(decision: BalancingDecision) -> dict[str, str]:
     return headers
 
 
+def _restate_dispatch_target(headers: dict[str, str], provider_key: str, wire_model: str) -> None:
+    """把 `x-dispatched-*` 改写成**真实派发**的目标。
+
+    [MODEL-LINE] `_make_lb_headers` 只描述负载均衡自己的选择，而它之后还有一处
+    可以改写去向：会话粘滞（`resolve_affinity` 的绑定 / 降级 / 迁移）。不重述，
+    响应头会宣告一个 provider 从未收到的模型——实测声明 `claude-3-7-sonnet`
+    （→ `Qwen3.7-Max`）的请求被绑定到上一轮的会话时，头写 `Qwen3.7-Max`、线路
+    收到 `Qwen3.6-Flash`。粘滞之后的目标才是派发边界真正交给 provider 的那一个；
+    派发之后的故障转移由 `x-failover-*` 单独报告，不在这里冒充。
+    """
+    headers["x-dispatched-provider"] = provider_key
+    headers["x-dispatched-model"] = wire_model
+
+
 def _make_risk_headers(
     delay_ms: Optional[float], provider_key: str, primary_provider: Optional[str] = None
 ) -> dict[str, str]:
@@ -2696,7 +2710,9 @@ async def chat_completions(req: ChatCompletionRequest):
     tool_contract = tool_contract_key(req.tools)
     prompt_text = (
         continuation_content(messages)
-        if session_affinity_manager.has_upstream_session(req.conversation_id, tool_contract)
+        if session_affinity_manager.has_upstream_session(
+            req.conversation_id, tool_contract, requested_model=wire_model
+        )
         else flatten_messages(messages)
     )
     prompt_tokens = _est_tokens(prompt_text)
@@ -2727,10 +2743,14 @@ async def chat_completions(req: ChatCompletionRequest):
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
+        requested_model=wire_model,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
     dispatched_model = affinity_decision.wire_model
+    # 粘滞解析也能改写去向（绑定 / 降级 / 迁移），响应头必须跟着改述，
+    # 否则它宣告的是负载均衡的候选而不是 provider 真正收到的模型。
+    _restate_dispatch_target(lb_headers, dispatched_provider, dispatched_model)
 
     chat_args = {
         "messages": messages,
@@ -3038,6 +3058,7 @@ async def chat_completions(req: ChatCompletionRequest):
                             dispatched_model,
                             _conv,
                             tool_contract=affinity_decision.tool_contract,
+                            requested_model=affinity_decision.requested_model,
                         )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3317,6 +3338,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         dispatched_model,
                         _conv,
                         tool_contract=affinity_decision.tool_contract,
+                        requested_model=affinity_decision.requested_model,
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3465,6 +3487,7 @@ async def chat_completions(req: ChatCompletionRequest):
             dispatched_model,
             _conv,
             tool_contract=affinity_decision.tool_contract,
+            requested_model=affinity_decision.requested_model,
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3660,10 +3683,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
+        requested_model=wire_model,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
     dispatched_model = affinity_decision.wire_model
+    # 粘滞解析也能改写去向（绑定 / 降级 / 迁移），响应头必须跟着改述，
+    # 否则它宣告的是负载均衡的候选而不是 provider 真正收到的模型。
+    _restate_dispatch_target(lb_headers, dispatched_provider, dispatched_model)
 
     chat_args = {
         "messages": gateway_messages,
@@ -3915,6 +3942,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             dispatched_model,
                             _up,
                             tool_contract=affinity_decision.tool_contract,
+                            requested_model=affinity_decision.requested_model,
                         )
 
                     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4101,6 +4129,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         dispatched_model,
                         _up,
                         tool_contract=affinity_decision.tool_contract,
+                        requested_model=affinity_decision.requested_model,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4255,6 +4284,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             dispatched_model,
             _up,
             tool_contract=affinity_decision.tool_contract,
+            requested_model=affinity_decision.requested_model,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4535,10 +4565,14 @@ async def responses_endpoint(req: ResponsesRequest):
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
         tool_contract=tool_contract,
+        requested_model=wire_model,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
     dispatched_model = affinity_decision.wire_model
+    # 粘滞解析也能改写去向（绑定 / 降级 / 迁移），响应头必须跟着改述，
+    # 否则它宣告的是负载均衡的候选而不是 provider 真正收到的模型。
+    _restate_dispatch_target(lb_headers, dispatched_provider, dispatched_model)
 
     chat_args = {
         "messages": gateway_messages,
@@ -4988,6 +5022,7 @@ async def responses_endpoint(req: ResponsesRequest):
                         dispatched_model,
                         _up,
                         tool_contract=affinity_decision.tool_contract,
+                        requested_model=affinity_decision.requested_model,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -5095,6 +5130,7 @@ async def responses_endpoint(req: ResponsesRequest):
             dispatched_model,
             _up,
             tool_contract=affinity_decision.tool_contract,
+            requested_model=affinity_decision.requested_model,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):

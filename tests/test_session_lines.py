@@ -31,6 +31,32 @@ the tool contract the request declares. A conversation opened under 47 declared
 tools is not continued by a request declaring none; the two lines are separate
 entries, each reusing its own upstream conversation. Adding a discriminator can
 only split conversations, never merge two that should have stayed apart.
+
+## [MODEL-LINE] The second discriminator: which model this line is speaking to
+
+The same argument applies to the model, and there the failure is worse than a
+split conversation — it is a *silently ignored instruction*. `resolve_affinity`'s
+bound branch returns `entry.model_name` and `server.py` assigns
+`dispatched_model = affinity_decision.wire_model`, so a client that names a
+different model on a bound session is dispatched to the **old** one. Measured
+(same session id, same tool set, Anthropic path):
+
+    turn 1  claude-3-5-haiku-20241022  affinity=fresh  wire model Qwen3.6-Flash  conv=None
+    turn 2  claude-3-7-sonnet          affinity=bound  wire model Qwen3.6-Flash  conv='up1'
+
+`resolve_model` resolves turn 2 to `Qwen3.7-Max`; the provider received
+`Qwen3.6-Flash`. No error, no telemetry naming the substitution — the client's
+`/model` switch simply did not happen. The mirror image is a background
+small-model request (Claude Code sends these under the *same*
+`metadata.user_id.session_id`) landing on the parent's line and then being served
+with the parent's model, or worse, dragging the parent's next turn onto the small
+model.
+
+The line identity therefore carries the model too — the **resolved wire model
+before load balancing** (`wire_model`), not the client's raw string and not the
+post-LB model. Two aliases that resolve to the same wire model produce
+interchangeable answers and stay on one line; a load-balancer downgrade is
+transient and must never split a conversation (§M3's rationale, one layer over).
 """
 
 from __future__ import annotations
@@ -257,10 +283,101 @@ def test_a_session_with_a_stable_tool_set_still_continues():
     )
 
 
+# ── [MODEL-LINE] the model is part of the line identity ─────────────────────────
+def _parent_body_with_model(turn: int, model: str) -> dict:
+    body = _parent_body(turn)
+    body["model"] = model
+    return body
+
+
+def test_a_mid_session_model_change_is_dispatched_to_the_requested_model():
+    """**靶点**：绑定会话里换模型，网关必须把请求交给**新声明的**模型。
+
+    修复前实测：第二轮声明 `claude-3-7-sonnet`（`resolve_model` 解析为
+    `Qwen3.7-Max`），上游实际收到 `Qwen3.6-Flash`（第一轮的模型）——`/model`
+    切换静默失效，没有任何错误，遥测里也只有 `x-session-affinity: bound`。
+    对 agent 客户端这是「我换了模型，它还是老样子，而且变笨/变贵了」。
+    """
+    _reset()
+    _post(_parent_body_with_model(1, "claude-3-5-haiku-20241022"))
+    _, turn2 = _post(_parent_body_with_model(2, "claude-3-7-sonnet"))
+    assert turn2["model"] == "Qwen3.7-Max", (
+        "会话中途换模型被静默忽略了：客户端声明 claude-3-7-sonnet（→ "
+        f"Qwen3.7-Max），上游实际收到 {turn2['model']!r}"
+    )
+
+
+def test_a_model_change_starts_a_new_line_with_the_full_history():
+    """换模型的那一轮必须新开对话线并展平历史——不能把新模型塞进旧模型建立的
+    上游会话（对方既不认识这段会话的模型，也无法保证上下文被正确解释）。"""
+    _reset()
+    _, turn1 = _post(_parent_body_with_model(1, "claude-3-7-sonnet"))
+    _, turn2 = _post(_parent_body_with_model(2, "claude-3-5-haiku-20241022"))
+    assert turn2["conv"] is None, (
+        f"换模型后仍续用旧模型的上游会话 {turn2['conv']!r}（第一轮为 {turn1['served']!r}）"
+    )
+    assert "Use the Agent tool to reply PONG" in turn2["prompt"], (
+        "新线没有展平全量历史，新模型看不到前一轮的提问——它只收到一份增量: "
+        f"{turn2['prompt'][:300]!r}"
+    )
+
+
+def test_a_background_small_model_request_does_not_hijack_the_parent_line():
+    """Claude Code 的后台请求（标题、配额、自动模式分类）用**同一个会话 id**
+    但用小的快模型。它既不能并进父会话的上游对话，也不能把父会话下一轮拖到
+    小模型上。实测（修复前）：三轮的 wire conv 全是 'up1'，父会话第三轮被
+    bind 在后台请求建立的模型上。"""
+    _reset()
+    _, parent1 = _post(_parent_body_with_model(1, "claude-3-7-sonnet"))
+    _, background = _post(_parent_body_with_model(2, "claude-3-5-haiku-20241022"))
+    _, parent3 = _post(_parent_body_with_model(2, "claude-3-7-sonnet"))
+    assert background["conv"] is None, (
+        f"后台快模型请求并进了父会话的上游对话（{background['conv']!r}）"
+    )
+    assert background["model"] == "Qwen3.6-Flash", background["model"]
+    assert parent3["conv"] == parent1["served"], (
+        f"父会话在后台请求之后没有回到自己的上游对话: 期望 {parent1['served']!r}，"
+        f"实际 {parent3['conv']!r}"
+    )
+    assert parent3["model"] == "Qwen3.7-Max", parent3["model"]
+
+
+def test_two_aliases_resolving_to_one_wire_model_share_one_line():
+    """Zero-regression guard (§59/§69: green on the pre-fix tree by design, recorded
+    as a guard). The key is the **resolved** wire model, not the client's raw string:
+    `claude-3-7-sonnet` and `claude-3-opus` both resolve to `Qwen3.7-Max`, their
+    answers are interchangeable, and they must not split a conversation. Keying the
+    raw alias would make the identity key so specific that ordinary sessions stop
+    continuing — the worse regression (§53)."""
+    _reset()
+    _, t1 = _post(_parent_body_with_model(1, "claude-3-7-sonnet"))
+    _, t2 = _post(_parent_body_with_model(2, "claude-3-opus"))
+    assert t2["conv"] == t1["served"], (
+        f"两个解析到同一个上游模型的别名被拆成了两条线: {t1['served']!r} -> {t2['conv']!r}"
+    )
+    assert t2["model"] == "Qwen3.7-Max", t2["model"]
+
+
+def test_the_dispatched_model_header_names_the_model_the_provider_received():
+    """`x-dispatched-model` 是「这次真正派给了谁」的唯一可观测出口，而它在粘滞
+    覆盖**之前**就构造好了（`_make_lb_headers(decision)`），所以绑定会话里它
+    报的是负载均衡的初选，不是真实派发目标。实测：头部 `Qwen3.7-Max`，provider
+    收到 `Qwen3.6-Flash`。断言按线路上的事实（provider 实收模型）来对，而不是
+    按网关自己的记账（§67/§81）。"""
+    _reset()
+    _post(_parent_body_with_model(1, "claude-3-5-haiku-20241022"))
+    r, turn2 = _post(_parent_body_with_model(2, "claude-3-7-sonnet"))
+    assert r.headers.get("x-dispatched-model") == turn2["model"], (
+        "响应头声明的模型与 provider 实收的模型不一致: 头 "
+        f"{r.headers.get('x-dispatched-model')!r} vs 线路 {turn2['model']!r}"
+    )
+    assert r.headers.get("x-session-affinity") in ("fresh", "bound"), r.headers
+
+
 def test_the_tool_contract_is_passed_at_every_call_site():
     """Structural (§53/§75): widening the signature alone passes every direct-call
     unit test while the real request path keeps handing the parent's conversation to
-    the classifier. Every call site must pass it."""
+    the classifier. Every call site must pass it — and the same for the model."""
     src = (Path(__file__).resolve().parents[1] / "server.py").read_text(encoding="utf-8")
     lines = src.splitlines()
     for fn, want in (("resolve_affinity(", 3), ("record_turn(", 8), ("has_upstream_session(", 1)):
@@ -287,10 +404,12 @@ def test_the_tool_contract_is_passed_at_every_call_site():
                     end = pos
                     break
             call = blob[start: (end + 1 if end is not None else len(blob))]
-            if "tool_contract" not in call:
-                missing.append(lines[i].strip())
+            for arg in ("tool_contract", "requested_model"):
+                if arg not in call:
+                    missing.append(f"{lines[i].strip()}  -> 缺 {arg}")
         assert not missing, (
-            f"{fn} 有调用点没有传 tool_contract，真实请求路径仍然只按会话 id 认线: {missing[:2]}"
+            f"{fn} 有调用点没有把对话线身份的组成部分传全（工具契约 / 声明的模型），"
+            f"真实请求路径仍会认错线: {missing[:2]}"
         )
 
 
@@ -329,11 +448,16 @@ def run_all():
     test_the_parent_and_the_classifier_occupy_two_upstream_conversations()
     test_repeated_classifier_calls_share_one_dedicated_line()
     test_a_session_with_a_stable_tool_set_still_continues()
+    test_a_mid_session_model_change_is_dispatched_to_the_requested_model()
+    test_a_model_change_starts_a_new_line_with_the_full_history()
+    test_a_background_small_model_request_does_not_hijack_the_parent_line()
+    test_two_aliases_resolving_to_one_wire_model_share_one_line()
+    test_the_dispatched_model_header_names_the_model_the_provider_received()
     test_the_tool_contract_is_passed_at_every_call_site()
     test_the_line_identity_is_observable_in_the_response()
     test_one_definition_of_the_tool_contract()
     assert not _GUARD_HITS, f"有请求走到了真实上游节点: {_GUARD_HITS}"
-    print("\n✅ All session-line tests passed! (7 cases)")
+    print("\n✅ All session-line tests passed! (12 cases)")
 
 
 if __name__ == "__main__":

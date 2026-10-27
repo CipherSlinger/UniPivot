@@ -123,7 +123,8 @@ def test_failover_does_not_hand_a_foreign_upstream_id_to_another_vendor():
                     "stream": False, "messages": HISTORY[:1]})
         assert r1.status_code == 200, r1.text
         assert r1.headers.get("x-session-affinity") == "fresh"
-        assert srv.session_affinity_manager.has_upstream_session("sess-1")
+        assert srv.session_affinity_manager.has_upstream_session(
+            "sess-1", requested_model=srv.resolve_model("glm-4-plus")[1])
         SEEN.clear()
 
         # 第 2 轮：glm 429 → 透明故障转移。同一个会话，全量历史。
@@ -152,13 +153,25 @@ def test_failover_does_not_hand_a_foreign_upstream_id_to_another_vendor():
         _restore()
 
 
+def _line(session_id: str, model_alias: str):
+    """对话线的注册表键：会话 id + 工具契约 + **解析后**的上游模型。
+
+    注册表按这条线的完整身份寻址（`providers/session_affinity._line_key`），
+    这里用同一个函数、同一个解析结果（`resolve_model`），而不是手拼键——
+    两份定义会在加入身份组成部分的那一天悄悄分叉。
+    """
+    from providers.session_affinity import _line_key
+
+    return _line_key(session_id, "", srv.resolve_model(model_alias)[1])
+
+
 def test_failover_does_not_poison_the_session_binding():
     """**靶点**：修复前 registry 变成 `glm -> doubao-conv`，原节点被永久喂外来 id。"""
     _install()
     try:
         _post({"model": "glm-4-plus", "conversation_id": "sess-2",
                "stream": False, "messages": HISTORY[:1]})
-        bound_before = srv.session_affinity_manager._registry.get("sess-2")
+        bound_before = srv.session_affinity_manager._registry.get(_line("sess-2", "glm-4-plus"))
         assert bound_before is not None and bound_before.provider_key == "glm"
 
         _install(failing={"glm"})
@@ -168,7 +181,7 @@ def test_failover_does_not_poison_the_session_binding():
         serving = r2.headers.get("x-failover-to")
         assert serving, "本轮应当发生故障转移"
 
-        entry = srv.session_affinity_manager._registry.get("sess-2")
+        entry = srv.session_affinity_manager._registry.get(_line("sess-2", "glm-4-plus"))
         assert entry is not None
         assert entry.provider_key == "glm", (
             f"绑定节点在一次短冷却改派后被改成了 {entry.provider_key!r}"

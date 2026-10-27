@@ -226,8 +226,11 @@ def test_bound_session_turn_two_carries_system_and_tools():
                               {"role": "user", "content": "q1"}]}
         r1 = _post(first)
         assert r1.status_code == 200, r1.text
+        # 对话线身份=会话 id + 工具契约 + 声明的上游模型。第三项必须用请求路径
+        # 的同一个解析结果（`resolve_model`），否则这里问的是另一条线。
         assert srv.session_affinity_manager.has_upstream_session(
-            "sess-1", srv.tool_contract_key([BASH_TOOL]))
+            "sess-1", srv.tool_contract_key([BASH_TOOL]),
+            requested_model=srv.resolve_model("qwen")[1])
         SEEN.clear()
 
         r2 = _post({"model": "qwen", "conversation_id": "sess-1", "stream": False,
@@ -270,7 +273,8 @@ def test_a_mid_session_tool_change_starts_a_new_line_but_still_ships_the_contrac
         _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
                "messages": [{"role": "system", "content": SYSTEM},
                             {"role": "user", "content": "q1"}]})
-        assert srv.session_affinity_manager.has_upstream_session("sess-4")
+        assert srv.session_affinity_manager.has_upstream_session(
+            "sess-4", requested_model=srv.resolve_model("qwen")[1])
         SEEN.clear()
         r2 = _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
                     "tools": [BASH_TOOL],
