@@ -209,15 +209,25 @@ def test_continuation_keeps_the_tool_result_contract():
 
 
 def test_bound_session_turn_two_carries_system_and_tools():
-    """**靶点（端到端）**：绑定会话的第二轮，上游收到的提示词里契约仍在。"""
+    """**靶点（端到端）**：绑定会话的第二轮，上游收到的提示词里契约仍在。
+
+    两轮声明**同一套**工具：这既是真实客户端的形状（Claude Code 两轮都是 47 个，
+    Codex 每个会话稳定），也是「续聊」这条路径唯一能被验证的形状——声明的工具集
+    一变，请求就属于另一条对话线（[SESSION-IDENTITY]，见
+    `tests/test_session_lines.py`），第二轮会走新建会话 + 展平，那时契约当然还在，
+    但证明的不是续聊会补发契约，而是展平本来就带着它。这条用例此前用「首轮无工具、
+    次轮有工具」来构造，等于在断言一个已经不成立的续聊（见下一条用例）。
+    """
     _install()
     try:
         first = {"model": "qwen", "conversation_id": "sess-1", "stream": False,
+                 "tools": [BASH_TOOL],
                  "messages": [{"role": "system", "content": SYSTEM},
                               {"role": "user", "content": "q1"}]}
         r1 = _post(first)
         assert r1.status_code == 200, r1.text
-        assert srv.session_affinity_manager.has_upstream_session("sess-1")
+        assert srv.session_affinity_manager.has_upstream_session(
+            "sess-1", srv.tool_contract_key([BASH_TOOL]))
         SEEN.clear()
 
         r2 = _post({"model": "qwen", "conversation_id": "sess-1", "stream": False,
@@ -244,6 +254,47 @@ def test_bound_session_turn_two_carries_system_and_tools():
     assert "Bash" in prompt, f"工具名必须出现在提示词里: {prompt!r}"
 
 
+def test_a_mid_session_tool_change_starts_a_new_line_but_still_ships_the_contract():
+    """[SESSION-IDENTITY] 「首轮之后才声明的工具」现在的正确行为是**新开一条对话线**，
+    并把全量历史 + 当前工具契约整份送上去。
+
+    这不是把第 76 节的承诺削弱了，而是把它落到正确的层：那条承诺是「模型必须知道
+    新工具存在」，它由展平满足（下面三条断言），而不是必须由「续聊同一段上游会话」
+    来满足。上游会话 id 是节点私有的续聊凭据，声明的工具契约变了就意味着模型看到的
+    契约变了，此时继续那段上游会话反而是在旧契约之上作答。代价是工具集变化的那一轮
+    重建一次上下文（此后同契约的轮次照常续聊），换来的是 Claude Code 自动模式分类器
+    （`tools: []`，与父会话共用同一个 session id）永远不会被并进用户的上游对话。
+    """
+    _install()
+    try:
+        _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
+               "messages": [{"role": "system", "content": SYSTEM},
+                            {"role": "user", "content": "q1"}]})
+        assert srv.session_affinity_manager.has_upstream_session("sess-4")
+        SEEN.clear()
+        r2 = _post({"model": "qwen", "conversation_id": "sess-4", "stream": False,
+                    "tools": [BASH_TOOL],
+                    "messages": [{"role": "system", "content": SYSTEM},
+                                 {"role": "user", "content": "q1"},
+                                 {"role": "assistant", "content": "a1"},
+                                 {"role": "user", "content": "q2"}]})
+        assert r2.status_code == 200, r2.text
+    finally:
+        _restore()
+
+    turn2 = SEEN[-1]
+    assert turn2["cid"] is None, (
+        f"工具契约变了却仍续用旧的上游会话 {turn2['cid']!r}：模型将在旧契约之上作答"
+    )
+    prompt = turn2["prompt"]
+    assert "## Tools Available" in prompt and "Bash" in prompt, (
+        f"新线没有把工具契约送上去: {prompt[:400]!r}"
+    )
+    assert "q1" in prompt, (
+        f"新线必须展平全量历史（否则模型丢了前文）: {prompt[:400]!r}"
+    )
+
+
 def test_tool_declared_only_after_turn_one_reaches_upstream():
     """首轮之后才声明的工具，此前**从未**出现在上游提示词里。"""
     _install()
@@ -267,6 +318,12 @@ def test_tool_declared_only_after_turn_one_reaches_upstream():
     assert "Write" in prompt, (
         f"第二轮新声明的工具 [Write] 没有送达上游——首轮没声明过，所以它从未"
         f"在会话里出现过，模型不可能知道它存在。实测: {prompt!r}"
+    )
+    # [SESSION-IDENTITY] 工具集变了就是另一条对话线：此刻展平全量历史是必要的，
+    # 不是巧合。断言机制本身，避免这条用例因为别的原因碰巧为绿。
+    assert SEEN[-1]["cid"] is None, (
+        f"工具集变化后仍续用旧上游会话 {SEEN[-1]['cid']!r}——契约变了，旧会话是在"
+        "另一份工具契约之下建立的"
     )
 
 
@@ -301,9 +358,10 @@ def run_all():
     test_continuation_without_system_is_unchanged()
     test_continuation_keeps_the_tool_result_contract()
     test_bound_session_turn_two_carries_system_and_tools()
+    test_a_mid_session_tool_change_starts_a_new_line_but_still_ships_the_contract()
     test_tool_declared_only_after_turn_one_reaches_upstream()
     test_per_turn_tool_choice_reaches_upstream_on_a_bound_session()
-    print("\n✅ All continuation-contract tests passed! (7 cases)")
+    print("\n✅ All continuation-contract tests passed! (8 cases)")
 
 
 if __name__ == "__main__":

@@ -170,6 +170,7 @@ from .session_affinity import (
     AffinityDecision,
     SessionAffinityManager,
     session_affinity_manager,
+    tool_contract_key,
 )
 from .singleflight import (
     FlightGroup,
@@ -298,6 +299,7 @@ __all__ = [
     "SessionAffinityManager",
     "AffinityDecision",
     "session_affinity_manager",
+    "tool_contract_key",
     "FlightGroup",
     "SingleFlightDecision",
     "SingleFlightManager",

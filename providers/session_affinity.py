@@ -24,22 +24,95 @@
 
 现在只有网关**实际观测到**的上游会话 id 才会被回放；未绑定的线程一律以
 `upstream_conv_id=None` 开始，由 provider 新建会话。
+
+[SESSION-IDENTITY] 会话 id 命名的是「一次会话」，不是「一条对话线」。
+Claude Code 2.1.293 的自动模式在每次工具审批时额外发一个 `/v1/messages`：
+非流式、`tools: []`、`max_tokens: 2112`、`stop_sequences: ["</block>"]`、
+自带一段 139 702 字符的「安全审查员」系统提示，要求回 `<block>yes|no</block>`，
+用户消息里包一段 `<transcript>`——而 `metadata.user_id.session_id` 与父会话
+**完全相同**（从真实二进制捕获的三份请求体实测：父会话第 1 轮、分类器、父会话
+第 2 轮；系统提示 sha 0270404a12 / 2d052caeb7，47 个工具 vs 0 个）。
+
+注册表原先只按会话 id 认线，于是网关把父会话正在使用的上游对话交给了分类器，
+父会话的下一轮又继续使用同一条对话。经本网关 + 脚本化 provider 实测（线上提示词
+由真实的 `flatten_messages` / `continuation_content` 构造，不是复刻）：
+
+    parent#1   affinity=fresh  wire conv=None  44 763 字符
+    classifier affinity=bound  wire conv='up1' 140 302 字符  <-- 被写进父会话
+    parent#2   affinity=bound  wire conv='up1'  44 543 字符  <-- 继续被污染的那条线
+
+修复后同三份真实请求体、同一实测脚本：
+
+    parent#1   affinity=fresh  wire conv=None  44 763 字符
+    classifier affinity=fresh  wire conv=None 140 320 字符  <-- 自己的对话线
+    parent#2   affinity=bound  wire conv='up1'  44 543 字符  <-- 回到自己的线
+
+（分类器第二轮起以自己的会话续聊；它声明 0 个工具，所以响应里没有
+`x-session-tool-contract` 头，父会话有。）
+
+两个后果都不是报错：用户的上游对话被永久写入一段 14 万字符的安全审查内容（此后
+每一轮的回答都在它之上生成），而分类器被当成「续聊」——它要评判的 transcript 与
+那条对话的历史毫无关系。
+
+客户端的会话 id 无法再细分（线路上没有更细的标识），因此修法是 §53/§75 用过的
+**保守方向**：在「这是哪一条对话线」的身份里再加一个事实——本请求声明的工具契约。
+在 47 个工具下开启的对话不会被一个声明 0 个工具的请求续上；两条线各自持有自己的
+上游会话。加宽身份键只可能拆开对话，绝不会把本该分开的两条合并。
+
+诚实的残留：如果客户端在**同一次对话**里交替更换声明的工具集（第 1 轮 47 个、
+第 2 轮 0 个、第 3 轮 47 个），它会交替命中两条线，各自缺少另一条的轮次。目前没有
+任何实测客户端这样做——Claude Code 两轮都是 47/47（摘要 035695cc210236e5），
+Codex 每个会话稳定（§62/§68）。
 """
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import threading
 import time
 from dataclasses import dataclass
-from typing import Callable, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional
+
+from .tool_streamer import tool_names_of
 
 logger = logging.getLogger("gateway.session_affinity")
 
 
+def tool_contract_key(tools: Any) -> str:
+    """把一次请求声明的工具集摘要成一小段稳定字符串，作为对话线身份的一部分。
+
+    空字符串表示「没有声明任何工具」（`tools` 缺省、`[]`、或全是无效声明）。
+
+    [SESSION-IDENTITY] 复用 `tool_names_of`，因为它已经回答了「客户端声明了哪些
+    工具」这个问题的全部三种协议形状（OpenAI 的 `function.name`、Anthropic /
+    Responses 的顶层 `name`、custom / freeform 的 `{"type":"custom","name":…}`）。
+    在这里另写一遍名字提取，自定义工具与 namespace 容器（§62）就会在「提示词里
+    能调用的工具」和「对话线身份」两条路径上得到不同的答案——即本仓库反复出现的
+    「一个事实两份定义」。
+
+    只摘要**名字集合**，不摘要 schema：参数微调不应把一段对话劈成两条线，而增删
+    工具（分类器 0 个 vs 父会话 47 个）必须。
+    """
+    names = tool_names_of(tools)
+    if not names:
+        return ""
+    joined = "\n".join(sorted(names))
+    return hashlib.sha256(joined.encode("utf-8")).hexdigest()[:16]
+
+
+def _line_key(session_id: str, tool_contract: str) -> str:
+    """对话线的注册表键。
+
+    没有工具契约时**原样返回会话 id**：所有既有调用点（匿名请求、纯聊天客户端、
+    直接调用本模块的测试）因此逐字节保持不变。
+    """
+    return session_id if not tool_contract else f"{session_id}\x00{tool_contract}"
+
+
 @dataclass
 class AffinityEntry:
-    """单个会话的粘滞元数据。"""
+    """单条对话线的粘滞元数据。"""
     session_id: str
     provider_key: str
     model_name: str
@@ -47,6 +120,7 @@ class AffinityEntry:
     created_at: float
     last_accessed_at: float
     turn_count: int = 1
+    tool_contract: str = ""
 
 
 @dataclass
@@ -59,6 +133,9 @@ class AffinityDecision:
     is_handoff: bool = False
     original_provider: Optional[str] = None
     turn_count: int = 1
+    # 决策自己携带本条线的工具契约，调用方 `record_turn` 时直接用它——解析与记录
+    # 于是不可能对「这是哪条线」产生分歧（`_affinity_record` 的同一理由）。
+    tool_contract: str = ""
 
 
 class SessionAffinityManager:
@@ -83,17 +160,19 @@ class SessionAffinityManager:
         provider_key: str,
         model_name: str,
         upstream_conv_id: Optional[str] = None,
+        tool_contract: str = "",
     ) -> None:
-        """记录或更新会话交互轮次与粘滞目标。"""
+        """记录或更新一条对话线的交互轮次与粘滞目标。"""
         if not session_id:
             return
 
+        key = _line_key(session_id, tool_contract)
         now = time.time()
         with self._lock:
             self._clean_expired_locked(now)
 
-            if session_id in self._registry:
-                entry = self._registry[session_id]
+            if key in self._registry:
+                entry = self._registry[key]
                 entry.provider_key = provider_key
                 entry.model_name = model_name
                 if upstream_conv_id:
@@ -106,7 +185,7 @@ class SessionAffinityManager:
                     oldest_key = min(self._registry, key=lambda k: self._registry[k].last_accessed_at)
                     self._registry.pop(oldest_key, None)
 
-                self._registry[session_id] = AffinityEntry(
+                self._registry[key] = AffinityEntry(
                     session_id=session_id,
                     provider_key=provider_key,
                     model_name=model_name,
@@ -116,6 +195,7 @@ class SessionAffinityManager:
                     created_at=now,
                     last_accessed_at=now,
                     turn_count=1,
+                    tool_contract=tool_contract,
                 )
                 self._stats["total_recorded_sessions"] += 1
 
@@ -126,8 +206,13 @@ class SessionAffinityManager:
         primary_model: str,
         is_provider_available: Callable[[str], bool],
         can_retain_degraded: Optional[Callable[[str], bool]] = None,
+        tool_contract: str = "",
     ) -> AffinityDecision:
-        """解析当前会话粘滞关系。
+        """解析当前对话线的粘滞关系。
+
+        `tool_contract` 是对话线身份的一部分（见模块 docstring 的
+        [SESSION-IDENTITY]）：同一次会话里声明的工具集不同的请求是两条线，各自
+        持有自己的上游会话。缺省空串，既有调用点逐字节不变。
 
         若存在已绑定的可用 Provider，则锁定该 Provider；
         若原 Provider 处于硬阻断状态，则触发跨模型状态迁移并剥离旧 ID。
@@ -149,12 +234,13 @@ class SessionAffinityManager:
                 upstream_conv_id=None,
                 is_handoff=False,
                 turn_count=1,
+                tool_contract=tool_contract,
             )
 
         now = time.time()
         with self._lock:
             self._clean_expired_locked(now)
-            entry = self._registry.get(session_id)
+            entry = self._registry.get(_line_key(session_id, tool_contract))
 
             if not entry:
                 # 未绑定线程：客户端给的是线程标识，网关从未为它建立过上游会话，
@@ -168,6 +254,7 @@ class SessionAffinityManager:
                     upstream_conv_id=None,
                     is_handoff=False,
                     turn_count=1,
+                    tool_contract=tool_contract,
                 )
 
             entry.last_accessed_at = now
@@ -182,6 +269,7 @@ class SessionAffinityManager:
                     upstream_conv_id=entry.upstream_conv_id,
                     is_handoff=False,
                     turn_count=entry.turn_count,
+                    tool_contract=tool_contract,
                 )
 
             degraded_ok = can_retain_degraded or (lambda _p: False)
@@ -198,6 +286,7 @@ class SessionAffinityManager:
                     upstream_conv_id=entry.upstream_conv_id,
                     is_handoff=False,
                     turn_count=entry.turn_count,
+                    tool_contract=tool_contract,
                 )
 
             # 原绑定节点硬阻断（租约 / 禁用 / 长效避让），执行平滑状态迁移
@@ -220,22 +309,27 @@ class SessionAffinityManager:
                 is_handoff=True,
                 original_provider=orig_provider,
                 turn_count=entry.turn_count,
+                tool_contract=tool_contract,
             )
 
-    def has_upstream_session(self, session_id: Optional[str]) -> bool:
+    def has_upstream_session(self, session_id: Optional[str], tool_contract: str = "") -> bool:
         """该线程是否已经持有**网关观测到的**上游会话 id。
 
         调用方据此在「把全量历史展平发出去」与「只发本轮增量」之间选择——这是
         [TOOL-LOOP] S1 的收口点：客户端自带的线程 id 永远不算数，只有 provider
         真的返回过 `conversation_id` 并且已 `record_turn` 的线程才算。
         只读，不改动任何状态。
+
+        `tool_contract` 必须与 `resolve_affinity` 传入的值一致：两者共用同一个
+        `_line_key`，否则调用方会在「本条线确有上游会话」时展平全量历史（多花
+        钱），或反过来在一条新线上只发增量（模型看不到工具契约）。
         """
         if not session_id:
             return False
         now = time.time()
         with self._lock:
             self._clean_expired_locked(now)
-            entry = self._registry.get(session_id)
+            entry = self._registry.get(_line_key(session_id, tool_contract))
             return bool(entry and entry.upstream_conv_id)
 
     def _clean_expired_locked(self, now: float) -> None:
@@ -265,7 +359,13 @@ class SessionAffinityManager:
             self._clean_expired_locked(now)
             active_count = len(self._registry)
             return {
-                "active_sessions": active_count,
+                # [SESSION-IDENTITY] 两个数必须分开：`active_sessions` 是不同会话
+                # id 的数量，`active_lines` 是注册表条数（一次会话可以有多条线，
+                # 例如 Claude Code 的父会话与自动模式分类器）。只报前者会让
+                # 「分类器是不是真的分到了一条独立线」无法从遥测上看出来；只报
+                # 后者会把一对多误读成重复计数。
+                "active_sessions": len({e.session_id for e in self._registry.values()}),
+                "active_lines": active_count,
                 "total_recorded_sessions": self._stats["total_recorded_sessions"],
                 "affinity_hits": self._stats["affinity_hits"],
                 # [M3] 「降级但保留」是本轮新增的第三种结局，必须可观测：

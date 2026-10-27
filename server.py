@@ -126,7 +126,11 @@ logger = logging.getLogger("gateway.server")
 from providers.stream_keepalive import sse_keepalive
 from providers.http_client import close_http_client, get_default_limits, get_http_client
 from providers.prompt_optimizer import prompt_optimizer, make_prompt_folding_headers
-from providers.session_affinity import AffinityDecision, session_affinity_manager
+from providers.session_affinity import (
+    AffinityDecision,
+    session_affinity_manager,
+    tool_contract_key,
+)
 from providers.singleflight import (
     SingleFlightDecision,
     broadcast_stream_wrapper,
@@ -1108,6 +1112,12 @@ def _make_affinity_headers(decision: AffinityDecision) -> dict[str, str]:
     # 反推——「降级但保留」与「一切正常」在响应上是两件事。
     if decision.status == "degraded" and decision.provider_key:
         headers["x-session-affinity-degraded"] = decision.provider_key
+    # [SESSION-IDENTITY] 对话线身份里还包含「本请求声明的工具契约」。它是分类器与
+    # 父会话各自持有独立上游会话的原因（`providers/session_affinity.py`），因此必须
+    # 可观测：没有这个头，运维只能看到同一次会话里突然出现两条线，却无法判断是
+    # 工具集变了还是身份键算错了。空串（未声明任何工具）不发送，与既有响应逐字节一致。
+    if decision.tool_contract:
+        headers["x-session-tool-contract"] = decision.tool_contract
     return headers
 
 
@@ -2680,9 +2690,13 @@ async def chat_completions(req: ChatCompletionRequest):
     # 而不是客户端有没有给线程 id。原先按 req.conversation_id 判断：一个自己生成
     # 线程 id 的客户端（Codex / Claude Code 类）首轮就被当成「续聊」，上游只收到
     # 最后一句提问，注入的系统提示与工具契约整段丢失——「模型无视我的 tools」。
+    # [SESSION-IDENTITY] 会话 id 命名会话，不命名对话线：同一会话里声明的工具集
+    # 不同的请求（Claude Code 自动模式分类器声明 0 个工具，父会话 47 个）是两条
+    # 线。身份只在这里算一次，四处调用点共用同一个值。
+    tool_contract = tool_contract_key(req.tools)
     prompt_text = (
         continuation_content(messages)
-        if session_affinity_manager.has_upstream_session(req.conversation_id)
+        if session_affinity_manager.has_upstream_session(req.conversation_id, tool_contract)
         else flatten_messages(messages)
     )
     prompt_tokens = _est_tokens(prompt_text)
@@ -2712,6 +2726,7 @@ async def chat_completions(req: ChatCompletionRequest):
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
+        tool_contract=tool_contract,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -3022,6 +3037,7 @@ async def chat_completions(req: ChatCompletionRequest):
                             _bound,
                             dispatched_model,
                             _conv,
+                            tool_contract=affinity_decision.tool_contract,
                         )
 
                     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3300,6 +3316,7 @@ async def chat_completions(req: ChatCompletionRequest):
                         _bound,
                         dispatched_model,
                         _conv,
+                        tool_contract=affinity_decision.tool_contract,
                     )
 
                 if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3447,6 +3464,7 @@ async def chat_completions(req: ChatCompletionRequest):
             _bound,
             dispatched_model,
             _conv,
+            tool_contract=affinity_decision.tool_contract,
         )
 
     if not req.conversation_id and conversation_id and hasattr(active_provider, "delete_conversation"):
@@ -3629,12 +3647,19 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     dispatched_model = decision.wire_model
 
     # 2.1 智能会话粘滞解析与跨模型状态迁移
+    # [SESSION-IDENTITY] 同一次会话里声明的工具集不同的请求是两条对话线（Claude
+    # Code 的自动模式分类器 `tools: []` 与父会话 47 个工具共用同一个
+    # `metadata.user_id.session_id`）。判据只有一份（`tool_contract_key`），
+    # 解析、记录、`has_upstream_session` 三处读的都是它。见
+    # `providers/session_affinity.py` 的模块 docstring（实测与诚实的残留）。
+    tool_contract = tool_contract_key(req.tools)
     affinity_decision = session_affinity_manager.resolve_affinity(
         session_id=client_session_id,
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
+        tool_contract=tool_contract,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -3889,6 +3914,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                             _bound,
                             dispatched_model,
                             _up,
+                            tool_contract=affinity_decision.tool_contract,
                         )
 
                     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4074,6 +4100,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                         _bound,
                         dispatched_model,
                         _up,
+                        tool_contract=affinity_decision.tool_contract,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4227,6 +4254,7 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
             _bound,
             dispatched_model,
             _up,
+            tool_contract=affinity_decision.tool_contract,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -4494,12 +4522,19 @@ async def responses_endpoint(req: ResponsesRequest):
     dispatched_model = decision.wire_model
 
     # 2.1 智能会话粘滞解析与跨模型状态迁移
+    # [SESSION-IDENTITY] 同一次会话里声明的工具集不同的请求是两条对话线（Claude
+    # Code 的自动模式分类器 `tools: []` 与父会话 47 个工具共用同一个
+    # `metadata.user_id.session_id`）。判据只有一份（`tool_contract_key`），
+    # 解析、记录、`has_upstream_session` 三处读的都是它。见
+    # `providers/session_affinity.py` 的模块 docstring（实测与诚实的残留）。
+    tool_contract = tool_contract_key(req.tools)
     affinity_decision = session_affinity_manager.resolve_affinity(
         session_id=client_session_id,
         primary_provider=dispatched_provider,
         primary_model=dispatched_model,
         is_provider_available=_is_provider_healthy,
         can_retain_degraded=_is_provider_retainable,
+        tool_contract=tool_contract,
     )
     affinity_headers = _make_affinity_headers(affinity_decision)
     dispatched_provider = affinity_decision.provider_key
@@ -4952,6 +4987,7 @@ async def responses_endpoint(req: ResponsesRequest):
                         _bound,
                         dispatched_model,
                         _up,
+                        tool_contract=affinity_decision.tool_contract,
                     )
 
                 if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
@@ -5058,6 +5094,7 @@ async def responses_endpoint(req: ResponsesRequest):
             _bound,
             dispatched_model,
             _up,
+            tool_contract=affinity_decision.tool_contract,
         )
 
     if not client_session_id and conv_id and hasattr(active_provider, "delete_conversation"):
