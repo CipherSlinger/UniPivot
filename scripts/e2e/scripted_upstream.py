@@ -511,6 +511,15 @@ class LoopProvider:
                     messages, kw.get("conversation_id")
                 ),
                 "tools": kw.get("tools"),
+                # [AGENT-LOOP] The reasoning decision the gateway actually made,
+                # measured where every upstream decision is measured: on the call
+                # itself. `kw_keys` lists that a `thinking` key exists, but not its
+                # VALUE, so before this field a run could not tell "the client asked
+                # for `xhigh` and the gateway opened thinking" from "the gateway
+                # silently ignored the effort and sent `thinking=False`". Qwen maps
+                # this straight to `chat_mode: think|quick`, i.e. it is the
+                # difference between a reasoning model and a plain one.
+                "thinking": bool(kw.get("thinking")),
                 "prompt_len": len(prompt),
                 "has_tools_section": "## Tools Available" in prompt,
                 "declared_tools": _declared_tools(prompt),

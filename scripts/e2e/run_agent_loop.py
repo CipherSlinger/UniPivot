@@ -360,6 +360,17 @@ def _collect(client: str, exit_code: int, bodies: list[dict], work: Path,
         "session_reused": any(
             b.get("conversation_id") for b in bodies[1:]
         ) if len(bodies) > 1 else False,
+        # [AGENT-LOOP] The reasoning decision, read from the call the provider
+        # really made. `all`, not `any`: the effort is a property of the client
+        # session, so a single request that lost it means that turn ran in
+        # non-reasoning mode — the same "every round after the first" rule the
+        # tool-result check above applies, for the same reason.
+        "thinking": bool(bodies) and all(b.get("thinking") is True for b in bodies),
+        # Only the Codex arm declares an effort this harness can name; Claude Code
+        # asks for thinking through its own `thinking` block, which the gateway
+        # judges separately. Declaring a value here would be asserting Codex's
+        # knob against a client that never used it.
+        "effort": (_codex_effort() or None) if client == "codex" else None,
         "stdout": stdout[-2000:],
     }
 
@@ -452,7 +463,59 @@ def _verdict_line(res: dict, ok: bool) -> str:
         parts.append("tool_markers=n/a")
     if res.get("session_reused") is not None:
         parts.append(f"conversation_reused={res.get('session_reused')}")
+    # [AGENT-LOOP] Whether the reasoning decision reached the wire. Silent in
+    # every other field: a non-reasoning turn is a perfectly green-looking run.
+    if res.get("thinking") is not None:
+        parts.append(f"effort={res.get('effort') or '-'},thinking={res.get('thinking')}")
     return f"{res['client']}: {'PASS' if ok else 'FAIL'} ({', '.join(parts)})"
+
+
+#: 明确表示「不要思考」的强度取值，与网关 `_THINKING_OFF_EFFORTS` 同义。
+_OFF_EFFORTS = frozenset({"none", "off", "disabled", "false", "no", "0"})
+
+
+def _codex_effort() -> str:
+    """[AGENT-LOOP] The reasoning effort this run asks Codex to declare.
+
+    The harness used to hardcode `model_reasoning_effort = "low"` — a value that
+    sat inside the gateway's literal whitelist, which is exactly why no E2E arm
+    could ever have caught the defect this knob exists to expose: the gateway
+    silently turned thinking OFF for `xhigh` / `max` / `ultra`, and the one value
+    the harness exercised was one of the four that still worked.
+
+    Read from the environment rather than an argparse flag for the same reason as
+    `_WRITE_MODE()`: the config file is written by the runner, the effort is
+    echoed into the verdict by the same process, and a second opinion about it
+    would be a second definition of one fact.
+    """
+    return os.environ.get("UNIPIVOT_E2E_CODEX_EFFORT", "low").strip()
+
+
+def _effort_failure(res: dict, name: str) -> str | None:
+    """[AGENT-LOOP] Did the effort the client declared reach the upstream?
+
+    A run's green light must cover this, because the failure is silent in every
+    other channel: the gateway answers 200, the loop closes, the tools execute,
+    and the only difference is that the model answered in non-reasoning mode
+    (`chat_mode: "quick"` on qwen). Measured shape of the defect: every catalog
+    effort above `high` produced `thinking=False` on the wire.
+
+    Shared by all three run modes for the reason `_write_failure` records: a
+    per-mode copy is how one arm keeps passing while another stops checking.
+    Only the arms that actually declare an effort are judged — a Claude Code run
+    asks for thinking a different way, and asserting Codex's knob against it
+    would invent a second definition of the same question.
+    """
+    effort = (res.get("effort") or "").strip().lower()
+    if not effort or effort in _OFF_EFFORTS:
+        return None
+    if res.get("thinking"):
+        return None
+    return (
+        f"{name}: the client declared reasoning effort {effort!r} but no upstream "
+        "request carried thinking=True — the gateway silently downgraded the "
+        "model to non-reasoning mode (HTTP 200, no error anywhere)"
+    )
 
 
 def _write_failure(res: dict, name: str) -> str | None:
@@ -553,11 +616,18 @@ def _codex_argv(port: int, work: Path, log_dir: Path, marker: Path):
     # The default stays `gpt-5.5` (the flat-tools shape); override to exercise the
     # lite shape, because one harness run cannot prove both.
     codex_model = os.environ.get("UNIPIVOT_E2E_CODEX_MODEL", "gpt-5.5")
+    # [AGENT-LOOP] The effort line is emitted only when one is asked for, so the
+    # harness can also exercise the "no declaration" shape; an empty value writes
+    # no line at all rather than `model_reasoning_effort = ""` (which Codex would
+    # parse as a value it must validate, not as an absence).
+    codex_effort = _codex_effort()
+    effort_line = (
+        f'model_reasoning_effort = "{codex_effort}"\n' if codex_effort else ""
+    )
     (codex_home / "config.toml").write_text(
         f'''model_provider = "unipivot"
 model = "{codex_model}"
-model_reasoning_effort = "low"
-disable_response_storage = true
+{effort_line}disable_response_storage = true
 approval_policy = "never"
 sandbox_mode = "danger-full-access"
 
@@ -701,6 +771,9 @@ def _run_same(log_dir: Path, work: Path, args, results: list, failures: list) ->
         _wf = _write_failure(res, name)
         if _wf:
             failures.append(_wf)
+        _ef = _effort_failure(res, name)
+        if _ef:
+            failures.append(_ef)
         if args.rounds > 1 and len(res["markers"]) < args.rounds:
             # At one round no per-round marker is ever written (see the parallel
             # mode's identical guard); `--sessions N --rounds 1` was red on a
@@ -889,6 +962,9 @@ def _run_parallel(log_dir: Path, work: Path, args, results: list, failures: list
         _wf = _write_failure(res, name)
         if _wf:
             failures.append(_wf)
+        _ef = _effort_failure(res, name)
+        if _ef:
+            failures.append(_ef)
         if len(res["markers"]) < args.rounds:
             # At one round the stub is never asked to write a per-round marker
             # (`_command_for` only rewrites the command when ROUNDS > 1), so this
@@ -1063,6 +1139,9 @@ def main() -> int:
             _wf = _write_failure(res, name)
             if _wf:
                 failures.append(_wf)
+            _ef = _effort_failure(res, name)
+            if _ef:
+                failures.append(_ef)
             if res["bodies"] < 2:
                 failures.append(
                     f"{name}: only {res['bodies']} upstream request(s) — a two-round "

@@ -1019,3 +1019,18 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
       claude: PASS (exit=0, bodies=2, tool_ran=True, tool=Bash,         conversation_reused=True)
       codex:  PASS (exit=0, bodies=2, tool_ran=True, tool=exec_command, conversation_reused=True)
       ```
+
+87. **推理强度是「要思考」的声明，不是四个白名单词 (`server.py:_effort_wants_thinking`, `scripts/e2e/`)**
+    - **[AGENT-LOOP] 越想要模型想清楚，越会把思考整个关掉。** `/v1/responses` 判定 thinking 意图时，对 `reasoning.effort` 只认一个字面量集合：`if isinstance(effort, str) and effort.lower() in ("high", "medium", "low", "minimal")`。而 Codex CLI 的**真实**目录（`codex debug models`，0.145.0）声明的档位是 `gpt-5.6-sol/-terra: low…ultra`、`gpt-5.6-luna: low…max`、`gpt-5.5/-5.4/codex-auto-review: low…xhigh`。于是 `-c model_reasoning_effort=xhigh`（以及 `max` / `ultra`）落在白名单外，`enable_thinking` 保持 `False`，上游照常 200、日志什么都没有，模型以**非推理模式**作答。实测（真实 `/v1/responses` 路径）：`low`/`medium`/`high` 为 `True`，`xhigh`/`max`/`ultra` 全部为 `False`。qwen 把它直接映射成 `chat_mode: think|quick`，这是推理模型与普通模型的全部区别。§34 对模型名兜底写过同一句话——「固定表永远追不上厂商发布」；`xhigh`/`max`/`ultra` 就是这样长出来的，而这里的固定表恰好把「想得更多」读成「不认识」。
+    - **同一字段在 `/v1/chat/completions` 上更彻底**：请求模型根本没有声明 `reasoning_effort`，它躺在 `extra="allow"` 里没有任何代码读过（§35 的「解析了然后没人用」）。实测同一取值两条路径的结论相反：`effort='low'` → `/v1/responses=True` / `/v1/chat/completions=False`。
+    - **判据改成语义而不是词表**：`_THINKING_OFF_EFFORTS = {none, off, disabled, false, no, 0}` 是唯一的关闭声明，其余任何非空强度一律开启（失败开放）。厂商再加一档时，网关只会「多想一点」，不会「静默不想」。两个协议共用 `_effort_wants_thinking()`，chat 路径的 `ChatCompletionRequest.reasoning_effort` 现在被声明并读取，`thinking` 字段默认 `None`，`is_thinking` 只裁决一次后复用到 `chat_args`——同一事实两份定义正是 §53/§75 反复记录的缺陷。
+    - **验收仪器此前看不见这个缺陷，这才是它存活至今的原因**：`scripts/e2e/run_agent_loop.py` 把 `model_reasoning_effort = "low"` 写死了，而 `low` 恰好是旧白名单里仍然工作的四个值之一。任何一次真实二进制验收都不可能失败。现在：`UNIPIVOT_E2E_CODEX_EFFORT`（默认 `low`，空值表示「不声明」）写进 `config.toml`；`scripted_upstream` 的上游调用记录新增 `"thinking": bool(kw.get("thinking"))`（`kw_keys` 只能证明键存在，不能证明取值）；`_effort_failure(res, name)` 由三种运行模式共用（与 `_write_failure` 同一理由：每个模式各写一份，就是「一个分支还在检查、另一个已经悄悄不查」的由来）；结论行（§82 的唯一格式器）新增 `effort=…,thinking=…`。
+    - **受控实验，同一台机器、同一条命令、只改一个变量（哪一份 `server.py`）**：
+      ```
+      修复前:  codex: FAIL (… effort=xhigh,thinking=False)
+               !! the client declared reasoning effort 'xhigh' but no upstream request
+                  carried thinking=True — the gateway silently downgraded the model
+      修复后:  codex: PASS (… effort=xhigh,thinking=True)
+      ```
+      两次都是 `bodies=3`、`tool_markers=2/2`、`conversation_reused=True`——即「回路闭合、工具真的执行」在两种情况下都成立，唯一的差别是模型的推理模式，这也正是该缺陷为什么从其他任何指标上都看不出来。
+    - 逐例在 pristine `HEAD` 工作树上验证：第 1 例 RED（`['xhigh','max','ultra']` 全为 False）、第 3 例 RED（`'low'` 处两协议不一致）、第 4 例 RED（`'turbo'` 被静默关闭）、第 5 例 RED（HEAD 的 `run_agent_loop.py` 里 `_codex_effort` / `_effort_failure` 都不存在，`"thinking"` 在上游记录里出现 0 次）；第 2 例按设计 GREEN——它是明确关闭取值的零回归守卫，必须在新旧两棵树上都绿。全量 glob `failures: 0 / 90`。

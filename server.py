@@ -560,7 +560,10 @@ class ChatCompletionRequest(BaseModel):
     # [AGENT-LOOP] 类型放宽到对象：Anthropic 一侧的现行写法已经是
     # `{"type": "adaptive"}`，把同一字段在 OpenAI 协议上钉成 bool 只会让
     # 形状稍有差异的客户端在 422 上失手——判定统一交给 `_wants_thinking`。
-    thinking: Union[bool, dict, str] = False
+    thinking: Optional[Union[bool, dict, str]] = None
+    # [AGENT-LOOP] 与 `/v1/responses` 同一条纪律：强度是「要思考」的声明。
+    # 此前它只被 `extra="allow"` 收着、没有任何代码读过（§35 的「解析了然后没人用」）。
+    reasoning_effort: Optional[str] = None
     search: bool = False
 
     @field_validator("tools")
@@ -868,6 +871,33 @@ def _wants_thinking(thinking: object) -> bool:
             return t_type.strip().lower() not in ("disabled", "none", "off")
         return True
     return bool(thinking)
+
+
+#: 明确表示「不要思考」的强度取值。其余**任何**非空强度都开启思考。
+_THINKING_OFF_EFFORTS = frozenset({"none", "off", "disabled", "false", "no", "0"})
+
+
+def _effort_wants_thinking(effort: object) -> bool:
+    """`reasoning.effort` / `reasoning_effort` 是否要求开启思考——两个协议共用。
+
+    [AGENT-LOOP] 原先这里是一个字面量白名单
+    `("high", "medium", "low", "minimal")`，而 Codex CLI 的真实目录
+    （`codex debug models`，0.145.0）声明的是
+    `low / medium / high / xhigh / max / ultra`。于是**越想要模型想清楚，越会把
+    思考整个关掉**：`xhigh` / `max` / `ultra` 落在白名单外，`enable_thinking`
+    保持 False，请求照常 200、日志一片安静。
+
+    判据因此必须是**语义**而不是词表：只有明确的 `none` / `off` / `disabled`
+    关闭思考，其余任何非空强度一律开启——失败开放。固定白名单在厂商发布新档位的
+    那一刻开始静默失效，而「静默失效」正是 §34 对模型名兜底、§76 对系统提示
+    反复修正过的同一类缺陷：声明的能力被丢掉，且没有任何可观察的错误。
+    """
+    if not isinstance(effort, str):
+        return False
+    value = effort.strip().lower()
+    if not value:
+        return False
+    return value not in _THINKING_OFF_EFFORTS
 
 
 def _thinking_display(thinking: object) -> str:
@@ -2481,7 +2511,13 @@ async def chat_completions(req: ChatCompletionRequest):
         else flatten_messages(messages)
     )
     prompt_tokens = _est_tokens(prompt_text)
-    is_thinking = _wants_thinking(req.thinking)
+    # 思考意图只裁决一次，`chat_args` 复用它：同一事实两份定义正是本项目反复
+    # 修正的缺陷（`_wants_thinking` 与强度判定的先后次序很容易在这里漂移）。
+    is_thinking = (
+        _wants_thinking(req.thinking)
+        if req.thinking is not None
+        else _effort_wants_thinking(req.reasoning_effort)
+    )
 
     # 2. 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
@@ -2511,7 +2547,7 @@ async def chat_completions(req: ChatCompletionRequest):
         "conversation_id": affinity_decision.upstream_conv_id,
         "temperature": temperature,
         "max_tokens": max_tokens,
-        "thinking": _wants_thinking(req.thinking),
+        "thinking": is_thinking,
         "search": req.search,
         "stream": req.stream,
     }
@@ -4216,8 +4252,7 @@ async def responses_endpoint(req: ResponsesRequest):
             effort = req.reasoning.get("effort")
         elif not effort and isinstance(req.reasoning, str):
             effort = req.reasoning
-        if isinstance(effort, str) and effort.lower() in ("high", "medium", "low", "minimal"):
-            enable_thinking = True
+        enable_thinking = _effort_wants_thinking(effort)
 
     # 自适应负载均衡与被禁节点即刻转移路由决策
     decision = load_balancer.select_route(
