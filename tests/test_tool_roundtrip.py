@@ -153,9 +153,28 @@ def test_unparseable_arguments_are_preserved_not_emptied():
 
 
 def test_tool_message_carries_its_name():
-    """`role:"tool"` 只带 tool_call_id，必须反查出工具名，否则上游看到一段无名输出。"""
+    """`role:"tool"` 只带 tool_call_id，必须反查出工具名，否则上游看到一段无名输出。
+
+    本用例的主体是「上游不得看到一段无名输出」，而不是某一种具体标记。带 id 时
+    渲染成 `[Tool Result for <id>]`（与 Anthropic / Responses 两条历史路径同形，
+    见 `tests/test_tool_result_pairing.py`），id 是比名字更强的配对信息；只有在
+    客户端**没有回传 id** 时，工具名才成为唯一可用的上下文，此时渲染成
+    `[Tool Result] (Bash)`。两条分支都断言，缺陷才不会被下一次改形状重新引入。
+    """
     prompt = flatten_messages(_agent_turn())
-    assert "Tool (Bash):" in prompt, f"工具结果必须带上工具名，实际:\n{prompt}"
+    assert "[Tool Result for call_abc123]" in prompt, (
+        f"带 id 的工具结果必须用契约承诺的标记渲染，实际:\n{prompt}"
+    )
+    assert "print(1)" in prompt, prompt
+
+    # 无 id 分支：客户端显式给了 name 时，名字必须仍然可见（这正是本用例原本要
+    # 保护的东西）。反查依赖 `tool_call_id`，没有 id 就无法反查，所以能显示的
+    # 名字只可能来自客户端自己给的字段。
+    no_id = _agent_turn()
+    no_id[-1].pop("tool_call_id")
+    no_id[-1]["name"] = "Bash"
+    weak = flatten_messages(no_id)
+    assert "[Tool Result] (Bash)" in weak, f"无 id 时工具名是唯一上下文，不得丢失:\n{weak}"
     print("test_tool_message_carries_its_name: PASSED")
 
 
@@ -223,7 +242,7 @@ def test_empty_tool_result_is_still_reported():
     msgs = _agent_turn()
     msgs[-1]["content"] = ""
     prompt = flatten_messages(msgs)
-    assert "Tool (Bash)" in prompt, prompt
+    assert "[Tool Result for call_abc123]" in prompt, prompt
     assert "(empty result)" in prompt, f"空结果必须显式告知，实际:\n{prompt}"
     print("test_empty_tool_result_is_still_reported: PASSED")
 

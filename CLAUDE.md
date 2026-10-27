@@ -1052,3 +1052,21 @@ The repository is a local multi-protocol API gateway (`server.py`) supporting th
       claude: PASS (exit=0, bodies=3, tool_ran=True, tool=Bash,         tool_markers=2/2, conversation_reused=True, effort=-,thinking=False)
       codex:  PASS (exit=0, bodies=3, tool_ran=True, tool=exec_command, tool_markers=2/2, conversation_reused=True, effort=low,thinking=True)
       ```
+
+89. **A Tool Result Must Carry the Id of the Call It Answers (`providers/base.py:_message_line`)**:
+    - **[TOOL-LOOP] The contract told the model to look for a shape its own history never contained.** The injected tool prompt's rule 5 reads, verbatim: *"When you receive a `[Tool Result for <id>]` block, continue the task using that result."* Two of the three history renderers honour it — Anthropic emits `[Tool Result for toolu_1]:` / `[Tool Error for toolu_2]:`, Responses emits `[Tool Result for c1]:`. The **OpenAI chat** path emitted `Tool (Read): ok`: no id, and a shape that appears nowhere in the contract. Measured on the real `/v1/chat/completions` path (scripted provider, `TESTING=1`, zero upstream calls) with one turn calling `Read` twice in parallel and returning two results whose **content is identical** (the ordinary shape — two empty files, two commands that both print `ok`):
+
+      ```
+      Assistant: Reading both.
+      Tool (Read): ok
+      Tool (Read): ok
+      ```
+
+    - **This is not a wording preference, it is the only pairing information there is.** §68 made two calls in one turn reach the client intact; when the client sends both results back, the assistant side is keyed by `call_a` / `call_b` and the result side carried nothing, so the two result lines were **byte-identical**. The model cannot tell which output answers which call — and the gateway also gave it a directive (`[Tool Result for <id>]`) that matched nothing it could see. The third of three renderers was the only one that disagreed, which is this file's recurring defect class (§43/§62/§88: one fact, one rendering) applied to the one field that closes the agent loop.
+    - **The fix is the id when there is one, and the honest fallback when there is not**: `call_id` present ⇒ `[Tool Result for <id>]`; absent ⇒ `[Tool Result] (name)`, and never a fabricated id — inventing one would send the model looking for a call it cannot see. The name is only available on the id-less path when the client itself supplied `name`, because the reverse lookup (`_tool_call_id_map`) is keyed by id; that asymmetry is now stated in the test rather than left as an unwritten assumption.
+    - **Three pre-existing assertions pinned the old shape and were corrected to the new contract, not weakened around it.** `tests/test_tool_roundtrip.py::test_tool_message_carries_its_name` had `assert "Tool (Bash):" in prompt`; its docstring's actual subject — *"the upstream must not see a nameless output"* — is now satisfied more strongly by the id, so the case asserts both branches (id present ⇒ `[Tool Result for call_abc123]`; id absent + client-supplied name ⇒ `[Tool Result] (Bash)`). `test_empty_tool_result_is_still_reported` and `tests/test_agent_loop.py::test_openai_two_round_loop` asserted `"Tool (Bash)"` / `"Tool (Read)"` and now assert the contract marker. This is the same treatment §45 gave the two stale `test_server.py` cases and §63 gave `test_healing.py`.
+    - Pinned by `tests/test_tool_result_pairing.py` (4 cases, the 92nd file in the glob), verified **per case** on a pristine `HEAD` worktree (`git worktree add /tmp/pair_base HEAD`), each with its own measured message rather than a shared first-case failure: case 1 `实测结果行仍是 'Tool (Read): ...' 形状`, case 2 `同一个工具的两条并行结果在提示词里完全相同，模型无法区分它们来自哪次调用: ['Tool (Read): ok', 'Tool (Read): ok']`, case 3 `工具契约要求模型识别 '[Tool Result for <id>]'，但它回传的历史里从来没有这个形状`, and case 4 GREEN by design (the zero-regression guard: `(empty result)` and an id-less `"loose output"` must both survive). Full glob sweep `failures: 0 / 92`; both real binaries re-run green afterwards:
+      ```
+      claude: PASS (exit=0, bodies=3, tool_ran=True, tool=Bash,         tool_markers=2/2, conversation_reused=True)
+      codex:  PASS (exit=0, bodies=3, tool_ran=True, tool=exec_command, tool_markers=2/2, conversation_reused=True)
+      ```

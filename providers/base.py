@@ -264,7 +264,24 @@ def _message_line(m: dict, id_map: dict) -> Optional[str]:
         label = "Assistant"
     elif role == "tool":
         name = m.get("name") or id_map.get(m.get("tool_call_id") or "", "")
-        label = f"Tool ({name})" if name else "Tool"
+        call_id = m.get("tool_call_id") or ""
+        # [TOOL-LOOP] 结果必须带上它的 call_id，且必须用**工具契约里承诺的那个
+        # 标记——契约第 5 条写着「收到 `[Tool Result for <id>]` 后继续」，而这里
+        # 曾经渲染成 `Tool (Read): ok`：没有 id，且形状与契约不同。
+        #
+        # 并行调用同一个工具时这不是措辞问题：两次结果在提示词里逐字节相同
+        # （实测 `Tool (Read): ok` ×2），模型无从判断哪条配哪次调用，agent 循环
+        # 在第二次往返时断掉。Anthropic（`[Tool Result for toolu_1]:`）与
+        # Responses（`[Tool Result for c1]:`）两条历史路径一直是这个形状，这里是
+        # 第三条——同一份契约的第三种渲染（§43/§62/§88 的同一纪律）。
+        if call_id:
+            label = f"[Tool Result for {call_id}]"
+            # Anthropic 的 `is_error` 在 Chat 协议里没有对应字段；客户端若用
+            # 文本标注失败（`[Tool Error …]` 前缀），提示词折叠那边已经认得它。
+        else:
+            # 没有 id 时保留工具名：名称仍能提供上下文，而伪造一个 id 会让模型
+            # 去找一次它看不到的调用。`[Tool Result]` 与 §88 的无 id 分支同形。
+            label = "[Tool Result]" + (f" ({name})" if name else "")
         # 工具执行成功但无输出时也要让模型知道它跑过了，否则会重复调用。
         content = content or "(empty result)"
     else:

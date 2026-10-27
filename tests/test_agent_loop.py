@@ -133,7 +133,9 @@ def test_openai_two_round_loop():
     assert '"name": "Read"' in prompt, prompt
     assert '"/etc/hosts"' in prompt, prompt
     assert "call_abc" in prompt, "调用 id 必须保留，否则工具结果无法与调用对应"
-    assert "Tool (Read)" in prompt, f"工具结果没有标明对应工具:\n{prompt}"
+    assert "[Tool Result for call_abc]" in prompt, (
+        f"工具结果必须用契约承诺的标记带上它的调用 id:\n{prompt}"
+    )
     assert "127.0.0.1 localhost" in prompt, prompt
     print("test_openai_two_round_loop: PASSED")
 
