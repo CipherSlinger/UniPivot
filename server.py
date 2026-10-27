@@ -1456,13 +1456,29 @@ async def health():
     dispatchable_map = {}
     for p_name, p_info in providers_status.items():
         try:
-            gate_ok = bool(
-                failover_router.evaluate_dispatch_gate(p_name)["dispatchable"]
-            )
+            gate = failover_router.evaluate_dispatch_gate(p_name)
         except Exception:  # noqa: BLE001 - 就绪面不得因单个节点判定失败而整体不可用
-            gate_ok = False
+            gate = {}
+        gate_ok = bool(gate.get("dispatchable", False))
         is_ok = bool(configured_map.get(p_name, False)) and gate_ok
         p_info["dispatchable"] = is_ok
+        # [HEALTH-SURFACE] 把闸门**自己的**结论原样带出去，而不是只给一个布尔位。
+        #
+        # `dispatchable` 是一个布尔，布尔丢掉了唯一让运维能行动的信息：「被哪一道闸门
+        # 拦住、要等多久、该做什么」。丢掉之后，每一个消费方只能自己从 `status` /
+        # `in_cooldown` / `*_configured` 反推——前端就是这么做的，实测把
+        # `dispatchable=false, blocked_by="disabled"` 的节点渲染成「健康在线」并计入
+        # 「健康」总数。这是 OPT-032/033/035（预演/档案在派发事实上说谎）的同一类缺陷，
+        # 换到了**用户真正盯着的那块屏幕**上：运维看到绿灯，而派发边界对同一个节点
+        # 一律拒绝。判据只有一份（`evaluate_dispatch_gate`），这里只是把它说出来。
+        p_info["blocked_by"] = str(gate.get("blocked_by", "") or "")
+        p_info["blocked_cause"] = str(gate.get("cause", "") or "")
+        try:
+            p_info["blocked_remaining_seconds"] = round(
+                float(gate.get("remaining_seconds") or 0.0), 1
+            )
+        except (TypeError, ValueError):
+            p_info["blocked_remaining_seconds"] = 0.0
         dispatchable_map[p_name] = is_ok
 
     if any(dispatchable_map.values()):
@@ -1666,10 +1682,24 @@ async def get_diagnostics():
         # 的诊断输出是 `status: ok`，与 `/health` 的 `degraded` 直接矛盾。同一个部署
         # 在两个就绪面上说两种话，运维只能靠猜。
         try:
-            gate_ok = bool(failover_router.evaluate_dispatch_gate(p_name)["dispatchable"])
+            gate = failover_router.evaluate_dispatch_gate(p_name)
         except Exception:  # noqa: BLE001 - 单节点判定失败不得让整份诊断不可用
-            gate_ok = False
-        providers_diag[p_name]["dispatchable"] = bool(configured) and gate_ok
+            gate = {}
+        providers_diag[p_name]["dispatchable"] = bool(configured) and bool(
+            gate.get("dispatchable", False)
+        )
+        # [HEALTH-SURFACE] 与 `/health` 同源同字段：本函数下面那句「详见各节点
+        # dispatchable / blocked_by」曾经指向一个**不存在的字段**——只有布尔位，
+        # 成因、剩余时长、该做什么全被丢掉了，于是任何消费方（前端、运维、脚本）
+        # 都只能从 `status`/`in_cooldown` 反推，而反推必然漂移。
+        providers_diag[p_name]["blocked_by"] = str(gate.get("blocked_by", "") or "")
+        providers_diag[p_name]["blocked_cause"] = str(gate.get("cause", "") or "")
+        try:
+            providers_diag[p_name]["blocked_remaining_seconds"] = round(
+                float(gate.get("remaining_seconds") or 0.0), 1
+            )
+        except (TypeError, ValueError):
+            providers_diag[p_name]["blocked_remaining_seconds"] = 0.0
 
     # 2. 三级对等能力环 (reasoning, flagship, speed) 与模型列表
     capability_rings = []

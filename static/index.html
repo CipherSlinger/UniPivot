@@ -3612,6 +3612,107 @@ async function loadDiagnosticsData() {
   }
 }
 
+/* ==== MESH-VERDICT-BEGIN ====
+ * [HEALTH-SURFACE] 面板上的「健康」必须就是派发闸门的结论，不是对它的推测。
+ *
+ * 这里原本是四条启发式分支（`in_cooldown` → 熔断 / `recovering` → 自愈 /
+ * `degraded` → 降级 / **`else if (isConfigured)` → 健康在线**）。最后那条兜底
+ * 是缺陷所在：`isConfigured` 只回答「本机有没有这个节点的凭证」，与「这条请求会不会
+ * 被派发过去」是两件事。实测（/tmp 下的忠实复刻，跑在 node 上）：
+ *
+ *     operator-disabled  -> healthy        健康在线   summary="1 健康 · 0 熔断避让"
+ *     quarantine lease   -> circuit_broken 已熔断避让  summary="0 健康 · 1 熔断避让"
+ *     long avoidance     -> circuit_broken 已熔断避让  summary="0 健康 · 1 熔断避让"
+ *
+ * 第一行的节点被 `DISABLED_PROVIDERS` 显式排除，派发边界一律拒绝它，屏幕上却是绿灯；
+ * 后两行的原因完全不同（一个是人工声明、一个是被平台封了），却共用同一个不透明的
+ * 标签，运维无从知道该等 15 秒、等 3 天，还是去跑 login.py。
+ *
+ * 因此判据收束为一处：读 `/health` 给出的 `dispatchable` 与 `blocked_by`（它们直接来自
+ * `evaluate_dispatch_gate()`，唯一的一份闸门定义）。**不可派发的节点永远不允许显示为
+ * 健康**——这条不变量由 tests/test_health_surface.py 以属性断言覆盖每个节点状态。
+ *
+ * 纯函数、无 DOM 依赖，测试从这对标记之间原样抽出并交给 node 执行。
+ */
+function formatSpan(seconds) {
+  const s = Math.max(0, Math.round(Number(seconds) || 0));
+  if (s >= 86400) {
+    const d = s / 86400;
+    return `${Number.isInteger(d) ? d : d.toFixed(1)} 天`;
+  }
+  if (s >= 3600) {
+    const h = s / 3600;
+    return `${Number.isInteger(h) ? h : h.toFixed(1)} 小时`;
+  }
+  if (s >= 60) return `${Math.round(s / 60)} 分钟`;
+  return `${s} 秒`;
+}
+
+function providerVerdict(pInfo, isConfigured, isHealing) {
+  const info = pInfo || null;
+  const blockedBy = (info && info.blocked_by) || "";
+  const dispatchable = Boolean(info) && info.dispatchable === true;
+  const remSeconds = Number((info && info.blocked_remaining_seconds) || 0);
+
+  if (!info) {
+    return {
+      statusClass: "offline",
+      statusLabel: isConfigured ? "状态未知" : "离线 / 待配置",
+      dispatchable: false,
+      hint: isConfigured ? "尚未取到该节点状态" : "本机没有该节点的凭证，先运行 login.py 登录",
+    };
+  }
+
+  // 1. 派发闸门说不可派发：只有这里能给出具体成因，也绝不能落到下面的「健康」分支。
+  if (!dispatchable) {
+    switch (blockedBy) {
+      case "credential_outage":
+        return { statusClass: "circuit_broken", statusLabel: "整环凭证失效", dispatchable: false,
+                 hint: "所有节点的凭证都已失效，运行 .venv/bin/python login.py all 重新登录" };
+      case "disabled":
+        return { statusClass: "circuit_broken", statusLabel: "运维禁用", dispatchable: false,
+                 hint: "DISABLED_PROVIDERS 显式排除了该节点（重新登录无用，改配置才生效）" };
+      case "quarantine":
+        return { statusClass: "circuit_broken", statusLabel: `封禁租约中 · 剩 ${formatSpan(remSeconds)}`, dispatchable: false,
+                 hint: "账号级封禁租约：重新登录无用，只能等平台解除或在 /v1/admin/quarantine 撤销" };
+      case "long_avoidance":
+        return { statusClass: "circuit_broken", statusLabel: `长效避让中 · 剩 ${formatSpan(remSeconds)}`, dispatchable: false,
+                 hint: "连续被风控拦截后的长时间避让：到 /v1/admin/risk 查看成因与处置建议" };
+      case "unconfigured":
+        return { statusClass: "offline", statusLabel: "离线 / 待配置", dispatchable: false,
+                 hint: "本机没有该节点的凭证，运行 .venv/bin/python login.py <provider> 扫码登录" };
+      default:
+        return { statusClass: "offline", statusLabel: "不可派发", dispatchable: false,
+                 hint: "派发闸门拒绝了该节点，明细见 /v1/admin/dispatch-audit" };
+    }
+  }
+
+  // 2. 可派发：以下都只是「可用但不完美」，不能反过来把结论说成不可用。
+  if (isHealing || info.status === "recovering") {
+    return { statusClass: "recovering", statusLabel: "自愈修复中", dispatchable: true, hint: "" };
+  }
+  if (info.status === "degraded") {
+    return { statusClass: "degraded", statusLabel: "故障 / 降级", dispatchable: true, hint: "" };
+  }
+  if (info.in_cooldown) {
+    const rem = Number(info.remaining_cooldown || info.remaining_cooldown_seconds || 0);
+    return { statusClass: "degraded", statusLabel: `短冷却 · 可兜底 (剩 ${formatSpan(rem)})`, dispatchable: true,
+             hint: "短冷却按设计只降权不阻断，环内无其它可用节点时仍会兜底派发" };
+  }
+  return { statusClass: "healthy", statusLabel: "健康在线", dispatchable: true, hint: "" };
+}
+
+function summarizeMesh(verdicts) {
+  let ok = 0;
+  let blocked = 0;
+  for (const v of verdicts || []) {
+    if (v && v.dispatchable) ok++;
+    else blocked++;
+  }
+  return `${ok} 可派发 · ${blocked} 不可派发`;
+}
+/* ==== MESH-VERDICT-END ==== */
+
 /**
  * 渲染五大 Provider 卡片列表
  */
@@ -3620,46 +3721,28 @@ function renderDiagnosticsCards(data) {
   const healing = data.healing || {};
   const runningTasks = healing.running_tasks || {};
 
-  // 更新顶栏摘要
-  let healthyCount = 0;
-  let brokenCount = 0;
-  let healingCount = healing.active_count || Object.keys(runningTasks).length;
+  // 更新顶栏摘要：只数真正可派发的节点（见 providerVerdict 的说明）
+  const healingCount = healing.active_count || Object.keys(runningTasks).length;
 
-  for (const meta of MESH_PROVIDERS) {
-    const pInfo = providers[meta.key];
-    const isConfigured = Boolean(data[meta.key + "_configured"]);
-    if (pInfo && pInfo.in_cooldown) brokenCount++;
-    else if (pInfo && pInfo.status === "healthy" || (isConfigured && (!pInfo || pInfo.status !== "offline"))) healthyCount++;
-  }
+  const verdicts = MESH_PROVIDERS.map((meta) =>
+    providerVerdict(providers[meta.key], Boolean(data[meta.key + "_configured"]), Boolean(runningTasks[meta.key]))
+  );
 
-  $("meshTopCount").textContent = `${healthyCount} 健康 · ${brokenCount} 熔断避让`;
+  $("meshTopCount").textContent = summarizeMesh(verdicts);
   $("meshHealingCount").textContent = `${healingCount} 任务运行中`;
 
   let cardsHtml = "";
 
-  for (const meta of MESH_PROVIDERS) {
+  for (let idx = 0; idx < MESH_PROVIDERS.length; idx++) {
+    const meta = MESH_PROVIDERS[idx];
     const pKey = meta.key;
     const pInfo = providers[pKey] || {};
     const isConfigured = Boolean(data[pKey + "_configured"]);
 
-    // 1. 健康状态判定 (健康 / 已熔断 / 故障)
-    let statusClass = "offline";
-    let statusLabel = "离线 / 待配置";
-    const rawStatus = pInfo.status || (isConfigured ? "healthy" : "offline");
-
-    if (pInfo.in_cooldown || (pInfo.remaining_cooldown && pInfo.remaining_cooldown > 0)) {
-      statusClass = "circuit_broken";
-      statusLabel = "已熔断避让";
-    } else if (rawStatus === "recovering" || Boolean(runningTasks[pKey])) {
-      statusClass = "recovering";
-      statusLabel = "自愈修复中";
-    } else if (rawStatus === "degraded") {
-      statusClass = "degraded";
-      statusLabel = "故障 / 降级";
-    } else if (rawStatus === "healthy" || isConfigured) {
-      statusClass = "healthy";
-      statusLabel = "健康在线";
-    }
+    // 1. 健康状态判定：单一判据（派发闸门的 dispatchable / blocked_by）
+    const verdict = verdicts[idx];
+    const statusClass = verdict.statusClass;
+    const statusLabel = verdict.statusLabel;
 
     // 2. 风控等级判定 (高风控 / 普通)
     const riskLevel = pInfo.risk_level || meta.defaultRisk;
@@ -3668,16 +3751,27 @@ function renderDiagnosticsCards(data) {
     const riskLabel = isHighRisk ? "高风控" : "普通";
 
     // 3. 冷却状态与动态倒计时
+    // 只有**短冷却**（闸门仍说可派发）才配秒级倒计时：它几分钟内就会到期，秒数是
+    // 有信息量的。被硬阻断的节点（租约 / 长效避让 / 禁用）等的是小时到天，甚至等的
+    // 根本不是时间（要改配置、要人扫码），对它每秒刷一次数字既无意义又会误导成
+    // 「等着就好」。
     const inCooldown = Boolean(pInfo.in_cooldown);
     const remSeconds = Number(pInfo.remaining_cooldown || pInfo.remaining_cooldown_seconds || 0);
     let cooldownHtml = "";
 
-    if (inCooldown && remSeconds > 0) {
+    if (!verdict.dispatchable) {
+      delete activeCooldownDeadlines[pKey];
+      cooldownHtml = `
+        <div class="mesh-cooldown-info">
+          <span>派发状态:</span>
+          <span class="mesh-cooldown-timer">⛔ ${escapeHtml(verdict.hint || "该节点不会被派发")}</span>
+        </div>`;
+    } else if (inCooldown && remSeconds > 0) {
       activeCooldownDeadlines[pKey] = Date.now() + remSeconds * 1000;
       cooldownHtml = `
         <div class="mesh-cooldown-info">
           <span>冷却状态:</span>
-          <span class="mesh-cooldown-timer">⏳ 冷却避让中 (剩余 <span id="cd_timer_${pKey}">${remSeconds.toFixed(1)}s</span>)</span>
+          <span class="mesh-cooldown-timer">⏳ 短冷却中 (剩余 <span id="cd_timer_${pKey}">${remSeconds.toFixed(1)}s</span>)</span>
         </div>`;
       startCooldownTicker();
     } else {
