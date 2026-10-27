@@ -38,7 +38,7 @@ from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator, model_validator
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from providers import (
@@ -538,6 +538,50 @@ class ChatMessage(BaseModel):
     role: str
     content: Optional[Union[str, List[dict]]] = None
 
+    @model_validator(mode="after")
+    def _normalize_legacy_function_call(self):
+        """[TOOL-LOOP] 上一代 `function_call` / `role:"function"` 归一化到现行形状。
+
+        `ChatMessage` 只有 `extra="allow"`，所以一代之前的两条写法——assistant
+        的 `function_call` 与 `role:"function"` 的结果消息——被静默收进
+        `model_extra` 之后**没有任何代码读过**。实测（真实 HTTP 路径）：
+
+            User: go
+            Function: a.py b.py
+            Assistant:
+
+        assistant 的调用段落**整段消失**（`_serialize_tool_calls` 只认
+        `tool_calls`），结果则落进 `_role_labels` 的兜底 `role.capitalize()`，
+        渲染成一句无主的独白——工具名与 id 都丢了。这与 §43/§45「assistant 的
+        工具调用从历史里消失」是同一缺陷，只是字段名早了一代。
+
+        归一化而不是第二条渲染路径：转成 `tool_calls` / `role:"tool"` 之后，
+        提示词、白名单、解析全部复用既有实现，一个特殊分支都不需要。
+        """
+        if self.role == "assistant" and not self.model_extra.get("tool_calls"):
+            legacy = self.model_extra.get("function_call")
+            if isinstance(legacy, dict) and legacy.get("name"):
+                # id 由网关合成：旧协议没有 id，但下游的
+                # `[Tool Result for <id>]` 契约需要一个。同一份历史里
+                # `role:"function"` 消息按工具名找回来（见下）。
+                self.model_extra["tool_calls"] = [{
+                    "id": f"call_{legacy['name']}",
+                    "type": "function",
+                    "function": {
+                        "name": legacy["name"],
+                        "arguments": legacy.get("arguments") or "{}",
+                    },
+                }]
+        elif self.role == "function":
+            # `role:"function"` -> `role:"tool"`。`name` 保留：找不到 id 时
+            # `_message_line` 用它渲染 `[Tool Result] (name)`——名称仍能提供
+            # 上下文，而伪造一个 id 会让模型去找一次它看不到的调用。
+            self.role = "tool"
+            name = self.model_extra.get("name")
+            if isinstance(name, str) and name.strip():
+                self.model_extra["tool_call_id"] = f"call_{name.strip()}"
+        return self
+
 
 class ChatCompletionRequest(BaseModel):
     model_config = ConfigDict(extra="allow")
@@ -565,6 +609,54 @@ class ChatCompletionRequest(BaseModel):
     # 此前它只被 `extra="allow"` 收着、没有任何代码读过（§35 的「解析了然后没人用」）。
     reasoning_effort: Optional[str] = None
     search: bool = False
+
+    @model_validator(mode="after")
+    def _normalize_legacy_functions(self):
+        """[TOOL-LOOP] 上一代 `functions` / `function_call` 归一化到现行字段。
+
+        实测（真实 HTTP 路径，脚本化 provider）：
+
+            functions+function_call   status=200 promptlen=2
+            prompt: 'go'   tools_section: False
+
+        工具声明从未进入提示词，模型不知道它有一个叫 `Bash` 的工具，因此永远
+        不会调用它——HTTP 200、内容正常、没有任何错误可看。`function_call`
+        同样落在 `model_extra` 里没人读，于是 `function_call:"none"` 这个
+        「本回合禁止调用」的约束也完全失效（§34b 的缺陷在旧字段上重演）。
+
+        归一化而非第二条实现：写回 `tools` / `tool_choice` 之后，提示词注入、
+        解析白名单、并行裁剪、去重指纹全部复用既有路径，`req.tools` 的 20 个
+        消费点无需任何改动。
+
+        **现行写法优先**：两代同时出现说明客户端有意为之，现行写法是更新的
+        意图；把旧字段合并进来会让一个现代客户端的工具集凭空变多。`tools`
+        缺席时才由 `functions` 补齐——这是「只加不减」的安全方向。
+        """
+        if not self.tools:
+            legacy = self.model_extra.get("functions")
+            if isinstance(legacy, list) and legacy:
+                # 不需要额外展平：旧版 `functions` 的条目是裸的
+                # `{name, description, parameters}`，没有 `type` 字段，因此
+                # `flatten_namespace_tools` 对它们恒为直通。给它加上一层展平只会
+                # 变成一句什么都不做的注释——本项目记录得最多的就是这种「声称做了
+                # 某事、实际没有」的代码。
+                self.tools = [
+                    {"type": "function", "function": f}
+                    for f in legacy
+                    if isinstance(f, dict) and f.get("name")
+                ] or None
+        if self.tool_choice is None:
+            legacy_choice = self.model_extra.get("function_call")
+            # `"auto"` / `"none"` 是同一个字符串枚举；`{"name": X}` 等价于
+            # `{"type": "function", "function": {"name": X}}`。
+            if isinstance(legacy_choice, str):
+                self.tool_choice = legacy_choice
+            elif isinstance(legacy_choice, dict) and legacy_choice.get("name"):
+                self.tool_choice = {
+                    "type": "function",
+                    "function": {"name": legacy_choice["name"]},
+                }
+        return self
 
     @field_validator("tools")
     @classmethod
