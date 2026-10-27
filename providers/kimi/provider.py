@@ -294,11 +294,11 @@ class KimiProvider:
                         raise ProviderError("Kimi 网页端限流或人机验证阻断", status=429, err_type="rate_limit_error")
                     if resp.status_code != 200:
                         detail = (await read_error_body(resp))[:300]
-                        err_type, is_risk = classify_stream_status(resp.status_code)
+                        err_type, keep_status = classify_stream_status(resp.status_code)
                         raise ProviderError(
                             f"Kimi 上游请求失败: HTTP {resp.status_code}"
                             + (f" {detail}" if detail else ""),
-                            status=resp.status_code if is_risk else 502,
+                            status=resp.status_code if keep_status else 502,
                             err_type=err_type,
                         )
 

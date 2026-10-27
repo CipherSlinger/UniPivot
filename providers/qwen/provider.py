@@ -249,7 +249,7 @@ class QwenProvider:
                         # 401/403/429 也保持原始状态码，交给风控账本分级。
                         if resp.status_code >= 400:
                             detail = await read_error_body(resp)
-                            err_type, is_risk = classify_stream_status(resp.status_code)
+                            err_type, keep_status = classify_stream_status(resp.status_code)
                             if resp.status_code == 401:
                                 msg = (
                                     "通义千问票据无效或已过期，请运行 "
@@ -263,7 +263,7 @@ class QwenProvider:
                                 msg += f" {detail[:300]}"
                             raise ProviderError(
                                 msg,
-                                status=resp.status_code if is_risk else 502,
+                                status=resp.status_code if keep_status else 502,
                                 err_type=err_type,
                             )
 
@@ -387,11 +387,11 @@ class QwenProvider:
                     detail = (await e.response.aread()).decode("utf-8", errors="replace")[:300]
                 except Exception:  # noqa: BLE001
                     detail = ""
-                err_type, is_risk = classify_stream_status(e.response.status_code)
+                err_type, keep_status = classify_stream_status(e.response.status_code)
                 raise ProviderError(
                     f"通义千问上游请求失败: {e.response.status_code}"
                     + (f" {detail}" if detail else ""),
-                    status=e.response.status_code if is_risk else 502,
+                    status=e.response.status_code if keep_status else 502,
                     err_type=err_type,
                 )
             except httpx.HTTPError as e:

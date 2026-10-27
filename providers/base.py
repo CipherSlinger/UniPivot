@@ -571,20 +571,43 @@ def error_response(
 # ratelimit），而不是塌成一个通用 502。
 _RISK_STATUS_HINTS = {401: "auth_error", 403: "waf_blocked", 429: "rate_limit_error"}
 
+# [REQUEST-REJECT] 这些状态码说的是「这条**请求**我不接受」，与节点健康无关：
+# 400 参数/结构不合法、413 请求体超长（长会话的上下文超限）、422 语义不合法
+# 或内容被策略拒绝。
+#
+# 它们和 5xx 的处置必须相反。5xx 是「这个节点坏了」——换一个节点可能就好了，
+# 所以故障转移、记失败、上冷却是对的。4xx 是「这句话上游不接受」——换五个节点
+# 只会把同一份请求**再发五遍**，而每一次都是一个带真实凭证的上游触点，正是
+# 风控线存在的理由要消灭的「自动化客户端」签名（见 H7 / OPT-025 的重试风暴）。
+# 同时这些节点什么都没做错，把它们写进冷却会让后续请求无谓地绕开健康节点。
+#
+# 状态码本身就是充分的事实，不需要去猜 body：这三类之间不存在「可能是这个也
+# 可能是那个」的模糊地带。
+_REQUEST_REJECT_STATUSES = frozenset({400, 413, 422})
+
 
 def classify_stream_status(status: int) -> tuple[str, bool]:
-    """返回 (err_type, is_risk)。`is_risk` 为真时调用方应保留原始状态码。
+    """返回 (err_type, keep_status)。
 
-    401 / 403 / 429 是风控线的输入：认证失效要触发凭证续期与（可能）封禁推断，
-    403 是 WAF/Cloudflare 拦截，429 是限流或人机验证。把它们统一报成 502 会让
-    账本失去严重度分级——对 DeepSeek（本部署里已被封禁的那一家）尤其致命，
-    因为它的 403 正是避让逻辑存在的理由。
+    三种语义，不是一个梯度：
+
+      * `keep_status=True` + 风控 err_type（auth_error / waf_blocked /
+        rate_limit_error）：账号被拦下了。401 要触发凭证续期与（可能）封禁推断，
+        403 是 WAF/Cloudflare 拦截，429 是限流或人机验证。塌成 502 会让账本
+        失去严重度分级——对 DeepSeek（本部署里已被封禁的那一家）尤其致命。
+      * `keep_status=True` + `invalid_request`：请求被拒绝（400/413/422）。保留
+        原始 4xx，客户端才知道「重发同一份请求没有意义」。
+      * `keep_status=False` + `upstream_error`：节点故障，报 502 并走故障转移。
+
+    第二项曾经叫 `is_risk`，但它唯一的作用就是决定状态码是否保留（调用点全是
+    `status=resp.status_code if X else 502`）——名字里带着「风控」会让后来的人
+    以为 `invalid_request` 不保留状态码，故改名为它实际表达的东西。
     """
     hint = _RISK_STATUS_HINTS.get(status)
     if hint:
         return hint, True
-    if status >= 500:
-        return "upstream_error", False
+    if status in _REQUEST_REJECT_STATUSES:
+        return "invalid_request", True
     return "upstream_error", False
 
 

@@ -115,7 +115,7 @@ class DeepSeekProvider:
         """
         if r.status_code < 400:
             return
-        err_type, is_risk = classify_stream_status(r.status_code)
+        err_type, keep_status = classify_stream_status(r.status_code)
         detail = (r.text or "").strip()[:300]
         if r.status_code == 401:
             msg = "DeepSeek token 无效或已过期，请重新获取"
@@ -125,7 +125,7 @@ class DeepSeekProvider:
             msg = f"DeepSeek {what}失败: {r.status_code}"
         if detail:
             msg += f" {detail}"
-        raise ProviderError(msg, status=r.status_code if is_risk else 502, err_type=err_type)
+        raise ProviderError(msg, status=r.status_code if keep_status else 502, err_type=err_type)
 
     async def _create_chat_session(self, client: httpx.AsyncClient) -> str:
         r = await client.post(BASE + SESSION_CREATE, json={}, headers=self._headers())
@@ -210,11 +210,11 @@ class DeepSeekProvider:
                     # 已被封禁的那一家）尤其致命：Cloudflare 403 正是避让逻辑的输入。
                     if resp.status_code >= 400:
                         detail = await read_error_body(resp)
-                        err_type, is_risk = classify_stream_status(resp.status_code)
+                        err_type, keep_status = classify_stream_status(resp.status_code)
                         raise ProviderError(
                             f"DeepSeek 上游请求失败: {resp.status_code}"
                             + (f" {detail[:300]}" if detail else ""),
-                            status=resp.status_code if is_risk else 502,
+                            status=resp.status_code if keep_status else 502,
                             err_type=err_type,
                         )
 
@@ -229,11 +229,11 @@ class DeepSeekProvider:
                     detail = (await e.response.aread()).decode("utf-8", errors="replace")[:300]
                 except Exception:  # noqa: BLE001
                     detail = ""
-                err_type, is_risk = classify_stream_status(e.response.status_code)
+                err_type, keep_status = classify_stream_status(e.response.status_code)
                 raise ProviderError(
                     f"DeepSeek 上游请求失败: {e.response.status_code}"
                     + (f" {detail}" if detail else ""),
-                    status=e.response.status_code if is_risk else 502,
+                    status=e.response.status_code if keep_status else 502,
                     err_type=err_type,
                 )
             except httpx.HTTPError as e:

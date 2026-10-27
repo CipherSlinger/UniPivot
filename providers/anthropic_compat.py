@@ -1530,6 +1530,11 @@ _ERR_TYPE_MAP = {
     # 部署侧而非上游侧。归入 authentication_error，客户端因此会提示「需重新认证」
     # 而不是「上游过载，稍后重试」，而后者正是对这件事最无用的建议。
     "unconfigured": "authentication_error",
+    # [REQUEST-REJECT] 上游拒绝了**这一条请求**（400/413/422）：不是节点故障，也不是
+    # 风控拦截，而是请求本身不合法。Anthropic 枚举里恰好有语义完全对应的一类。
+    # 必须显式登记，不能依赖 `_STATUS_ERROR_MAP`：它只覆盖 400，413/422 会一路掉到
+    # 兜底的 `api_error`——客户端于是看到一个「未知错误」，而它其实完全可读、可修。
+    "invalid_request": "invalid_request_error",
 }
 
 

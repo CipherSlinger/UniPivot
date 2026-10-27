@@ -3697,6 +3697,39 @@ class FailoverRouter:
                 # 继续往后故障转移（后续候选同样没有份额）。直接如实上抛。
                 if getattr(exc, "zero_upstream", False):
                     raise
+                # [REQUEST-REJECT] 上游的 4xx（400/413/422）拒绝的是**请求体**，不是
+                # 节点健康。落进下面的记账分支会造成三件事，每一件本项目都单独
+                # 记录过、都够严重：
+                #   1. 故障转移 —— 换一家厂商会把同一份请求**再发一遍**，一次被
+                #      拒绝的请求因此产生五次带真实凭证的上游触点，正是 H7 /
+                #      OPT-025 反复记录并消灭的「自动化客户端」签名；
+                #   2. `record_failure` —— 节点什么都没做错却被记冷却与失败计数，
+                #      后续请求被无谓地绕开（[BUDGET-3]/[BUDGET-4] 的「我们家自己的
+                #      判断被写成了上游的罪状」）；
+                #   3. 报错写成「环内所有节点均已尝试且全部失效」—— 运维会去查
+                #      网络和上游，而真正该改的是客户端发来的那条请求。
+                # 因此这里在记账与选候选**之前**如实上抛：保留上游原始状态码，
+                # 让客户端立刻知道「重发同一份请求没有意义」。
+                if getattr(exc, "err_type", "") == "invalid_request":
+                    status_code = getattr(exc, "status", 400)
+                    err_msg = str(getattr(exc, "message", str(exc)))
+                    logger.warning(
+                        "[对等互备网格] 上游拒绝请求（请求级，非节点故障）: [%s:%s] -> HTTP %s: %s",
+                        curr_provider_key,
+                        curr_wire_model,
+                        status_code,
+                        err_msg,
+                    )
+                    raise ProviderError(
+                        f"上游拒绝了这次请求（HTTP {status_code}）：{err_msg}\n"
+                        f"这是**请求级**失败，不是节点故障：网关已停止故障转移"
+                        f"（换一个节点只会把同一份请求再发一遍），也没有给 "
+                        f"[{curr_provider_key}] 记冷却或失败计数。"
+                        f"请检查请求本身——上下文长度、字段结构、内容策略——"
+                        f"修改后重新发送。",
+                        status=status_code,
+                        err_type="invalid_request",
+                    ) from exc
                 if primary_exc is None:
                     primary_exc = exc
                 status_code = getattr(exc, "status", 502)

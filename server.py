@@ -1465,7 +1465,20 @@ _DETERMINISTIC_REFUSAL_ERR_TYPES = {
     # 为 None 的路径不会走到这里——见 failover 里 `err_type == "upstream_timeout"`
     # 且「环已耗尽」的那个分支）。
     "upstream_timeout",
+    # [REQUEST-REJECT] 上游拒绝了**这一条请求**（400/413/422）。与上面四个不同的是，
+    # 它并非零上游——真的打了一个节点，那一个节点给出的答案就是最终答案。但「确定性」
+    # 是同一个结论：**同一份请求体**再发一次，无论发给谁，都只会被同样地拒绝（上下文
+    # 超限、字段不合法、内容被策略拒绝，都不是抖动）。客户端原地重试只会把一次被拒
+    # 的请求变成「5 家 × N 次」的自动重试签名。
+    #
+    # 这是本集合里唯一允许出现在 4xx 上的成员，`_is_deterministic_refusal` 的
+    # `status < 500` 守卫因此改为「按集合判定，4xx 也放行」（见下方）。
+    "invalid_request",
 }
+
+# 4xx 里可以带「重试无用」信号的唯一一类。其余 4xx（含 401 以外的鉴权类）语义各不
+# 相同，不在此处一并改写。
+_DETERMINISTIC_REFUSAL_4XX = {"invalid_request"}
 
 # 退避秒数：取「最快可能自愈的那一档」，不复述最长的那一档。
 # 凭证失效由人重登解除（通常几分钟内），封禁租约是天级——按最长的报会让一次刚好的
@@ -1476,10 +1489,17 @@ _REFUSAL_RETRY_AFTER_MAX_SECONDS = int(os.getenv("GATEWAY_REFUSAL_RETRY_AFTER_MA
 
 
 def _is_deterministic_refusal(status: int, err_type: Optional[str]) -> bool:
-    """本次拒绝是否属于「网关已确定、重试无用」的零上游拒绝。"""
-    if status < 500:
-        return False
-    return (err_type or "") in _DETERMINISTIC_REFUSAL_ERR_TYPES
+    """本次拒绝是否属于「网关已确定、重试无用」的拒绝。
+
+    判据是**集合成员**，不是状态码区间。`status < 500 → False` 这个守卫曾经等价于
+    集合成员判定（当时集合里全是 5xx），但它表达的是「4xx 一律不算」，于是
+    [REQUEST-REJECT] 的 400 一旦进了集合就会被它悄悄挡掉——测试看着集合是对的，
+    行为却没有发生。4xx 只承认显式列在 `_DETERMINISTIC_REFUSAL_4XX` 里的那一类。
+    """
+    err_type = err_type or ""
+    if status >= 500:
+        return err_type in _DETERMINISTIC_REFUSAL_ERR_TYPES
+    return err_type in _DETERMINISTIC_REFUSAL_4XX
 
 
 def _refusal_headers(exc: ProviderError) -> dict:
@@ -1499,6 +1519,14 @@ def _refusal_headers(exc: ProviderError) -> dict:
     status, err_type = exc.status, exc.err_type
     if not _is_deterministic_refusal(status, err_type):
         return {}
+    # [REQUEST-REJECT] 请求被拒绝这一类**不发 `Retry-After`**，这是本函数唯一的例外，
+    # 理由是它和其余成员的方向相反：那些都在等一个**会自己到期**的窗口（租约、冷却、
+    # 凭证失效），等待是唯一正确的动作；而 400/413/422 的修复方**就是客户端自己**，
+    # 改完立刻就能发。给它一个 600 秒的倒计时等于告诉用户「先等十分钟，虽然你现在
+    # 就能改」——§54 的教训是「时长必须是真实的窗口，不是一个常量」，这里真实的
+    # 窗口是**零**。抑制重试仍然要靠 `x-should-retry: false`，那一个必须有。
+    if err_type == "invalid_request":
+        return {"x-should-retry": "false"}
     if exc.retry_after is not None:
         seconds = exc.retry_after
     else:
