@@ -3757,7 +3757,17 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                     in_text_block = False
                     block_idx += 1
 
-                output_tokens = max(1, _est_tokens("".join(streamer.accumulated_text)))
+                # [THINKING-TURN] 思考增量不进 accumulated_text（它不参与工具解析），
+                # 但它**确实**是这一回合产出的 tokens，三条路径必须同一口径：非流式
+                # 与非工具流式都计入思考，这里曾经漏掉，于是 agent 最常走的工具回合
+                # 上报的成本少了整段推理，且与同一份输出的非流式响应自相矛盾。
+                output_tokens = max(
+                    1,
+                    _est_tokens(
+                        "".join(streamer.accumulated_text)
+                        + "".join(streamer.accumulated_reasoning)
+                    ),
+                )
 
                 if tool_list:
                     _tool_healing_stats["total_tool_calls"] += len(tool_list)
@@ -4001,7 +4011,8 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
     blocks: list[dict] = []
     # [PROTOCOL] display=omitted：思考照常参与 usage 与思考通道兜底，只是不进
     # 响应体——客户端会把它存进历史，下一轮再发回来。
-    if full_thinking and not suppress_thinking:
+    thinking_block_emitted = bool(full_thinking) and not suppress_thinking
+    if thinking_block_emitted:
         blocks.append({"type": "thinking", "thinking": full_thinking})
 
     if req.tools:
@@ -4047,7 +4058,14 @@ async def anthropic_messages(req: AnthropicMessagesRequest):
                 headers=resp_headers if resp_headers else None,
             )
 
-    if full_output or not full_thinking:
+    # [THINKING-TURN] 空正文块不是可选装饰：客户端要求至少一个内容块。原判据
+    # `full_output or not full_thinking` 的前提是「思考块已经发出去了，所以
+    # 正文为空也行」；display=omitted 抑制思考块后前提不再成立，整条只写在思考
+    # 通道里的回合就变成 `content: []` + end_turn + 非零 usage —— 客户端看到的
+    # 是「正常结束、什么都没有」的助手回合，既没有回答也没有错误。判据改为
+    # 「思考块是否**真的**发出去了」，与上面追加思考块用的是同一个事实；流式
+    # 路径本来就补空正文块，两个传输由此给出同一个骨架。
+    if full_output or not thinking_block_emitted:
         blocks.append({"type": "text", "text": full_output})
 
     msg_data = anthropic_message_response(
