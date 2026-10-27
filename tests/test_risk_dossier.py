@@ -57,6 +57,7 @@ from providers.risk_dossier import (  # noqa: E402
     POSTURE_LONG_AVOIDANCE,
     POSTURE_PROBATION,
     POSTURE_QUARANTINED,
+    POSTURE_UNCONFIGURED,
     POSTURE_WATCH,
     RiskDossier,
 )
@@ -364,9 +365,10 @@ def test_diagnostics_and_admin_endpoint_exposure():
         summary = diag["risk_dossier_summary"]
         assert "posture_counts" in summary
         assert set(summary["posture_counts"]) == {
-            POSTURE_QUARANTINED, POSTURE_DISABLED, POSTURE_LONG_AVOIDANCE,
+            POSTURE_QUARANTINED, POSTURE_DISABLED, POSTURE_UNCONFIGURED,
+            POSTURE_LONG_AVOIDANCE,
             POSTURE_COOLING, POSTURE_PROBATION, POSTURE_WATCH, POSTURE_CLEAR
-        }, "姿态词表新增成员时必须同步更新此断言（OPT-035 新增 disabled）"
+        }, "姿态词表新增成员时必须同步更新此断言（OPT-035 新增 disabled，[READINESS] 新增 unconfigured）"
 
         r = TestClient(srv.app).get("/v1/admin/risk")
         assert r.status_code == 200, r.text

@@ -56,23 +56,53 @@ class _FakeSession:
 
 
 def _patch_resolvers(mapping):
-    """把五个 resolver 顶掉，返回还原函数。
+    """把五个 resolver 在**每一层**顶掉，返回还原函数。
 
     真实机器上 `session/*.json` 是存在的（本机就有一个被封禁的 DeepSeek），所以
     「全新克隆」不能靠「文件不存在」来构造，必须显式顶替——否则这个套件在本机能过、
     在 CI 上行为不同，正是本项目反复记录的「开发机的状态决定测试结果」。
+
+    [READINESS] 必须顶掉**三层**，不是一层。`session_store._PROVIDER_RESOLVERS`
+    在 import 时就把五个 resolver 函数抓进了字典，`health_monitor.register_provider()`
+    同样抓了一份；只有 `server.py` 里的模块级 `resolve_*` 名字是运行时可替换的。
+    早先这个 helper 只顶替 `srv.resolve_*`，而 `_configured()` 现在委托给
+    `session_store.is_configured()`——也就是读**第二层**——于是 helper 会静默失效：
+    套件仍然「通过」，但它测的是本机磁盘，不是它声称的场景。三层一起顶，
+    这个 helper 才对得起它自己的名字。
     """
     import server as srv
+    import session_store
 
-    saved = {pk: getattr(srv, f"resolve_{pk}") for pk in PROVIDERS}
+    saved_module = {pk: getattr(srv, f"resolve_{pk}") for pk in PROVIDERS}
+    saved_store = dict(session_store._PROVIDER_RESOLVERS)
+    saved_monitor = dict(srv.health_monitor._provider_resolvers)
+
+    def _resolver_for(pk):
+        return (lambda v=mapping[pk]: v) if pk in mapping else (lambda: None)
+
     for pk in PROVIDERS:
-        setattr(srv, f"resolve_{pk}", lambda: None)
-    for pk, value in mapping.items():
-        setattr(srv, f"resolve_{pk}", (lambda v=value: v))
+        setattr(srv, f"resolve_{pk}", _resolver_for(pk))
+        session_store._PROVIDER_RESOLVERS[pk] = _resolver_for(pk)
+        srv.health_monitor._provider_resolvers[pk] = _resolver_for(pk)
 
     def restore():
-        for pk, fn in saved.items():
+        for pk, fn in saved_module.items():
             setattr(srv, f"resolve_{pk}", fn)
+        session_store._PROVIDER_RESOLVERS.clear()
+        session_store._PROVIDER_RESOLVERS.update(saved_store)
+        srv.health_monitor._provider_resolvers.clear()
+        srv.health_monitor._provider_resolvers.update(saved_monitor)
+        # 探针缓存里的 configured 位是上一次探针的结论，顶替后必须重算
+        for pk in PROVIDERS:
+            state = srv.health_monitor._states.get(pk)
+            if state is None:
+                continue
+            fn = saved_store.get(pk)
+            try:
+                sess = fn() if fn else None
+            except Exception:  # noqa: BLE001 - 还原不改变被测行为
+                sess = None
+            state.configured = bool(sess and getattr(sess, "token", None))
 
     return restore
 
@@ -184,6 +214,13 @@ def test_health_dispatchable_agrees_with_the_single_gate():
         restore = _patch_resolvers(mapping)
         try:
             body = _health().json()
+            # 闸门现在读凭证（[READINESS]），所以期望值必须在**顶替窗口内**求值：
+            # 还原之后再问闸门，问的是开发机上的真实磁盘，而不是本场景。
+            expected = {
+                pk: bool(body.get(f"{pk}_configured"))
+                and bool(srv.failover_router.evaluate_dispatch_gate(pk)["dispatchable"])
+                for pk in PROVIDERS
+            }
         finally:
             restore()
             for k in env:
@@ -191,7 +228,7 @@ def test_health_dispatchable_agrees_with_the_single_gate():
 
         for pk in PROVIDERS:
             configured = bool(body.get(f"{pk}_configured"))
-            expect = configured and bool(srv.failover_router.evaluate_dispatch_gate(pk)["dispatchable"])
+            expect = expected[pk]
             got = body["providers"][pk].get("dispatchable")
             assert got == expect, (
                 f"[{name}] {pk}: /health 报 dispatchable={got!r}，"

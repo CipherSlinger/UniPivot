@@ -1253,6 +1253,12 @@ _DETERMINISTIC_REFUSAL_ERR_TYPES = {
     "disabled",            # [OPT-033] 运维禁用且环内无可用节点
     "quarantined",         # [OPT-021] 运维封禁租约
     "ring_exhausted",      # [OPT-031] 整环长效避让
+    # [READINESS] 整环都没有配置凭证。同样是**确定性**结论：没有凭证时，再派发一次
+    # 也只会在本地构造 provider 时失败，零上游调用。而它的解法是**人**去执行
+    # `login.py`——没有会自动到期的窗口，所以客户端最不该做的就是原地重试。
+    # 这正是整条 [H6]/[H7] 退避信号存在的理由，只是成因从「上游拒绝」换成了
+    # 「部署尚未完成」。
+    "unconfigured",
     # [H7] 环内节点全部尝试且全部握手超时。这是**环已经走完**的结论，同一个环
     # 再走一遍不会得到不同答案。实测（真实 Claude Code，五节点全挂，唯一变量是
     # 响应头）：仅 504 → 240s 内 8 次请求；加 `x-should-retry:false` → 18s/2 次。
@@ -1387,9 +1393,21 @@ _STATIC_DIR = Path(__file__).resolve().parent / "static"
 _REPORTS_DIR = Path(__file__).resolve().parent / "reports"
 
 
-def _configured(resolver) -> bool:
-    s = resolver()
-    return bool(s and s.token)
+def _configured(provider_key: str) -> bool:
+    """[READINESS] 「本机是否配置了该节点的凭证」——委托给 `session_store` 的**唯一**判据。
+
+    这里原本是 `s = resolver(); bool(s and s.token)`，即「是否已配置」的**第二份实现**；
+    而 `session_store.is_configured()` 与 `providers/failover.py` 的派发闸门读的是第一份。
+    同一份配置有两处读法必然漂移——本文件反复记录的缺陷形状（OPT-033 的
+    `DISABLED_PROVIDERS`、OPT-034 的 `HealthMonitor.is_disabled` 都是同一个病）。
+
+    尤须注意**失败方向**：`session_store.is_configured` 的约定是「判定失败按已配置处理」
+    （保守），而派生实现会让一次磁盘故障把已配置的节点报成未配置，进而让就绪面误报
+    降级。收束到一处，失败方向就随之统一。
+    """
+    from session_store import is_configured
+
+    return bool(is_configured(provider_key))
 
 
 @app.get("/health")
@@ -1426,7 +1444,7 @@ async def health():
     # 短软冷却仍是 demote-only，闸门对它答 True，就绪面因此照旧报 ok——与「环内全冷却
     # 时允许最后一搏」的可用性语义逐值一致。
     configured_map = {
-        pk: _configured(resolver) for pk, resolver in (
+        pk: _configured(pk) for pk, _resolver in (
             ("qwen", resolve_qwen), ("deepseek", resolve_deepseek),
             ("doubao", resolve_doubao), ("kimi", resolve_kimi), ("glm", resolve_glm),
         )
@@ -1492,11 +1510,11 @@ async def health():
         "singleflight": {
             "active_flights": _sf_diag["active_flights"],
         },
-        "qwen_configured": _configured(resolve_qwen),
-        "deepseek_configured": _configured(resolve_deepseek),
-        "doubao_configured": _configured(resolve_doubao),
-        "kimi_configured": _configured(resolve_kimi),
-        "glm_configured": _configured(resolve_glm),
+        "qwen_configured": _configured("qwen"),
+        "deepseek_configured": _configured("deepseek"),
+        "doubao_configured": _configured("doubao"),
+        "kimi_configured": _configured("kimi"),
+        "glm_configured": _configured("glm"),
         "providers": providers_status,
         "healing": healing_status,
     }
@@ -1587,7 +1605,12 @@ async def get_diagnostics():
         in_cd = failover_router.cooldown_tracker.is_in_cooldown(p_name)
         rem_cd = failover_router.cooldown_tracker.get_remaining_cooldown(p_name)
         consec_fails = p_state.get("consecutive_failures", 0)
-        configured = p_state.get("configured", False)
+        # [READINESS] 「本机有没有凭证」一律向 `session_store.is_configured` 求值，
+        # 而不是读健康探针缓存下来的 `p_state["configured"]`。后者只有在探针跑过之后
+        # 才成立（`ProviderHealth.configured` 默认为 False），于是重启后、首次探针之前，
+        # 一个**已经配好凭证**的节点会被诊断面报成未配置——诊断面的事实必须以此刻为准，
+        # 不能以「上一次探针说了什么」为准。
+        configured = _configured(p_name)
         raw_status = p_state.get("status", "offline")
         is_disabled = p_name in disabled_set
 
@@ -1631,6 +1654,18 @@ async def get_diagnostics():
             "last_check": p_state.get("last_check", 0.0),
             "last_error": p_state.get("last_error"),
         }
+
+        # [READINESS] 逐节点 `dispatchable`：与 `/health` **逐字同一口径**
+        # （`configured and evaluate_dispatch_gate().dispatchable`），因为这两个面
+        # 回答的是同一个问题「此刻能不能把这个节点派发出去」。此前诊断面根本没有这一格，
+        # 而它把顶层 `status` 硬编码成 "ok"——于是全新克隆（session/ 为空、五家全无凭证）
+        # 的诊断输出是 `status: ok`，与 `/health` 的 `degraded` 直接矛盾。同一个部署
+        # 在两个就绪面上说两种话，运维只能靠猜。
+        try:
+            gate_ok = bool(failover_router.evaluate_dispatch_gate(p_name)["dispatchable"])
+        except Exception:  # noqa: BLE001 - 单节点判定失败不得让整份诊断不可用
+            gate_ok = False
+        providers_diag[p_name]["dispatchable"] = bool(configured) and gate_ok
 
     # 2. 三级对等能力环 (reasoning, flagship, speed) 与模型列表
     capability_rings = []
@@ -1765,8 +1800,36 @@ async def get_diagnostics():
         },
     }
 
+    # [READINESS] 顶层 `status` 由**真的能服务**决定，而不是恒为 "ok"。
+    #
+    # 实测（本机，`session/` 只有 .gitkeep）：诊断面报 `status: "ok"`，同时五个节点
+    # 全无凭证、`/health` 同一刻报 `degraded`。同一个部署在两个就绪面上说两种话，
+    # 而诊断面是运维排查时先打开的那一张。派生规则与 `/health` 完全一致：只要有一个
+    # 节点真的可以被派发就是 ok，否则 degraded 并说明成因——「为什么不能服务」比
+    # 「不能服务」有用得多。
+    dispatchable_providers = sorted(pk for pk, v in providers_diag.items() if v["dispatchable"])
+    if dispatchable_providers:
+        diag_status, diag_status_reason = "ok", ""
+    else:
+        diag_status = "degraded"
+        missing = sorted(pk for pk, v in providers_diag.items() if not v["configured"])
+        if len(missing) == len(providers_diag):
+            diag_status_reason = (
+                "没有任何节点持有凭证：请执行 `.venv/bin/python login.py all` 完成登录，"
+                "或为对应厂商设置 *_AUTH_TOKEN 环境变量"
+            )
+        elif missing:
+            diag_status_reason = (
+                f"无可用节点（缺少凭证: {', '.join(missing)}）；"
+                f"其余节点均被派发闸门阻断，详见各节点 dispatchable / blocked_by"
+            )
+        else:
+            diag_status_reason = "所有节点均被派发闸门阻断（禁用 / 租约 / 长效避让），详见各节点状态"
+
     return {
-        "status": "ok",
+        "status": diag_status,
+        "status_reason": diag_status_reason,
+        "dispatchable_providers": dispatchable_providers,
         "timestamp": time.time(),
         "disabled_providers": sorted(list(disabled_set)),
         "load_balancer": lb_stats,

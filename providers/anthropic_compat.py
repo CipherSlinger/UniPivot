@@ -1379,6 +1379,11 @@ _ERR_TYPE_MAP = {
     # 本次请求零上游调用拒绝派发：与 quarantined 同属「服务当下无法承接该请求」，
     # 故同样映射到 overloaded_error。
     "disabled": "overloaded_error",
+    # [READINESS] 本机没有任何该厂商的凭证（全新克隆 / 尚未 login）：与
+    # `credential_outage` 同族——网关确实无法用当前凭证完成认证，区别只是成因在
+    # 部署侧而非上游侧。归入 authentication_error，客户端因此会提示「需重新认证」
+    # 而不是「上游过载，稍后重试」，而后者正是对这件事最无用的建议。
+    "unconfigured": "authentication_error",
 }
 
 

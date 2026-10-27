@@ -26,6 +26,12 @@ os.environ["QWEN_AUTH_TOKEN"] = "fake_qwen"
 os.environ["DEEPSEEK_AUTH_TOKEN"] = "fake_ds"
 os.environ["DOUBAO_AUTH_TOKEN"] = "fake_doubao"
 
+# [DAY-ZERO] 派发闸门要求节点持有凭证；本套件只给了 qwen/deepseek/doubao，
+# 而失败转移相关的用例会走到 kimi，于是以 `unconfigured` 结束、断言拿不到 failover 信息。
+os.environ["KIMI_AUTH_TOKEN"] = "fake_kimi"
+os.environ["GLM_AUTH_TOKEN"] = "fake_glm"
+
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 import server as srv  # noqa: E402

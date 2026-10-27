@@ -45,6 +45,14 @@ os.environ["GATEWAY_DISABLE_CREDENTIAL_WATCH"] = "1"
 os.environ["GATEWAY_DISABLE_CREDENTIAL_RENEWAL"] = "1"
 os.environ["GATEWAY_DISABLE_DEVICE_IDENTITY"] = "1"
 
+# [DAY-ZERO] 派发闸门现在有一道「本机有没有凭证」的硬阻断。本套件的上游全是内存假节点，
+# 与凭证无关；但不摆出凭证的话，请求会在进入被测逻辑之前就以 `unconfigured` 返回，
+# 于是套件测的变成一道与它无关的闸门（实测：期望 504，实得 503 unconfigured）。
+# 给五个节点摆上假 token，让被测对象真的是被测对象。
+for _pk in ("QWEN", "DEEPSEEK", "DOUBAO", "KIMI", "GLM"):
+    os.environ[f"{_pk}_AUTH_TOKEN"] = f"test-token-{_pk.lower()}"
+
+
 from fastapi.testclient import TestClient  # noqa: E402
 
 import server as srv  # noqa: E402

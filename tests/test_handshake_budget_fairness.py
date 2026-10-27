@@ -39,6 +39,14 @@ os.environ["GATEWAY_DISABLE_CREDENTIAL_WATCH"] = "1"
 os.environ["GATEWAY_DISABLE_CREDENTIAL_RENEWAL"] = "1"
 os.environ["GATEWAY_DISABLE_DEVICE_IDENTITY"] = "1"
 
+# [DAY-ZERO] 本套件用内存里的假上游驱动 `execute_chat`，与凭证毫无关系；但派发闸门
+# 现在有一道「本机有没有凭证」的硬阻断。不摆出凭证的话，请求会在进入预算逻辑之前
+# 就以 `unconfigured` 返回（实测：`第一个候选超时后请求直接失败（unconfigured）`），
+# 于是这个套件测的不再是预算，而是一道与它无关的闸门。给五个节点摆上假 token，
+# 让被测对象真的是被测对象。
+for _pk in ("QWEN", "DEEPSEEK", "DOUBAO", "KIMI", "GLM"):
+    os.environ[f"{_pk}_AUTH_TOKEN"] = f"test-token-{_pk.lower()}"
+
 from providers.failover import FailoverRouter, ProviderError  # noqa: E402
 
 

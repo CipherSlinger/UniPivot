@@ -408,8 +408,33 @@ def _unconfigured_cooldown() -> float:
         return 60.0
 
 
+def _unconfigured_gate_disabled() -> bool:
+    """[READINESS] `GATEWAY_DISABLE_UNCONFIGURED_GATE=1` 关闭闸门的这一格。
+
+    与其它机制的开关同构（`GATEWAY_DISABLE_QUARANTINE`/`..._LONG_AVOIDANCE_FAST_FAIL`
+    /`..._CREDENTIAL_WATCH`）：一个结论一旦进入派发边界，就必须有一条明确的退回路径，
+    否则任何以「无凭证节点」为前置条件的诊断或测试都会失去原来的语义。关闭后完全退回
+    旧行为——无凭证节点照旧被派发到本地构造失败为止。
+    """
+    return os.getenv("GATEWAY_DISABLE_UNCONFIGURED_GATE", "") == "1"
+
+
 class CooldownTracker:
     """动态冷却与避让跟踪器"""
+
+    # [READINESS] 派发闸门的门名清单——**唯一**定义。
+    #
+    # 顺序就是判定的顺序（见 `FailoverRouter.evaluate_dispatch_gate`）：前四道关乎节点
+    # 自身状态与环级事实，第五道 `unconfigured` 是纯本地的配置缺口，排在最后。
+    # 直方图的初值与 `clear()` 的复位都从这里派生，所以新增一道闸门只需改这一行；
+    # 上一版把同一张表写了两遍，加第五道时就漏掉了复位那一份。
+    _DISPATCH_GATE_NAMES = (
+        "credential_outage",
+        "disabled",
+        "quarantine",
+        "long_avoidance",
+        "unconfigured",
+    )
 
     def __init__(self):
         # 禁用提供方配置 (从环境变量 DISABLED_PROVIDERS 读取，逗号分隔，如 "deepseek,glm")
@@ -507,11 +532,11 @@ class CooldownTracker:
         }
         # 闸门拒绝计数：blocked_by -> 次数。使「哪一道闸门在承担拒载」可观测，
         # 而不是只能从日志里翻。
+        # 闸门名只有一份定义：初值与 `clear()` 的复位都从 `_DISPATCH_GATE_NAMES`
+        # 派生。上一版把同一张表写了两遍，新增第五道闸门时就漏掉了复位那一份——
+        # 「同一个事实在两处定义」是本文件反复记录的缺陷形状。
         self._dispatch_gate_stats: Dict[str, int] = {
-            "credential_outage": 0,
-            "disabled": 0,
-            "quarantine": 0,
-            "long_avoidance": 0,
+            name: 0 for name in self._DISPATCH_GATE_NAMES
         }
         # [OPT-022] 避让解除后的「恢复观察期」(probation) 状态
         # provider -> 冷却 episode 的预计结束时间戳（解除后据此判定观察期）
@@ -762,7 +787,10 @@ class CooldownTracker:
         """[OPT-034] 后台触点避让门控诊断。"""
         return {
             "blocked_by_cause": dict(self._touch_block_stats),
-            "causes": ["disabled", "quarantined", "cooldown"],
+            # [READINESS] `unconfigured` 必须列出来：`touch_avoidance_reason()` 早已会
+            # 返回它（未配置的节点不该被探针/刷新/会话回收/自愈选举触碰），而这里漏报
+            # 会让运维读到一份「成因只有三种」的诊断，从而以为那个节点的成因是别的。
+            "causes": ["disabled", "quarantined", "unconfigured", "cooldown"],
         }
 
     def get_remaining_cooldown(self, provider_key: str) -> float:
@@ -2128,10 +2156,7 @@ class CooldownTracker:
             "last_redirect": "",
         }
         self._dispatch_gate_stats = {
-            "credential_outage": 0,
-            "disabled": 0,
-            "quarantine": 0,
-            "long_avoidance": 0,
+            name: 0 for name in self._DISPATCH_GATE_NAMES
         }
         # [OPT-034] 后台触点拒载直方图同样复位（它不是持久状态，只是本轮观测）
         self._touch_block_stats = {}
@@ -2381,6 +2406,7 @@ class FailoverRouter:
         1. 排除当前排除集（已尝试失败过的 Provider 以及被主动禁用的 Provider）
         2. [OPT-021] 排除处于运维长期封禁租约的节点（硬阻断，除非显式放行）
         3. [OPT-031] 排除处于**长效避让**（升级后的长冷却，小时~天级）的节点
+        3b. [READINESS] 排除**本机未配置凭证**的节点（纯本地判据，见 `session_store.is_configured`）
         4. 健康节点排在冷却避让中节点之前
         5. 健康节点中：低风险 (LOW) > 中风险 (MEDIUM) > 高风险 (HIGH)
         6. 同等风险下，按历史失败次数升序排列
@@ -2413,6 +2439,20 @@ class FailoverRouter:
             # 上游已连续拦截过多次；把它留在候选里等于给风暴留了一条通道）。
             # 短冷却不受影响：它小于阈值，因此这里恒为 False，降级排序语义不变。
             if not include_long_avoidance and self.cooldown_tracker.is_in_long_avoidance(p_key):
+                continue
+
+            # [READINESS] 本机没有该节点凭证时，它同样不是候选：派发过去只会在本地
+            # 构造 provider 时失败（零上游调用、零信息量），却让客户端为每个环成员
+            # 白付一次尝试。与前三者同为**硬阻断**，不是降级——短冷却等的是一个会自动
+            # 到期的窗口，而这里是等一个人去完成登录。
+            #
+            # [READINESS] 必须受同一个总开关约束。第一版只把这个判断加在候选过滤里、
+            # 开关只判在 `evaluate_dispatch_gate()` 里，于是
+            # `GATEWAY_DISABLE_UNCONFIGURED_GATE=1` 关掉的是闸门而不是候选集：
+            # 实测 `gate(qwen) -> dispatchable True` 而
+            # `get_fallback_candidates("qwen","Qwen") -> []`——开关报「已关闭」，
+            # 行为却没有回到旧样子，正是本项目反复记录的「开关本身说谎」。
+            if not _unconfigured_gate_disabled() and not _provider_is_configured(p_key):
                 continue
 
             meta = PROVIDER_RISK_SPECS.get(p_key)
@@ -2471,11 +2511,72 @@ class FailoverRouter:
            的可用性检查里生效，派发边界本身不予理会，于是「绕开负载均衡那条路」就能把
            请求送进被显式禁用的节点；
         3. `quarantine`（运维/自动租约，OPT-020/021/027）；
-        4. `long_avoidance`（升级后长冷却，OPT-031）。
+        4. `long_avoidance`（升级后长冷却，OPT-031）；
+        5. `unconfigured`（本机没有任何该厂商的凭证，[READINESS]）。
 
         长短软冷却**刻意不在此列**：短冷却按 OPT-021 的语义保持 demote-only，环内全冷却时
         仍允许最后一搏，可用性优先。
+
+        **[READINESS] 为什么 `unconfigured` 是第五道硬阻断，而不是又一次记录**：
+
+        在这条闸门之前，「本机没有凭证」确实已经被识别出来了——但识别点全都在**下游**：
+        `record_failure` 会给它记一个 60 秒的 `unconfigured` 冷却，`touch_avoidance_reason`
+        会向下游报告成因，档案里有 `AVOIDANCE_MATRIX["unconfigured"]` 一行。而**派发
+        边界本身**（就是这里）没有这一格，于是全新克隆的第一次请求照样逐个实例化五个
+        Provider、逐个在本地抛 `ProviderError(401)`，走完整个环才把 401 交给客户端。
+        实测（本机 `session/` 只有 `.gitkeep`）：
+
+            /health            -> degraded（已正确）      ← [HEALTH-TRUTH] 修过
+            /v1/diagnostics    -> ok，且节点没有 dispatchable 字段
+            dispatch-audit     -> predicted_primary_dispatchable: True, 5/5 可派发
+            /v1/admin/risk     -> 五个节点 posture=clear dispatchable=True
+            真实 POST          -> 401, x-should-retry 缺失, 本地构造了 ['qwen','glm','doubao','kimi','deepseek']
+
+        三个「预览面」一致地说可以派发，真实派发却说不行——这正是 OPT-031/035 记录过的
+        缺陷类型（预演/档案在派发事实上说谎），只是成因从「长效避让」「运维禁用」换成了
+        「这张机器上根本没有凭证」。因此判据必须落在**唯一**的闸门定义处：只要一个谓词
+        定义在这里，`execute_chat`、`audit_dispatch`、`/health`、档案、就绪面就都自动一致，
+        而不需要五处各自补一个 `if`。
+
+        措辞与语义上的分寸：无凭证**不是**风控结论，也不是运维声明——它不是「这个节点被
+        平台封了」或「这次部署不用它」，而是「这台机器还没登录过」。所以它排在最后（前三道
+        都是关于节点本身状态的判断，更重），且它**是硬阻断**：被派发只会得到一次纯本地的
+        构造失败，零上游调用、零信息量，却让每个客户端请求白付一次环遍历。与短软冷却的
+        差别也在这里——短冷却等一个会自动到期的窗口，无凭证等一个**必须由人完成**的动作，
+        没有窗口可等。
         """
+        if _unconfigured_gate_disabled():
+            return self._evaluate_dispatch_gate_core(provider_key, outage_active)
+        gate = self._evaluate_dispatch_gate_core(provider_key, outage_active)
+        if gate["blocked_by"]:
+            return gate
+        # 前四道都没开火，才有必要问这一格：它是整条闸门里唯一**纯本地**的判据
+        # （不读冷却、不读租约、不读台账），没凭证的节点被派发也只会得到一次本地
+        # 构造失败，零上游调用。
+        try:
+            configured = _provider_is_configured(provider_key)
+        except Exception:  # noqa: BLE001 - 判定失败一律按「已配置」，绝不误阻断
+            configured = True
+        if not configured:
+            gate["dispatchable"] = False
+            gate["blocked_by"] = "unconfigured"
+            gate["cause"] = "unconfigured"
+            # 无凭证是「等人登录」，不是「等窗口到期」：没有会自动到期的时长可报。
+            # 若该节点恰好已有一个 unconfigured 短冷却（下游 record_failure 记下的），
+            # 那才是真实窗口；[H6] 的规矩是报真实的那个，而不是编一个倒计时。
+            try:
+                gate["remaining_seconds"] = float(
+                    self.cooldown_tracker.get_remaining_cooldown(provider_key)
+                )
+            except Exception:  # noqa: BLE001
+                gate["remaining_seconds"] = 0.0
+            return gate
+        return gate
+
+    def _evaluate_dispatch_gate_core(
+        self, provider_key: str, outage_active: Optional[bool] = None
+    ) -> Dict[str, Any]:
+        """闸门的前四道（环级失效 → 运维禁用 → 租约 → 长效避让）。"""
         if outage_active is None:
             try:
                 outage_active = bool(self.cooldown_tracker.credential_watch.is_outage_active())
@@ -2547,6 +2648,10 @@ class FailoverRouter:
             info["in_long_avoidance"] = bool(self.cooldown_tracker.is_in_long_avoidance(provider_key))
         except Exception:  # noqa: BLE001
             pass
+        try:
+            info["unconfigured"] = not _provider_is_configured(provider_key)
+        except Exception:  # noqa: BLE001 - 判定失败一律按「已配置」
+            info["unconfigured"] = False
         try:
             cooldown = float(self.cooldown_tracker.get_remaining_cooldown(provider_key))
         except Exception:  # noqa: BLE001
@@ -2620,6 +2725,7 @@ class FailoverRouter:
                     "disabled": bool(info.get("disabled")),
                     "quarantined": bool(info.get("quarantined")),
                     "in_long_avoidance": bool(info.get("in_long_avoidance")),
+                    "unconfigured": bool(info.get("unconfigured")),
                     "remaining_cooldown_seconds": info.get("remaining_cooldown_seconds", 0.0),
                 }
             )
@@ -2649,6 +2755,11 @@ class FailoverRouter:
             "disabled": "disabled",
             "quarantine": "quarantined",
             "long_avoidance": "ring_exhausted",
+            # [READINESS] 无凭证是一个**确定的、零上游的**结论：节点被派发也只会在本地
+            # 构造 provider 时失败。它与其它三道一样属于「不必再走一遍环」的终局，因此
+            # 有资格进 `_DETERMINISTIC_REFUSAL_ERR_TYPES` 并带上 `x-should-retry: false`
+            # ——否则客户端会对一个需要人登录的环无限重试（[H7] 的退避风暴）。
+            "unconfigured": "unconfigured",
         }
         if outage_active:
             err_type: Optional[str] = "credential_outage"
@@ -2672,8 +2783,8 @@ class FailoverRouter:
             "ring_members": members,
             "scope_note": (
                 "仅预演**闸门**决定（全环凭证失效 / 运维禁用 DISABLED_PROVIDERS / 运维与自动"
-                "租约 / 长效避让），零上游调用；不含负载均衡分流与会话亲和固定，最终承接节点"
-                "可能与 predicted_redirect_target 不同。"
+                "租约 / 长效避让 / 无凭证），零上游调用；不含负载均衡分流与会话亲和固定，"
+                "最终承接节点可能与 predicted_redirect_target 不同。"
             ),
         }
 
@@ -2896,6 +3007,14 @@ class FailoverRouter:
         ring = classify_capability_ring(primary_provider_key, primary_wire_model)
         tried_providers: Set[str] = set()
         composite_errors: List[str] = []
+
+        # [BUDGET-2] 整条请求里是否**真的**有一次尝试被预算天花板截断。环走完时的
+        # 报错要据此决定是否提「预算分摊」——只有它确实参与了判决时才提。
+        # 实测反例：五个节点全是本地 401（没有任何超时），报错却告诉运维
+        # 「握手总预算 180s 已按剩余候选公平分摊……请调大 GATEWAY_HANDSHAKE_BUDGET」，
+        # 把一个与本请求无关的旋钮指给了运维。诊断信息里的每一句都必须由本请求
+        # 的真实证据支持，这与本项目反复修正的「报文不得替代码说话」是同一件事。
+        _budget_was_capped = False
 
         curr_provider_key = primary_provider_key
         curr_wire_model = primary_wire_model
@@ -3123,6 +3242,66 @@ class FailoverRouter:
                 self.cooldown_tracker.note_long_avoidance_redirect(curr_provider_key, next_cand.provider_key)
                 logger.warning(
                     "[长效避让硬阻断] 改派: [%s] -> [%s] (模型: %s)",
+                    curr_provider_key,
+                    next_cand.provider_key,
+                    next_cand.wire_model,
+                )
+                curr_provider_key = next_cand.provider_key
+                curr_wire_model = next_cand.wire_model
+                continue
+
+            # [READINESS] 无凭证硬阻断：本机没有任何该厂商的凭证时，派发过去只会在
+            # `_make_provider` 里因「未检测到 … 令牌」而失败——一次**纯本地**的结论，
+            # 零上游调用、零信息量，却让客户端为环内每个成员白付一次尝试。
+            #
+            # 这一格此前是闸门的空白：其它四道都在问「上游是否允许我们用这个节点」，
+            # 没有人问「我们手里到底有没有这个节点的凭证」。于是全新克隆（session/ 为空）
+            # 的网关会宣称自己一切正常（/v1/diagnostics status=ok、预演 5/5 可派发、
+            # 档案五个节点 posture=clear），客户端收到一个没有任何退避信号的 401，
+            # 而真正该做的是去 `login.py`。
+            #
+            # 处置与其它三道一致：先改派，改派不出去才终止请求。硬阻断而非降级，
+            # 因为短冷却等的是一个会自动到期的窗口，这里等的是一个**人**。
+            if gate["blocked_by"] == "unconfigured":
+                logger.error(
+                    "[凭证缺失硬阻断] 节点 [%s] 在本机没有任何凭证，拒绝派发（零上游调用）",
+                    curr_provider_key,
+                )
+                candidates = self.get_fallback_candidates(
+                    primary_provider_key,
+                    primary_wire_model,
+                    excluded_providers=tried_providers,
+                )
+                if not candidates:
+                    unconfigured = sorted(
+                        p for p, _ in RING_DEFINITIONS.get(ring, []) if not _provider_is_configured(p)
+                    )
+                    detail = "、".join(unconfigured) or curr_provider_key
+                    logger.error(
+                        "[凭证缺失硬阻断] 能力环 [%s] 内没有任何已配置凭证的节点 (%s)，零上游调用拒绝派发",
+                        ring.value,
+                        detail,
+                    )
+                    # [H6] 无凭证是「等一个人去登录」，没有会自动到期的窗口——不编造
+                    # 倒计时。但若该节点此刻确实处在一个未配置短冷却里（下游
+                    # `record_failure` 记下的），那才是真实窗口，照实报。
+                    live = 0.0
+                    try:
+                        live = float(self.cooldown_tracker.get_remaining_cooldown(curr_provider_key))
+                    except Exception:  # noqa: BLE001
+                        live = 0.0
+                    raise ProviderError(
+                        f"能力环 [{ring.value}] 内没有任何已配置凭证的节点（未配置: {detail}），"
+                        f"本次请求已拒绝派发（零上游调用）。这与风控拦截无关，是部署尚未完成："
+                        f"请执行 `.venv/bin/python login.py all` 完成扫码登录，"
+                        f"或为对应厂商设置 *_AUTH_TOKEN 环境变量。",
+                        status=503,
+                        err_type="unconfigured",
+                        retry_after=live if live > 0 else None,
+                    )
+                next_cand = candidates[0]
+                logger.warning(
+                    "[凭证缺失硬阻断] 改派: [%s] -> [%s] (模型: %s)",
                     curr_provider_key,
                     next_cand.provider_key,
                     next_cand.wire_model,
@@ -3528,6 +3707,7 @@ class FailoverRouter:
                 # 上游的罪状，正是本项目反复记录的那类谎报。继续故障转移（这次确实
                 # 没拿到首包），但不进冷却、不增失败计数。
                 if _is_budget_capped(exc):
+                    _budget_was_capped = True
                     # 单次不记账（那是诬告），但**连续**被裁短是一条不同的事实：
                     # 「我们在全部可用份额里都没等到首包」。没有这本账，一个挂死的
                     # 节点会在每次请求上重新被白等一整份份额且永不收敛（实测四轮
@@ -3589,7 +3769,11 @@ class FailoverRouter:
                     # 此时报错若只列失败，运维无法区分「预算太小」和「节点真的全挂」，
                     # 也就不知道该调预算还是去查网络。把预算与份额一并写出（仅在预算
                     # 确实参与了本次判决时，否则逐值保持旧文案）。
-                    if deadline is not None:
+                    #
+                    # [BUDGET-2] 判据是「本轮真的有一次被预算截断」，不是「预算开着」：
+                    # 五个节点全是本地 401 时预算根本没参与，旧写法却仍然让运维去调
+                    # `GATEWAY_HANDSHAKE_BUDGET`，把一个无关的旋钮指给了他。
+                    if deadline is not None and _budget_was_capped:
                         report += (
                             f"\n注：握手总预算 {handshake_budget:.0f}s 已按剩余候选公平"
                             f"分摊（每个候选只有其中一份），因此单次超时时间远短于 "

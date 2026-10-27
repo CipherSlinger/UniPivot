@@ -45,6 +45,13 @@ os.environ["GATEWAY_DISABLE_CREDENTIAL_WATCH"] = "1"
 os.environ["GATEWAY_DISABLE_CREDENTIAL_RENEWAL"] = "1"
 os.environ["GATEWAY_DISABLE_DEVICE_IDENTITY"] = "1"
 
+# [DAY-ZERO] 派发闸门有一道「本机有没有凭证」的硬阻断。本套件的上游是内存假节点，
+# 与凭证无关；但不摆出凭证，请求会在进入被测逻辑前就以 `unconfigured` 返回，
+# 套件便不再测它声称要测的东西。五个节点一律摆上假 token。
+for _pk in ("QWEN", "DEEPSEEK", "DOUBAO", "KIMI", "GLM"):
+    os.environ[f"{_pk}_AUTH_TOKEN"] = f"test-token-{_pk.lower()}"
+
+
 from providers.failover import (  # noqa: E402
     FailoverRouter,
     ProviderError,

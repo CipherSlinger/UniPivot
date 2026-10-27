@@ -41,6 +41,7 @@ logger = logging.getLogger("gateway.risk_dossier")
 
 POSTURE_QUARANTINED = "quarantined"
 POSTURE_DISABLED = "disabled"
+POSTURE_UNCONFIGURED = "unconfigured"
 POSTURE_LONG_AVOIDANCE = "long_avoidance"
 POSTURE_COOLING = "cooling"
 POSTURE_PROBATION = "probation"
@@ -51,6 +52,7 @@ POSTURE_CLEAR = "clear"
 POSTURE_ORDER: tuple = (
     POSTURE_QUARANTINED,
     POSTURE_DISABLED,
+    POSTURE_UNCONFIGURED,
     POSTURE_LONG_AVOIDANCE,
     POSTURE_COOLING,
     POSTURE_PROBATION,
@@ -61,6 +63,7 @@ POSTURE_ORDER: tuple = (
 POSTURE_LABELS: Dict[str, str] = {
     POSTURE_QUARANTINED: "长期封禁（硬阻断，零派发）",
     POSTURE_DISABLED: "运维声明出局（DISABLED_PROVIDERS，硬阻断，零派发）",
+    POSTURE_UNCONFIGURED: "本机未配置凭证（硬阻断，零派发；执行 login.py 后自动恢复）",
     POSTURE_LONG_AVOIDANCE: "长效避让（升级后的长冷却，硬阻断，零派发）",
     POSTURE_COOLING: "避让冷却中（自动，时长有界）",
     POSTURE_PROBATION: "恢复观察期（串行探路 + 步调放大）",
@@ -81,6 +84,7 @@ POSTURE_LABELS: Dict[str, str] = {
 POSTURE_DISPATCHABLE: Dict[str, bool] = {
     POSTURE_QUARANTINED: False,
     POSTURE_DISABLED: False,
+    POSTURE_UNCONFIGURED: False,
     POSTURE_LONG_AVOIDANCE: False,
     POSTURE_COOLING: True,
     POSTURE_PROBATION: True,
@@ -337,6 +341,13 @@ class RiskDossier:
             # 「主要症结是频控/认证」会把运维引向重登，而重登对声明出局完全无效。
             verdict_key = "disabled"
             reason = "该节点被运维声明出局（DISABLED_PROVIDERS），非平台风控"
+        elif not self._is_configured(provider_key):
+            # [READINESS] 无凭证也必须先于「按拦截严重度研判」：这样的节点**从未被上游
+            # 看见过**，台账里必然一条记录都没有，于是缺省答案会是「无拦截记录，可正常
+            # 派发」——而它其实连一次请求都发不出去。处置与 disabled 相反：不是改配置，
+            # 而是去登录（`recoverable_by_relogin: True`）。
+            verdict_key = "unconfigured"
+            reason = "本机没有该节点的凭证（部署尚未完成），与平台风控无关"
         else:
             # 取出现次数最多的严重度作为主要症结；无记录则按最轻的 ratelimit。
             by_sev = stats.get("by_severity") or {}
@@ -386,6 +397,19 @@ class RiskDossier:
             return bool(tracker.is_disabled(provider_key))
         except Exception:  # noqa: BLE001 - 判读失败绝不误报「出局」
             return False
+
+    def _is_configured(self, provider_key: str) -> bool:
+        """[READINESS] 本机是否有该节点的凭证（委托给唯一判据；查询失败按「已配置」）。
+
+        失败方向与 `session_store.is_configured` 一致，也是刻意的：一次读取异常绝不能
+        让档案把一个**已配置**的节点报成「未配置」，进而给出「去登录」这条无用建议。
+        """
+        try:
+            from session_store import is_configured
+
+            return bool(is_configured(provider_key))
+        except Exception:  # noqa: BLE001 - 判读失败视作已配置（保守）
+            return True
 
     def _quarantine_state(self, provider_key: str) -> Dict[str, Any]:
         try:
@@ -493,6 +517,20 @@ class RiskDossier:
                 return POSTURE_DISABLED
         except Exception:  # noqa: BLE001 - 判定失败退回既有姿态，绝不误报可用
             pass
+        # [READINESS] 本机没有凭证时派发边界是硬阻断（零上游调用），档案必须与之一致。
+        # 排在「禁用」之后、「长效避让」之前：无凭证是配置缺口，比激进避让更根本——
+        # 一个既无凭证又处于避让的节点，先要让运维知道该去登录。
+        #
+        # 这条不是为了补一个姿态枚举：此前全新克隆（session/ 为空）的档案对五个节点
+        # 一律报 `posture=clear, dispatchable=True`，而真实派发全部在本地构造处失败。
+        # 这正是 OPT-031/035 记录过的同一类谎报，只是成因从「避让/声明」换成了「缺凭证」。
+        try:
+            from session_store import is_configured
+
+            if not is_configured(provider_key):
+                return POSTURE_UNCONFIGURED
+        except Exception:  # noqa: BLE001 - 判定失败退回既有姿态（失败方向：不误报阻断）
+            pass
         # [OPT-031] 升级后的长效避让（小时~天级）在派发边界已被硬阻断，必须先于
         # 「冷却中」判定，否则档案会给出一个可派发、实则零派发的错误姿态。
         try:
@@ -522,6 +560,16 @@ class RiskDossier:
                 "该节点被运维声明出局（DISABLED_PROVIDERS），派发边界对其硬阻断、零上游调用",
                 "如需恢复使用：修改 DISABLED_PROVIDERS 或程序化解除声明后重启网关；重登无效",
                 "解除前先确认该节点本身是否仍处于封禁/人机验证避让，避免把受控节点放回派发路径",
+            ]
+        if posture == POSTURE_UNCONFIGURED:
+            # 与 POSTURE_DISABLED 的处置**相反**：一个是「人改了配置」，一个是「人还没
+            # 登录」。这是本项目反复记录的「把成因混为一谈会让运维去做无用功」——
+            # 对无凭证的节点说「修改 DISABLED_PROVIDERS」是彻底的误导。
+            return [
+                "本机没有该节点的凭证：派发边界对其硬阻断，零上游调用（这与风控无关）",
+                f"如需恢复使用：执行 `.venv/bin/python login.py {provider_key}` 完成扫码登录，"
+                f"或为该厂商设置 *_AUTH_TOKEN 环境变量",
+                "登录后无需重启：下一次请求即会重新问一次凭证（判据是即时的，不缓存）",
             ]
         if posture == POSTURE_QUARANTINED:
             q = entry["quarantine"]
@@ -688,6 +736,9 @@ class RiskDossier:
             # [OPT-035] 逐节点备注：即便姿态被更重的成因（封禁/长效避让）占据，
             # 「运维已声明出局」这一事实仍必须可见——否则运维会以为解除封禁即可恢复派发。
             "disabled": self._is_disabled(provider_key),
+            # [READINESS] 同上：无凭证是「人还没登录」，与「人声明出局」处置相反，
+            # 必须能被分别看见。
+            "unconfigured": not self._is_configured(provider_key),
             "quarantine": self._quarantine_state(provider_key),
             "probation": self._probation_state(provider_key),
             "pacing": self._pacing_state(provider_key),
