@@ -18,7 +18,7 @@ import re
 import threading
 from typing import Any, Dict, List, Optional, Tuple
 
-from .base import _est_tokens, text_of
+from .base import _est_tokens, is_contract_role, text_of
 
 DEFAULT_MAX_TOKENS = 24000
 DEFAULT_PRESERVE_RECENT_TURNS = 4
@@ -404,10 +404,14 @@ class PromptOptimizer:
                 "phase": 0,
             }
 
-        # 1. 提取头部系统提示词 (index 0 及开头连续的 system 消息)
+        # 1. 提取头部系统提示词 (index 0 及开头连续的契约消息)
+        # 判据是 `is_contract_role()`，不是与 "system" 的字面比较：`developer` 是
+        # OpenAI 官方的 system 替代名，同样是「当轮生效的常驻契约」。只认字面量时，
+        # 开头那一整段客户端规则会被当作可折叠的历史内容折叠掉（[SESSION-CONTINUITY]
+        # 第 76 节的反面：那条修的是续聊，这条是折叠）。
         head_indices: List[int] = []
         for i, m in enumerate(messages):
-            if m.get("role") == "system":
+            if is_contract_role(m.get("role")):
                 head_indices.append(i)
             else:
                 break

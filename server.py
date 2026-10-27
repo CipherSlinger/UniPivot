@@ -111,7 +111,7 @@ from providers import (
     sse_done,
     sse_response_error,
 )
-from providers.base import _est_tokens, _id, text_of
+from providers.base import _est_tokens, _id, is_contract_role, text_of
 from providers import http_client
 from providers.disconnect_guard import disconnect_guard, guard_stream
 
@@ -2419,7 +2419,7 @@ async def chat_completions(req: ChatCompletionRequest):
         system_additions.append(fmt_prompt)
     if system_additions:
         block = "\n\n".join(system_additions)
-        if messages and messages[0].get("role") == "system":
+        if messages and is_contract_role(messages[0].get("role")):
             # [PROTOCOL] 客户端的 system content 可以是 parts 列表；直接 f-string
             # 会把它变成 Python repr（`[{'type': 'text', ...}]`），模型在工具契约
             # 前面读到一段既不是指令、也不是它自己语言的噪声。统一走 text_of。

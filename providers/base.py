@@ -13,7 +13,28 @@ import httpx
 
 from .http_client import get_http_client
 
-_ROLE_LABELS = {"system": "System", "user": "User", "assistant": "Assistant"}
+# [SESSION-CONTINUITY] 「这条消息是常驻契约」是一个**判断**，不是散在四处的一次字符串
+# 比较。OpenAI 为 o 系列引入的 `developer` 角色是 `system` 的官方替代名（SDK 的
+# `EasyInputMessage` 直接支持它），语义上同样是「高于用户、当轮生效的指令」；此前网关
+# 只认 `"system"`，于是同一个角色换了个名字就变成未知角色：渲染成上游从未见过的
+# `Developer:`、续聊时不被上提（绑定会话第二轮起整段消失）、折叠时也不受头部保护区
+# 保护。三个后果都没有报错。唯一实现放这里，四个读点（`_ROLE_LABELS`、
+# `continuation_content`、`prompt_optimizer` 的头部保护区、`server.py` 的契约合并落点）
+# 全部读它。
+_CONTRACT_ROLES = frozenset({"system", "developer"})
+
+
+def is_contract_role(role: object) -> bool:
+    """该角色的消息是不是"现在这一刻生效的常驻契约"（system / developer）。"""
+    return str(role or "").strip().lower() in _CONTRACT_ROLES
+
+
+_ROLE_LABELS = {
+    "system": "System",
+    "developer": "System",
+    "user": "User",
+    "assistant": "Assistant",
+}
 
 
 @asynccontextmanager
@@ -289,11 +310,11 @@ def continuation_content(messages: List[dict]) -> str:
     else:
         tail = messages[last_user_idx + 1:]
 
-    # 常驻契约：最后一条 user **之前**的全部 system 消息（含首轮之后追加的那些）。
-    # 已经在尾部的 system 不再重复——尾部本来就会逐条渲染。
+    # 常驻契约：最后一条 user **之前**的全部契约消息（system / developer，含首轮之后
+    # 追加的那些）。已经在尾部的契约消息不再重复——尾部本来就会逐条渲染。
     head_system = [
         m for m in messages[:max(last_user_idx, 0)]
-        if isinstance(m, dict) and str(m.get("role") or "").lower() == "system"
+        if isinstance(m, dict) and is_contract_role(m.get("role"))
     ]
     contract_lines = [ln for ln in (_message_line(m, id_map) for m in head_system) if ln]
 
