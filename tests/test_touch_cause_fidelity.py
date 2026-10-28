@@ -46,6 +46,8 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import io
 import logging
 import os
 import sys
@@ -68,8 +70,10 @@ os.environ["KIMI_AUTH_TOKEN"] = "fake_kimi"
 os.environ["GLM_AUTH_TOKEN"] = "fake_glm"
 
 import providers.failover as fov  # noqa: E402
+import server as srv  # noqa: E402
 from healing.monitor import HealthMonitor  # noqa: E402
 from providers.conversation_gc import ConversationGC  # noqa: E402
+from session_store import MAX_AGE  # noqa: E402
 
 _UPSTREAM_FAULT_CAUSES = ("timeout", "truncated", "upstream_error")
 # 判据是**断言的短语**，不是关键词「风控」：修复后正确的日志里恰好写着
@@ -257,6 +261,216 @@ def test_the_documented_cause_vocabulary_lists_every_cause_the_gate_can_return()
         )
 
 
+# ---------------------------------------------------------------- 7. 令牌刷新通道
+#
+# 上面六条覆盖了探针 / 自愈 / 会话回收三条通道，第四条（启动期静默令牌刷新）当时
+# **没有任何用例**——而它恰恰是最容易把一次 502 读成「封禁」的地方，因为它的文案
+# 里同时写着「风控避让」和「避免加剧上游封禁」两句结论。
+#
+# 修复前的实测输出（`_refresh_stale_provider` 的真实分支，非推断）：
+#
+#     timeout        remaining=45s   → 「qwen 处于风控避让冷却期，暂缓令牌刷新（避免加剧上游封禁）」
+#     truncated      remaining=45s   → 同一句
+#     upstream_error remaining=15s   → 同一句
+#     quarantine     remaining=3600s → 同一句（`cooldown_cause()` 为 ''，只读成因的实现连分支都进不去）
+#     deferred 放弃   cause='timeout' → 「qwen 风控冷却未解除（已达等待上限 0.0h）」
+#
+# 也就是说：一次上游 502、一次握手中断、乃至**运维自己下的封禁租约**，在运维读到的
+# 启动日志里都变成了「平台正在风控这个账号」。与探针/自愈/回收三处是同一个缺陷，
+# 只是这一处此前没有人测。
+
+_GATEWAY_TRACKER = srv.failover_router.cooldown_tracker
+
+
+class _StaleSession:
+    """超过 MAX_AGE 的凭证：只有这种节点才会走到刷新判定。"""
+
+    token = "fake_token"
+    age = MAX_AGE + 3600
+
+
+def _stale() -> _StaleSession:
+    return _StaleSession()
+
+
+class _NoUpstreamRefresh:
+    """刷新器替身：被调用即表示网关真的要发一次真实上游登录请求。"""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, **kwargs):  # noqa: D401 - 只用于计数
+        self.calls += 1
+        raise AssertionError("避让期内不得发起静默刷新（那是一次真实的上游登录请求）")
+
+
+class _RecordingRefresh:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    def __call__(self, **kwargs):
+        self.calls += 1
+        return object()
+
+
+def _reset_gateway_tracker() -> None:
+    _GATEWAY_TRACKER.reset()
+    srv.quarantine_store.clear_all_for_tests()
+
+
+def _refresh(kind: str):
+    """把网关全局跟踪器上的 qwen 按成因打进避让，跑一次刷新判定。
+
+    返回 (outcome, stdout, refresher)。
+    """
+    _reset_gateway_tracker()
+    if kind == "quarantine":
+        _GATEWAY_TRACKER.quarantine.set_lease("qwen", 3600.0)
+    else:
+        _cool(_GATEWAY_TRACKER, "qwen", kind)
+    refresher = _NoUpstreamRefresh()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        outcome = srv._refresh_stale_provider("qwen", _stale, refresher)
+    return outcome, buf.getvalue(), refresher
+
+
+def test_token_refresh_names_an_upstream_fault_honestly():
+    """**靶点**：静默刷新通道把上游故障说成「风控避让 / 避免加剧上游封禁」。"""
+    try:
+        for kind in _UPSTREAM_FAULT_CAUSES:
+            outcome, out, refresher = _refresh(kind)
+            assert outcome == "cooling", (
+                f"{kind} 冷却仍必须暂缓刷新（后台自维护比派发边界更严），实际 {outcome!r}"
+            )
+            assert refresher.calls == 0, (
+                f"{kind} 冷却期内发起了 {refresher.calls} 次真实上游登录请求"
+            )
+            for word in _RISK_CLAIMS:
+                assert word not in out, (
+                    f"{kind} 的刷新日志里出现了 {word!r}——一次上游故障被说成了风控。"
+                    f"原文: {out.strip()!r}"
+                )
+            assert "上游" in out, (
+                f"{kind} 的刷新日志没有说出真实成因，运维只能读到一句「避让中」: {out.strip()!r}"
+            )
+    finally:
+        _reset_gateway_tracker()
+
+
+def test_token_refresh_reports_a_quarantine_lease_as_a_lease():
+    """**靶点**：运维租约必须报「租约」，而不是「风控冷却」。
+
+    这一条是「判定是否真的问了唯一判据」的判别器：纯租约时 `cooldown_cause()`
+    返回 `''`（租约不是软冷却），所以任何「只读成因、再自己读冷却浮点」的实现都会
+    落回风控文案；只有向 `touch_avoidance_reason()` 求值才会读到 `quarantined`。
+    """
+    try:
+        _reset_gateway_tracker()
+        _GATEWAY_TRACKER.quarantine.set_lease("qwen", 3600.0)
+        assert _GATEWAY_TRACKER.cooldown_cause("qwen") == "", (
+            "用例前提不成立：纯租约不应留下软冷却成因"
+        )
+        refresher = _NoUpstreamRefresh()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            outcome = srv._refresh_stale_provider("qwen", _stale, refresher)
+        out = buf.getvalue()
+        assert outcome == "cooling", f"租约期内必须暂缓刷新，实际 {outcome!r}"
+        assert refresher.calls == 0, "租约期内发起了真实上游登录请求"
+        assert "租约" in out, (
+            f"运维租约被报成了一次软冷却，运维无法从日志里分辨「等租约到期」和「等冷却窗口」: {out.strip()!r}"
+        )
+        for word in _RISK_CLAIMS:
+            assert word not in out, f"运维租约被说成了 {word!r}: {out.strip()!r}"
+    finally:
+        _reset_gateway_tracker()
+
+
+def test_token_refresh_still_reads_a_genuine_waf_cooldown_as_risk_control():
+    """零回归**守卫**：真正的人机验证冷却照旧说「风控」，照旧不刷新。
+
+    修复前即绿，且必须如此：把范围收窄到「非风控成因」时若顺手把风控也改了，
+    `login.py all` 的「冷却 → 照常登录」分支与 `GATEWAY_AUTH_COOLDOWN_*` 的升级
+    语义一起失效，比原缺陷更糟。
+    """
+    try:
+        outcome, out, refresher = _refresh("waf")
+        assert outcome == "cooling"
+        assert refresher.calls == 0
+        assert "风控" in out, f"真正的人机验证冷却的刷新日志丢了「风控」二字: {out.strip()!r}"
+    finally:
+        _reset_gateway_tracker()
+
+
+def test_the_deferred_give_up_names_the_real_cause():
+    """**靶点**：延迟重试的放弃语句把上游故障说成「风控冷却未解除」。"""
+    try:
+        _reset_gateway_tracker()
+        _cool(_GATEWAY_TRACKER, "qwen", "timeout")
+        refresher = _NoUpstreamRefresh()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            srv._deferred_refresh_after_cooldown(
+                [("qwen", _stale, refresher)], max_wait=0.05, poll=0.01
+            )
+        out = buf.getvalue()
+        assert refresher.calls == 0, "冷却未解除前发起了真实上游登录请求"
+        assert "上游" in out, (
+            f"放弃语句没有说出真实成因（上游超时），运维会去排查一个不存在的风控封禁: {out.strip()!r}"
+        )
+        for word in _RISK_CLAIMS:
+            assert word not in out, f"上游超时被说成了 {word!r}: {out.strip()!r}"
+    finally:
+        _reset_gateway_tracker()
+
+
+def test_the_refresh_channel_asks_the_single_judgement():
+    """**靶点**：刷新判定必须向唯一判据求值，而不是自己读冷却浮点。
+
+    把唯一判据改成「qwen 处于租约」而底层冷却为 0：只读浮点的实现会照常刷新——
+    即**绕过**了运维的声明，发出一次真实的上游登录请求。这是 §33 的「篡改单一闸门」
+    手法：只测行为的话，一个仍然握着第二份判据的实现可能在所有正常用例里都绿。
+    """
+    _missing = object()
+    original = getattr(srv, "_touch_avoidance_reason", _missing)
+    _reset_gateway_tracker()
+    srv._touch_avoidance_reason = lambda name: "quarantined" if name == "qwen" else ""
+    try:
+        refresher = _NoUpstreamRefresh()
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            outcome = srv._refresh_stale_provider("qwen", _stale, refresher)
+        assert refresher.calls == 0, (
+            "刷新判定没有向唯一判据求值：冷却读数为 0 时它照样发出了真实的上游登录请求，"
+            "运维的声明被绕过了"
+        )
+        assert outcome == "cooling", f"判据说「避让」时刷新必须暂缓，实际 {outcome!r}"
+    finally:
+        if original is _missing:
+            try:
+                del srv._touch_avoidance_reason
+            except AttributeError:
+                pass
+        else:
+            srv._touch_avoidance_reason = original
+        _reset_gateway_tracker()
+
+
+def test_a_healthy_node_is_still_refreshed():
+    """零回归**守卫**（修复前即绿）：没有避让的过期凭证照旧刷新一次。"""
+    _reset_gateway_tracker()
+    refresher = _RecordingRefresh()
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        outcome = srv._refresh_stale_provider("qwen", _stale, refresher)
+    try:
+        assert outcome == "refreshed", f"健康节点的过期凭证必须照旧刷新，实际 {outcome!r}"
+        assert refresher.calls == 1, f"刷新调用次数应为 1，实际 {refresher.calls}"
+    finally:
+        _reset_gateway_tracker()
+
+
 def run_all():
     test_an_upstream_fault_cooldown_is_named_an_upstream_fault()
     test_the_health_probe_does_not_claim_risk_control_for_an_upstream_fault()
@@ -264,7 +478,13 @@ def run_all():
     test_conversation_gc_labels_an_upstream_fault_honestly()
     test_a_genuine_waf_cooldown_still_reads_as_risk_control()
     test_the_documented_cause_vocabulary_lists_every_cause_the_gate_can_return()
-    print("\n✅ All touch-cause fidelity tests passed! (6 cases)")
+    test_token_refresh_names_an_upstream_fault_honestly()
+    test_token_refresh_reports_a_quarantine_lease_as_a_lease()
+    test_token_refresh_still_reads_a_genuine_waf_cooldown_as_risk_control()
+    test_the_deferred_give_up_names_the_real_cause()
+    test_the_refresh_channel_asks_the_single_judgement()
+    test_a_healthy_node_is_still_refreshed()
+    print("\n✅ All touch-cause fidelity tests passed! (12 cases)")
 
 
 if __name__ == "__main__":

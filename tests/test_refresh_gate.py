@@ -42,9 +42,23 @@ def _fresh_session():
 
 
 def _patch_cooldown(mapping):
-    original = srv._provider_cooldown_remaining
+    """把「该不该触碰这个节点」的两个读数一起换成映射，返回可用于恢复的句柄。
+
+    [TOUCH-CAUSE] 判定已统一向唯一判据 `_touch_avoidance_reason()` 求值，冷却浮点只剩
+    「还剩多少秒」这一个用途。**只换浮点是不够的**：一个「冷却中」的节点会被判据放行，
+    于是真的发起一次上游登录请求——本套件的每个冷却用例都会因此失去意义。所以两处
+    必须一起换，这不是绕过被测代码，而是把 fixture 换成它现在真正读取的那个读数。
+    """
+    saved = (srv._provider_cooldown_remaining, srv._touch_avoidance_reason)
     srv._provider_cooldown_remaining = lambda name: float(mapping.get(name, 0.0))
-    return original
+    srv._touch_avoidance_reason = (
+        lambda name: "cooldown" if float(mapping.get(name, 0.0)) > 0 else ""
+    )
+    return saved
+
+
+def _restore_cooldown(saved):
+    srv._provider_cooldown_remaining, srv._touch_avoidance_reason = saved
 
 
 def test_stale_provider_refreshed_when_idle():
@@ -55,11 +69,11 @@ def test_stale_provider_refreshed_when_idle():
         calls.append(kw)
         return True
 
-    orig = _patch_cooldown({})
+    saved = _patch_cooldown({})
     try:
         outcome = srv._refresh_stale_provider("qwen", lambda: _stale_session(), refresher)
     finally:
-        srv._provider_cooldown_remaining = orig
+        _restore_cooldown(saved)
     assert outcome == "refreshed"
     assert len(calls) == 1
     print("test_stale_provider_refreshed_when_idle: PASSED")
@@ -68,13 +82,13 @@ def test_stale_provider_refreshed_when_idle():
 def test_fresh_provider_skipped():
     """未过期令牌无需刷新。"""
     calls = []
-    orig = _patch_cooldown({})
+    saved = _patch_cooldown({})
     try:
         outcome = srv._refresh_stale_provider(
             "qwen", lambda: _fresh_session(), lambda **kw: calls.append(kw) or True
         )
     finally:
-        srv._provider_cooldown_remaining = orig
+        _restore_cooldown(saved)
     assert outcome == "fresh"
     assert calls == []
     print("test_fresh_provider_skipped: PASSED")
@@ -83,13 +97,13 @@ def test_fresh_provider_skipped():
 def test_cooling_provider_deferred():
     """冷却期内的节点暂缓刷新，绝不发起刷新请求。"""
     calls = []
-    orig = _patch_cooldown({"deepseek": 3600.0})
+    saved = _patch_cooldown({"deepseek": 3600.0})
     try:
         outcome = srv._refresh_stale_provider(
             "deepseek", lambda: _stale_session(), lambda **kw: calls.append(kw) or True
         )
     finally:
-        srv._provider_cooldown_remaining = orig
+        _restore_cooldown(saved)
     assert outcome == "cooling"
     assert calls == [], "冷却期内绝不能发起令牌刷新（尤其是已封禁账号）"
     print("test_cooling_provider_deferred: PASSED")
@@ -103,8 +117,9 @@ def test_deferred_refresh_after_cooldown_clears():
         return 5.0 if remaining["n"] > 0 else 0.0
 
     calls = []
-    orig = srv._provider_cooldown_remaining
+    saved = (srv._provider_cooldown_remaining, srv._touch_avoidance_reason)
     srv._provider_cooldown_remaining = fake_remaining
+    srv._touch_avoidance_reason = lambda name: "cooldown" if fake_remaining(name) > 0 else ""
     try:
         def refresher(**kw):
             calls.append(kw)
@@ -121,7 +136,7 @@ def test_deferred_refresh_after_cooldown_clears():
             [("qwen", lambda: _stale_session(), refresher)], max_wait=2.0, poll=0.01
         )
     finally:
-        srv._provider_cooldown_remaining = orig
+        _restore_cooldown(saved)
     assert len(calls) == 1, "冷却解除后必须补做一次刷新"
     print("test_deferred_refresh_after_cooldown_clears: PASSED")
 
@@ -129,7 +144,7 @@ def test_deferred_refresh_after_cooldown_clears():
 def test_deferred_refresh_gives_up_on_timeout():
     """冷却超时未解除则放弃本轮刷新（有界等待）。"""
     calls = []
-    orig = _patch_cooldown({"qwen": 999999.0})
+    saved = _patch_cooldown({"qwen": 999999.0})
     try:
         srv._deferred_refresh_after_cooldown(
             [("qwen", lambda: _stale_session(), lambda **kw: calls.append(kw) or True)],
@@ -137,7 +152,7 @@ def test_deferred_refresh_gives_up_on_timeout():
             poll=0.01,
         )
     finally:
-        srv._provider_cooldown_remaining = orig
+        _restore_cooldown(saved)
     assert calls == [], "冷却未解除前绝不能刷新"
     print("test_deferred_refresh_gives_up_on_timeout: PASSED")
 
@@ -161,7 +176,7 @@ def test_auto_refresh_end_to_end_skips_cooling():
 
         setattr(login, f"refresh_{n}", make(n))
 
-    orig_cd = _patch_cooldown({"qwen": 7200.0})  # qwen 处于冷却，其余健康
+    saved_cd = _patch_cooldown({"qwen": 7200.0})  # qwen 处于冷却，其余健康
     os.environ.pop("GATEWAY_DISABLE_AUTO_REFRESH", None)
     os.environ.pop("TESTING", None)
     os.environ["GATEWAY_REFRESH_DEFER_MAX_WAIT"] = "0"  # 延迟线程立即有界退出
@@ -173,7 +188,7 @@ def test_auto_refresh_end_to_end_skips_cooling():
             setattr(srv, f"resolve_{n}", v)
         for n, v in original_refreshers.items():
             setattr(login, f"refresh_{n}", v)
-        srv._provider_cooldown_remaining = orig_cd
+        _restore_cooldown(saved_cd)
         os.environ["GATEWAY_DISABLE_AUTO_REFRESH"] = "1"
         os.environ["TESTING"] = "1"
         os.environ.pop("GATEWAY_REFRESH_DEFER_MAX_WAIT", None)

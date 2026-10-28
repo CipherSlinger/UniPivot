@@ -732,17 +732,85 @@ class CredentialRenewalScanRequest(BaseModel):
 # ---------------------------------------------------------------- 应用
 
 def _provider_cooldown_remaining(name: str) -> float:
-    """[OPT-013] 查询节点剩余风控冷却秒数（查询失败按 0 处理，绝不阻断刷新流程）。"""
+    """[OPT-013] 查询节点剩余风控冷却秒数（查询失败按 0 处理，绝不阻断刷新流程）。
+
+    注意：它只回答「还剩多少秒」，**不回答「该不该触碰」**。判定一律走
+    `_touch_avoidance_reason()`——一份事实一个读点（[TOUCH-CAUSE]）。
+    """
     try:
         return max(0.0, float(failover_router.cooldown_tracker.get_remaining_cooldown(name)))
     except Exception:  # noqa: BLE001
         return 0.0
 
 
+def _touch_avoidance_reason(name: str) -> str:
+    """[OPT-034] 后台自维护触点在 `server.py` 中的唯一接线点：向唯一判据求值。
+
+    `CooldownTracker.touch_avoidance_reason()` 是四条后台通道（探针 / 令牌刷新 /
+    会话回收 / 自愈选举）共用的判据，`healing/task_dispatcher.py` 的 OPT-034 记录一直
+    声称「四条通道全部向它求值，并在 server.py 中只接线一次」——但令牌刷新这一条此前
+    **从未接过**：它自己读冷却浮点，于是把一次上游 502、一次上游超时、一次上游截断，
+    乃至运维自己下的封禁租约，全都打印成「处于风控避让冷却期，暂缓令牌刷新（避免加剧
+    上游封禁）」。实测（`_refresh_stale_provider` 的真实分支）：
+
+        timeout        cause='timeout'        → 「风控避让冷却期 … 避免加剧上游封禁」
+        truncated      cause='truncated'      → 同一句
+        upstream_error cause='upstream_error' → 同一句
+        quarantine     cause=''               → 同一句（纯租约没有软冷却成因，只读成因的实现连分支都进不去）
+
+    这正是 [DAY-ZERO] 为 `unconfigured` 修过的同一类误导（「不该让运维去排查一个不存在
+    的封禁」），只是换到了最后一条通道上。判据查询失败时退回冷却浮点（`cooldown`），
+    保持修复前「读不到就多说一次避让」的保守方向，绝不因为读不到而放行一次上游登录。
+    """
+    try:
+        return str(failover_router.cooldown_tracker.touch_avoidance_reason(name) or "")
+    except Exception:  # noqa: BLE001 - 判据查询失败绝不阻断刷新流程
+        try:
+            if failover_router.cooldown_tracker.is_disabled(name):
+                return "disabled"
+        except Exception:  # noqa: BLE001
+            pass
+        return "cooldown" if _provider_cooldown_remaining(name) > 0 else ""
+
+
+# 避让成因 → 这一条通道的如实描述。四张标签表（探针 / 自愈 / 会话回收 / 令牌刷新）
+# 服务于四句不同的句子，尾部助词各不相同（「避让期」「避让中」「冷却中」），因此
+# 刻意不合并成一张共享表——合并会改坏其中三句的语法，而这是纯粹的外观改写，
+# 没有可测量的收益。这里只保证**成因词汇**与其余三处一致。
+_TOUCH_AVOIDANCE_NOUNS = {
+    "disabled": "已被运维禁用 (DISABLED_PROVIDERS)",
+    "quarantined": "处于运维/自动封禁租约期",
+    "unconfigured": "本机尚未配置凭证",
+    "cooldown": "处于风控避让冷却期",
+    "timeout": "处于上游超时避让期",
+    "truncated": "处于上游截断避让期",
+    "upstream_error": "处于上游故障避让期",
+}
+# 收尾语按成因分支：上游故障推迟刷新的理由是「别在故障期间再发一次上游请求」，
+# 租约是「账号级封禁重登无效」，配置缺口是「先去登录」——共用一句「避免加剧上游
+# 封禁」正是本条要消除的误导。
+_TOUCH_AVOIDANCE_TAILS = {
+    "disabled": "，不做令牌刷新（改回配置后下次启动即会刷新）",
+    "quarantined": "，暂缓令牌刷新（账号级封禁重登无效，等租约到期）",
+    "unconfigured": "，无可刷新凭证（请先运行 login.py {name}）",
+    "cooldown": "，暂缓令牌刷新（避免加剧上游封禁）",
+    "timeout": "，暂缓令牌刷新（上游故障期间不追加上游请求）",
+    "truncated": "，暂缓令牌刷新（上游故障期间不追加上游请求）",
+    "upstream_error": "，暂缓令牌刷新（上游故障期间不追加上游请求）",
+}
+
+
+def _touch_avoidance_sentence(name: str, reason: str, suffix: str = "") -> str:
+    """成因 → 一句如实的话（未知成因也要说出来，绝不静默）。"""
+    noun = _TOUCH_AVOIDANCE_NOUNS.get(reason, "处于后台避让期")
+    tail = _TOUCH_AVOIDANCE_TAILS.get(reason, "，跳过本次上游操作")
+    return f"[网关] {name} {noun}{suffix}{tail.format(name=name)}"
+
+
 def _refresh_stale_provider(name: str, resolver, refresher) -> str:
     """按需对单个 Provider 执行静默令牌刷新。
 
-    返回: "fresh"（无需刷新）/ "disabled"（运维禁用，不做）/ "cooling"（风控避让中，暂缓）
+    返回: "fresh"（无需刷新）/ "disabled"（运维禁用，不做）/ "cooling"（避让中，暂缓）
           / "refreshed" / "failed"。
     [OPT-013] 处于风控避让冷却期的节点绝不发起登录/刷新请求，
     避免「静默刷新」成为持续触碰已被上游封禁账号的隐蔽通道。
@@ -751,16 +819,15 @@ def _refresh_stale_provider(name: str, resolver, refresher) -> str:
     复现：DISABLED_PROVIDERS=kimi 且无冷却时，此处真的调用了 refresher。
     与冷却的区别在于**不进入延迟重试**：冷却是在等一个会到期的窗口，而禁用是在等运维改
     配置，没有可等待的期限，因此不加入 deferred（运维改回配置后，下一次启动即会刷新）。
+    [TOUCH-CAUSE] 判定改为向唯一判据 `_touch_avoidance_reason()` 求值，成因如实入日志。
     """
     s = resolver()
     if not s or not s.token or getattr(s, "age", 0.0) < MAX_AGE:
         return "fresh"
-    if failover_router.cooldown_tracker.is_disabled(name):
-        print(f"[网关] {name} 已被运维禁用 (DISABLED_PROVIDERS)，不做令牌刷新")
-        return "disabled"
-    if _provider_cooldown_remaining(name) > 0:
-        print(f"[网关] {name} 处于风控避让冷却期，暂缓令牌刷新（避免加剧上游封禁）")
-        return "cooling"
+    reason = _touch_avoidance_reason(name)
+    if reason:
+        print(_touch_avoidance_sentence(name, reason))
+        return "disabled" if reason == "disabled" else "cooling"
     print(f"[网关] {name} 令牌已超过 {MAX_AGE // 3600}h，尝试静默刷新…")
     ns = refresher(timeout=60)
     if ns:
@@ -775,6 +842,8 @@ def _deferred_refresh_after_cooldown(deferred: list, max_wait: Optional[float] =
 
     有界等待：最多等待 max_wait 秒（默认 24h），每 poll 秒（默认 300s）检查一次冷却是否解除；
     到期仍未解除则放弃本轮刷新（下一个启动周期再评估），绝不无限阻塞。
+    [TOUCH-CAUSE] 等待条件与放弃语句同样向唯一判据求值：此前它们只读冷却浮点，于是
+    一次上游超时在放弃时被写成「风控冷却未解除」，运维会去排查一个从未发生的封禁。
     """
     if not deferred:
         return
@@ -784,7 +853,7 @@ def _deferred_refresh_after_cooldown(deferred: list, max_wait: Optional[float] =
         max_wait = float(os.getenv("GATEWAY_REFRESH_DEFER_MAX_WAIT", "86400"))
     deadline = time.time() + max_wait
     while True:
-        if not any(_provider_cooldown_remaining(name) > 0 for name, _, _ in deferred):
+        if not any(_touch_avoidance_reason(name) for name, _, _ in deferred):
             break
         remaining_wait = deadline - time.time()
         if remaining_wait <= 0:
@@ -792,8 +861,13 @@ def _deferred_refresh_after_cooldown(deferred: list, max_wait: Optional[float] =
         time.sleep(min(poll, remaining_wait))
 
     for name, resolver, refresher in deferred:
-        if _provider_cooldown_remaining(name) > 0:
-            print(f"[网关] {name} 风控冷却未解除（已达等待上限 {max_wait / 3600:.1f}h），跳过本轮令牌刷新")
+        reason = _touch_avoidance_reason(name)
+        if reason:
+            print(
+                _touch_avoidance_sentence(
+                    name, reason, suffix=f"未解除（已达等待上限 {max_wait / 3600:.1f}h）"
+                )
+            )
             continue
         try:
             _refresh_stale_provider(name, resolver, refresher)
