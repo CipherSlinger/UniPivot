@@ -157,13 +157,29 @@ class ConversationGC:
             "cooldown": "处于风控避让冷却中",
             # [DAY-ZERO] 配置缺口，不是风控：该账号从未被触碰，说成封禁会误导运维。
             "unconfigured": "本机尚未配置凭证",
+            # [TOUCH-CAUSE] 上游故障三类，同样不是风控。说成「避免触碰被封禁的账号」
+            # 会让运维去排查一个从未发生的封禁。
+            "timeout": "处于上游超时避让中",
+            "truncated": "处于上游截断避让中",
+            "upstream_error": "处于上游故障避让中",
         }
-        detail = f" (剩余 {remaining:.0f}s)" if cause == "cooldown" else ""
+        # 上游故障的收尾语与风控/禁用不同：这里推迟删除的理由是「别在故障期间再发
+        # 一次上游请求」，不是「别碰被封禁的账号」。共用一句收尾语正是本条要消除的
+        # 误导——文案也必须跟着成因分支。
+        _UPSTREAM_FAULT_TAIL = "（上游故障期间不追加上游请求）"
+        is_upstream_fault = cause in ("timeout", "truncated", "upstream_error")
+        detail = f" (剩余 {remaining:.0f}s)" if cause == "cooldown" or is_upstream_fault else ""
+        tail = (
+            _UPSTREAM_FAULT_TAIL
+            if is_upstream_fault
+            else "，推迟其临时会话删除以避免触碰被封禁/已下线的账号"
+        )
         logger.warning(
-            "[会话回收] 节点 %s %s%s，推迟其临时会话删除以避免触碰被封禁/已下线的账号",
+            "[会话回收] 节点 %s %s%s%s",
             provider_key,
             _CAUSE_LABEL.get(cause, "处于后台避让期"),
             detail,
+            tail,
         )
 
     @staticmethod

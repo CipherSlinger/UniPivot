@@ -33,6 +33,15 @@ from providers.stream_completion import observe
 
 logger = logging.getLogger("healing.monitor")
 
+# [TOUCH-CAUSE] 上游故障成因的探针文案。三种成因都**不是**风控拦截：风控冷却要等窗口
+# 或等人工完成验证，上游故障要等上游恢复——把一次 502 说成「规避上游封禁」，运维就会
+# 去排查一个从未发生的拦截（与 [DAY-ZERO] 的 `unconfigured` 完全同形）。
+_UPSTREAM_FAULT_LABELS = {
+    "timeout": "上游超时",
+    "truncated": "上游流被截断",
+    "upstream_error": "上游故障（5xx）",
+}
+
 
 @dataclass
 class ProviderHealth:
@@ -447,9 +456,18 @@ class HealthMonitor:
                 st.cooldown_remaining = round(cooldown_remaining, 1)
                 # [DAY-ZERO] 成因是「本机没有凭证」时不得说成风控：该账号从未被
                 # 触碰过，把它报成「避免加剧上游封禁」会让运维去排查一个不存在的封禁。
+                # [TOUCH-CAUSE] 上游故障（5xx / 超时 / 截断）同理：这三种冷却与风控
+                # 的处置方式完全不同（等上游恢复 vs 等窗口/人工介入），把它们读作
+                # 「风控避让」会把运维引向一个从未发生的拦截。只区分「是不是风控」，
+                # 不合并风控内部的成因（那三者的处置在别处已经分开）。
+                upstream_label = _UPSTREAM_FAULT_LABELS.get(avoidance)
                 if avoidance == "unconfigured":
                     st.last_error = (
                         f"本机尚未配置凭证 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针"
+                    )
+                elif upstream_label:
+                    st.last_error = (
+                        f"{upstream_label}避让中 (剩余 {cooldown_remaining:.0f}s)，已跳过真实探针"
                     )
                 else:
                     st.last_error = (
@@ -458,13 +476,23 @@ class HealthMonitor:
                 self._probe_skip_stats["total"] += 1
                 per = self._probe_skip_stats["per_provider"]
                 per[name] = per.get(name, 0) + 1
-                logger.warning(
-                    "[探针冷却门控] 节点 [%s] 处于风控避让冷却期 (成因 %s, 剩余 %.0fs)，本轮跳过真实探针，"
-                    "避免加剧上游封禁",
-                    name,
-                    avoidance or "cooldown",
-                    cooldown_remaining,
-                )
+                if upstream_label:
+                    logger.warning(
+                        "[探针冷却门控] 节点 [%s] %s避让中 (成因 %s, 剩余 %.0fs)，本轮跳过真实探针"
+                        "（上游故障，不是风控拦截）",
+                        name,
+                        upstream_label,
+                        avoidance,
+                        cooldown_remaining,
+                    )
+                else:
+                    logger.warning(
+                        "[探针冷却门控] 节点 [%s] 处于风控避让冷却期 (成因 %s, 剩余 %.0fs)，本轮跳过真实探针，"
+                        "避免加剧上游封禁",
+                        name,
+                        avoidance or "cooldown",
+                        cooldown_remaining,
+                    )
                 return False, st.last_error
 
             self.check_count += 1

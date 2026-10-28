@@ -93,6 +93,14 @@ _RELEASABLE_BY_CREDENTIAL_EVENT = _RELEASABLE_BY_RENEWAL + _RELEASABLE_BY_CONFIG
 # 它们既不该写台账，也不该改写一个仍在生效的风控成因。
 _RISK_CAUSES = (SEVERITY_AUTH, SEVERITY_RATE_LIMIT, SEVERITY_WAF)
 
+# [TOUCH-CAUSE] 上游故障的三类成因：`record_failure` 会为它们记一段冷却，但它们
+# **不是**风控拦截（不写台账、不写「人类已介入」基线、不进入观察期）。后台触点判据
+# `touch_avoidance_reason()` 必须把它们与风控冷却区分开：三处消费方的文案把
+# `cooldown` 读作「风控避让 / 规避上游封禁」，把一次 502 说成风控会让运维去排查
+# 一个不存在的封禁（与 [DAY-ZERO] 的 `unconfigured` 完全同形）。
+# 定义在 `_RISK_CAUSES` 旁边，使「哪些成因是风控」与「哪些不是」共用同一个分类依据。
+_UPSTREAM_FAULT_CAUSES = ("timeout", "truncated", "upstream_error")
+
 
 # ---------------------------------------------------------------- [OPT-014] 风控证据驱动的自适应步调
 
@@ -781,6 +789,17 @@ class CooldownTracker:
             if not _provider_is_configured(provider_key):
                 self.note_touch_block("unconfigured")
                 return "unconfigured"
+            # [TOUCH-CAUSE] 上游故障（5xx / 超时 / 截断）同样不是风控。三种通道的
+            # 文案把 `cooldown` 读作「风控避让 / 规避上游封禁」，于是一次 502 让运维
+            # 以为账号正在被平台风控——与 `unconfigured` 那一条完全同形，只是成因
+            # 换成了上游故障。判据只做「折叠」而不重写：风控成因（`_RISK_CAUSES`）
+            # 仍报 `cooldown`（文案本就正确，且 `login.py all` 的「冷却即照常登录」
+            # 分支依赖它），读取不到成因时也仍报 `cooldown`（宁可多说一次风控，
+            # 也不能因为读不到成因就放行一次上游触碰）。
+            cause = self.cooldown_cause(provider_key)
+            if cause and cause not in _RISK_CAUSES:
+                self.note_touch_block(cause)
+                return cause
             self.note_touch_block("cooldown")
             return "cooldown"
         return ""
@@ -798,7 +817,15 @@ class CooldownTracker:
             # [READINESS] `unconfigured` 必须列出来：`touch_avoidance_reason()` 早已会
             # 返回它（未配置的节点不该被探针/刷新/会话回收/自愈选举触碰），而这里漏报
             # 会让运维读到一份「成因只有三种」的诊断，从而以为那个节点的成因是别的。
-            "causes": ["disabled", "quarantined", "unconfigured", "cooldown"],
+            "causes": [
+                "disabled",
+                "quarantined",
+                "unconfigured",
+                # [TOUCH-CAUSE] 上游故障三类必须列出来：`touch_avoidance_reason()`
+                # 会把它们如实返回，漏报会让这份「成因词汇表」声称一份不完整的清单。
+                *_UPSTREAM_FAULT_CAUSES,
+                "cooldown",
+            ],
         }
 
     def get_remaining_cooldown(self, provider_key: str) -> float:

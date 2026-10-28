@@ -58,6 +58,10 @@ def pick_healer_model(monitor: HealthMonitor, failing_provider: str) -> Optional
         "cooldown": "处于风控避让冷却期",
         # [DAY-ZERO] 配置缺口，不是风控。
         "unconfigured": "本机尚未配置凭证",
+        # [TOUCH-CAUSE] 上游故障三类，同样不是风控。
+        "timeout": "处于上游超时避让期",
+        "truncated": "处于上游截断避让期",
+        "upstream_error": "处于上游故障避让期",
     }
 
     def _avoiding(cand: str) -> bool:
