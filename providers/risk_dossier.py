@@ -177,6 +177,20 @@ AVOIDANCE_MATRIX: Dict[str, Dict[str, Any]] = {
                     "(deepseek/doubao/glm) 协议里没有完成标记，它们的截断无法被"
                     "判定——那是协议的限制，不是漏判。",
     },
+    # [COOLDOWN-CAUSE] 普通 5xx：网关最常见的失败，原先被记成 waf。
+    # 分类器对任何非 401/429 的输入都缺省回 waf，而「普通 5xx」分支没有显式写成因，
+    # 于是档案会建议运维去完成一个从未发生的人机验证。与 [M2]/[S2] 同形，换个成因。
+    "upstream_error": {
+        "label": "上游 5xx (服务端错误，非风控拦截)",
+        "technically_bypassable": False,
+        "recoverable_by_relogin": False,
+        "auto_recovers": True,
+        "typical_span": "秒到分钟级",
+        "strategy": "这不是风控拦截：上游返回了 5xx（既不是 401/403/429 这类账号级"
+                    "拦截，也不是我们自己的超时或截断）。网关已按上游故障记一段短冷却"
+                    "并故障转移。**重新登录无效**，也不应去完成任何验证码；若同一节点"
+                    "反复出现，应检查上游服务状态与本地出网质量。",
+    },
     # [DAY-ZERO] 未配置凭证：本机的配置缺口，连上游都没碰过。
     # 与 `disabled` 同属「不是平台风控」，但方向相反：disabled 是运维**主动**排除，
     # 这里是运维**还没**配置。两者的正确动作因此完全不同（改配置 vs 执行登录）。
@@ -227,6 +241,10 @@ _SEVERITY_TO_VERDICT = {
     # 是第一次登录。这是本项目反复修复的「误导运维」缺陷类型
     # （OPT-026/027/029/031/035），换了个成因。
     "unconfigured": "unconfigured",
+    # [COOLDOWN-CAUSE] 普通 5xx：也是上游故障。缺这一行会落到 `or "ratelimit"`
+    # 的缺省上——「频率限制，无需人工介入，等它衰减」对一次 502 恰好不算错得离谱，
+    # 但成因报错会让运维去查错的东西（而且与 tracker 的判读不一致）。
+    "upstream_error": "upstream_error",
 }
 
 # [M2] 台账**无法表达**的成因：超时从不入账（它不是风控拦截），因此研判不能
@@ -234,7 +252,7 @@ _SEVERITY_TO_VERDICT = {
 # 把运维引去登录一个从未拦截过他的平台。只有这类成因才允许覆盖台账多数成因。
 # [DAY-ZERO] 未配置同理，而且更彻底：这类节点**从未被上游看见过**，台账里必然
 # 一条记录都没有，于是档案的缺省答案会是「无拦截记录」，同样不对。
-_LIVE_ONLY_CAUSES = ("timeout", "truncated", "unconfigured")
+_LIVE_ONLY_CAUSES = ("timeout", "truncated", "unconfigured", "upstream_error")
 
 
 class RiskDossier:

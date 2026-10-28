@@ -1305,6 +1305,15 @@ class CooldownTracker:
             # `and not ...`，正是本仓库反复在修的「同一事实散落多处」。
             is_upstream_fault = is_timeout or is_truncation or is_unconfigured
 
+            # 「这真的是一次拦截吗」同样只定义一次。原先这句判据在观察期与台账
+            # 各抄了一份，而**写人机验证凭证基线**的那一支漏抄了——它只看
+            # `severity == SEVERITY_WAF`，可分类器对任何非 401/429 的输入都缺省
+            # 回 waf，于是一次普通 502 会给节点记下「人类已介入」的基线（实测），
+            # 而那条基线正是 OPT-029 长效避让唯一的解除判据。
+            is_interception = not is_upstream_fault and (
+                is_risk or is_waf_or_rate or is_auth_error
+            )
+
             # 严重度分级：auth（令牌/账号级）> ratelimit（频控）> waf（人机验证）
             severity = classify_interception_severity(
                 is_risk=is_risk, risk_reason=risk_reason, status=status, error_msg=error_msg
@@ -1417,6 +1426,14 @@ class CooldownTracker:
             else:
                 # 普通 5xx（超时已在上面单独分支处置）
                 cooldown_duration = min(base_cd, 15.0 * cur_fails)
+                # 成因必须显式写：`severity` 此刻还带着分类器的缺省值 `waf`
+                # （它对任何非 401/429 的输入都回 waf），不覆盖就等于把网关最常见
+                # 的一种失败登记成「人机验证拦截」——实测一次 502 的成因是 waf，
+                # 档案于是建议运维去登录一个从未拦截他的平台（与 [M2] 超时、
+                # [S2] 截断、[DAY-ZERO] 未配置同形，换个成因而已）。
+                # 它是**上游故障**而非风控：不写台账、不写凭证基线、不进观察期，
+                # 且作为非风控成因永远不会抹掉仍在生效的风控成因（[BUDGET-6]）。
+                severity = "upstream_error"
 
             end_time = time.time() + cooldown_duration
             # 如果已有更长的冷却期，保留较长者
@@ -1444,7 +1461,7 @@ class CooldownTracker:
                 except Exception:  # noqa: BLE001
                     renewed_at_failure = False
                 self._note_renewal_rejection(provider_key, renewed_at_failure)
-            elif severity == SEVERITY_WAF:
+            elif is_interception and severity == SEVERITY_WAF:
                 # [OPT-029] 人机验证同样要留下凭证基线：人工 `login.py`（完成滑块验证）
                 # 成功后令牌必然刷新，指纹变化即「人类已介入」的唯一可观测证据。
                 # 没有这条基线，长效避让就没有出口——同一个自锁缺陷换了个成因。
@@ -1455,12 +1472,12 @@ class CooldownTracker:
 
             # [OPT-022] 真正的风控/认证级避让才需要「解除后恢复观察期」：
             # 普通 5xx/超时说明是上游故障而非账号被标记，解封瞬间并无惊群风险。
-            if not is_upstream_fault and (is_risk or is_waf_or_rate or is_auth_error):
+            if is_interception:
                 self._enter_probation(provider_key, self._cooldowns[provider_key])
 
             # 台账记录：仅记录真正的拦截事件（风控 / 频控 / 认证失效），
             # 普通 5xx 与超时不入账，避免污染风控画像。
-            if not is_upstream_fault and (is_risk or is_waf_or_rate or is_auth_error):
+            if is_interception:
                 try:
                     self.risk_ledger.record_interception(
                         provider=provider_key,
@@ -1476,9 +1493,13 @@ class CooldownTracker:
             # 持久化冷却状态与失败计数，使避让跨重启生效
             self._persist_state()
 
+            # 成因写进日志：运维读的就是这一行，而「成因」正是决定下一步动作的事实
+            # （重登 / 等人完成滑块 / 等窗口到期 / 去查上游）。原先这行不含成因，
+            # 于是一次被记错的成因只能靠去问档案才会发现。
             logger.warning(
-                f"[对等互备网格] 节点 [{provider_key}] 失败 (HTTP {status})，进入冷却避让期 "
-                f"{cooldown_duration:.1f}s (第 {cur_fails} 次连续失败, 剩余冷却: {cooldown_duration:.1f}s)"
+                f"[对等互备网格] 节点 [{provider_key}] 失败 (HTTP {status}, 成因 {severity})，"
+                f"进入冷却避让期 {cooldown_duration:.1f}s "
+                f"(第 {cur_fails} 次连续失败, 剩余冷却: {cooldown_duration:.1f}s)"
             )
             return cooldown_duration
 
